@@ -329,6 +329,19 @@ app/static/          旧版静态控制台回退资源
 
 当前 `.gitignore` 已排除 `.env`、`data/`、`vault/`、`uploads/`、`output/`、`node_modules/`、`dist/` 等运行产物。
 
+## GitHub 上传前检查
+
+上传或公开仓库前建议逐项确认：
+
+- 不提交 `.env`、真实 API Key、访问令牌、数据库文件、上传资料和企业真实文档。
+- `.env.example` 只保留示例值，不写真实密码、真实模型 Key 或内部服务地址。
+- `data/`、`vault/`、`uploads/`、`output/`、`node_modules/`、`dist/` 已被 `.gitignore` 排除。
+- 如果仓库需要公开，先检查 `samples/`、`docs/`、`scripts/`、`test_proxy.sh` 是否包含内部业务信息。
+- 大体积目录如 `gbrain/`、`app/static/vendor/`、样例 PDF/DOCX 是否确实需要随仓库发布。
+- 本地至少执行一次 `python -m pytest -q` 和 `cd frontend && npm run build`。
+- 开源前确认 `LICENSE` 已存在，当前协议为 Apache License 2.0。
+- 推送后在 GitHub 页面检查 README、仓库描述、默认分支、License 识别和置顶状态。
+
 ## 测试
 
 后端：
