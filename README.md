@@ -353,4 +353,3 @@ GBrain 默认关闭。开启后提供实体关系遍历、跨文档依赖分析�
 
 ---
 
-*Made with ❤️ for internal knowledge teams.*
