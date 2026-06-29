@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "./api/client";
 import { Layout } from "./components/Layout";
 import type { SectionId } from "./constants";
+import { GapsTask } from "./features/GapsTask";
 import { IngestTask } from "./features/IngestTask";
 import { Overview } from "./features/Overview";
 import { QaTask } from "./features/QaTask";
@@ -18,13 +19,23 @@ import type {
   ReviewItem,
   SourcePreview,
   SourceRecord,
+  SpaceFilter,
   WikiPage,
 } from "./types";
 import { encodePath, filterRows, safeJson, splitTags, translateGapStatus, translateReviewItemStatus } from "./utils/format";
+import {
+  buildSpaceDirectory,
+  filterGapsBySpace,
+  filterPagesBySpace,
+  filterReportsBySources,
+  filterSourcesBySpace,
+  findSpaceFilter,
+} from "./utils/space";
 
 export function App() {
   const [activeSection, setActiveSection] = useState<SectionId>("overview");
   const [searchText, setSearchText] = useState("");
+  const [activeSpaceFilterId, setActiveSpaceFilterId] = useState("all");
   const [sources, setSources] = useState<SourceRecord[]>([]);
   const [reports, setReports] = useState<IngestReport[]>([]);
   const [pages, setPages] = useState<WikiPage[]>([]);
@@ -44,6 +55,9 @@ export function App() {
     question: "用户如何处理退款问题？",
     domain: "product",
     answer_mode: "detail",
+    user_id: "admin",
+    role: "admin",
+    acl_tags: "内部,产品",
   });
   const [lastQueryId, setLastQueryId] = useState<string | null>(null);
   const [answer, setAnswer] = useState<AskResponse | null>(null);
@@ -78,9 +92,9 @@ export function App() {
 
   async function refresh() {
     const [nextSources, nextReports, nextPages, nextReviews, nextGaps, nextRagStatus] = await Promise.all([
-      api<SourceRecord[]>("/api/internal/sources?domain=product"),
+      api<SourceRecord[]>("/api/internal/sources"),
       api<IngestReport[]>("/api/internal/ingest/reports"),
-      api<WikiPage[]>("/api/internal/wiki/pages?domain=product"),
+      api<WikiPage[]>("/api/internal/wiki/pages"),
       api<ReviewItem[]>("/api/internal/reviews?status=pending"),
       api<KnowledgeGap[]>("/api/internal/gaps"),
       api<RagStatus>("/api/internal/rag/status"),
@@ -163,7 +177,13 @@ export function App() {
   async function ask() {
     const result = await api<AskResponse>("/api/internal/ask", {
       method: "POST",
-      body: JSON.stringify({ ...askForm, require_citations: true }),
+      body: JSON.stringify({
+        ...askForm,
+        user_id: askForm.user_id || null,
+        role: askForm.role || null,
+        acl_tags: splitTags(askForm.acl_tags),
+        require_citations: true,
+      }),
     });
     setAnswer(result);
     setLastQueryId(result.query_id);
@@ -242,31 +262,88 @@ export function App() {
     await refresh();
   }
 
-  const stats = useMemo(
-    () => [
-      ["资料", sources.length],
-      ["采集报告", reports.length],
-      ["知识页", pages.length],
-      ["知识缺口", gaps.length],
-      ["待审阅", reviews.length],
-    ] as Array<[string, number]>,
-    [sources, reports, pages, gaps, reviews],
+  const spaceDirectory = useMemo(() => buildSpaceDirectory(sources, pages, gaps), [sources, pages, gaps]);
+  const activeSpaceFilter = useMemo<SpaceFilter>(
+    () => findSpaceFilter(spaceDirectory, activeSpaceFilterId),
+    [spaceDirectory, activeSpaceFilterId],
   );
-  const filteredSources = useMemo<SourceRecord[]>(
-    () => filterRows<SourceRecord>(sources, searchText, (source) => [source.title, source.id, source.original_path, source.owner, source.metadata?.normalized_path]),
+
+  function selectSpaceFilter(filter: SpaceFilter) {
+    setActiveSpaceFilterId(filter.id);
+    if (filter.targetSection) {
+      setActiveSection(filter.targetSection);
+    }
+  }
+
+  function clearSpaceFilter() {
+    setActiveSpaceFilterId("all");
+  }
+
+  const searchedSources = useMemo<SourceRecord[]>(
+    () => filterRows<SourceRecord>(sources, searchText, (source) => [source.title, source.id, source.original_path, source.owner, source.metadata?.normalized_path, source.domain, source.source_type]),
     [sources, searchText],
   );
-  const filteredPages = useMemo<WikiPage[]>(
-    () => filterRows<WikiPage>(pages, searchText, (page) => [page.title, page.path, page.page_type, page.review_status]),
+  const searchedPages = useMemo<WikiPage[]>(
+    () => filterRows<WikiPage>(pages, searchText, (page) => [page.title, page.path, page.page_type, page.review_status, page.domain]),
     [pages, searchText],
   );
-  const filteredGaps = useMemo<KnowledgeGap[]>(
+  const searchedGaps = useMemo<KnowledgeGap[]>(
     () => filterRows<KnowledgeGap>(gaps, searchText, (gap) => [gap.question, gap.status, gap.priority, gap.owner]),
     [gaps, searchText],
   );
+  const scopedSources = useMemo<SourceRecord[]>(
+    () => filterSourcesBySpace(searchedSources, searchedPages, activeSpaceFilter),
+    [searchedSources, searchedPages, activeSpaceFilter],
+  );
+  const scopedPages = useMemo<WikiPage[]>(
+    () => filterPagesBySpace(searchedPages, activeSpaceFilter),
+    [searchedPages, activeSpaceFilter],
+  );
+  const scopedGaps = useMemo<KnowledgeGap[]>(
+    () => filterGapsBySpace(searchedGaps, activeSpaceFilter),
+    [searchedGaps, activeSpaceFilter],
+  );
+  const scopedReports = useMemo<IngestReport[]>(
+    () => filterReportsBySources(reports, scopedSources),
+    [reports, scopedSources],
+  );
+
+  useEffect(() => {
+    if (activeSection !== "sources") return;
+    if (!scopedSources.length) {
+      if (selectedSourceId) setSelectedSourceId(null);
+      return;
+    }
+    if (!selectedSourceId || !scopedSources.some((source) => source.id === selectedSourceId)) {
+      setSelectedSourceId(scopedSources[0].id);
+    }
+  }, [activeSection, scopedSources, selectedSourceId]);
+
+  const stats = useMemo(
+    () => [
+      ["资料", scopedSources.length],
+      ["采集报告", scopedReports.length],
+      ["知识页", scopedPages.length],
+      ["知识缺口", scopedGaps.length],
+      ["待审阅", reviews.length],
+    ] as Array<[string, number]>,
+    [scopedSources, scopedReports, scopedPages, scopedGaps, reviews],
+  );
 
   const content = {
-    overview: <Overview stats={stats} reports={reports} pages={filteredPages} gaps={filteredGaps} ragStatus={ragStatus} />,
+    overview: (
+      <Overview
+        stats={stats}
+        reports={scopedReports}
+        pages={scopedPages}
+        gaps={scopedGaps}
+        sources={scopedSources}
+        activeSpaceFilter={activeSpaceFilter}
+        ragStatus={ragStatus}
+        selectSpaceFilter={selectSpaceFilter}
+        directory={spaceDirectory}
+      />
+    ),
     ingest: (
       <IngestTask
         scanForm={scanForm}
@@ -282,8 +359,11 @@ export function App() {
     ),
     sources: (
       <SourcesTask
-        sources={filteredSources}
-        reports={reports}
+        sources={scopedSources}
+        allSources={searchedSources}
+        reports={scopedReports}
+        activeSpaceFilter={activeSpaceFilter}
+        clearSpaceFilter={clearSpaceFilter}
         selectedSourceId={selectedSourceId}
         setSelectedSourceId={setSelectedSourceId}
         sourcePreview={sourcePreview}
@@ -293,9 +373,10 @@ export function App() {
         showToast={showToast}
       />
     ),
-    wiki: <WikiTask pages={filteredPages} editor={editor} setEditor={setEditor} loadPage={loadPage} savePage={savePage} markPageStale={markPageStale} showToast={showToast} />,
-    qa: <QaTask askForm={askForm} setAskForm={setAskForm} ask={ask} answer={answer} feedback={feedback} setFeedback={setFeedback} createGap={createGap} gaps={filteredGaps} updateGap={updateGap} showToast={showToast} />,
-    reviews: <ReviewsTask reviews={reviews} updateReview={updateReview} showToast={showToast} />,
+    wiki: <WikiTask pages={scopedPages} activeSpaceFilter={activeSpaceFilter} clearSpaceFilter={clearSpaceFilter} editor={editor} setEditor={setEditor} loadPage={loadPage} savePage={savePage} markPageStale={markPageStale} showToast={showToast} />,
+    qa: <QaTask askForm={askForm} setAskForm={setAskForm} ask={ask} answer={answer} feedback={feedback} setFeedback={setFeedback} createGap={createGap} showToast={showToast} />,
+    gaps: <GapsTask gaps={scopedGaps} updateGap={updateGap} showToast={showToast} />,
+    reviews: <ReviewsTask reviews={reviews} loadPage={loadPage} updateReview={updateReview} showToast={showToast} />,
   }[activeSection];
 
   return (
@@ -307,10 +388,17 @@ export function App() {
       sources={sources}
       pages={pages}
       gaps={gaps}
+      scopedSources={scopedSources}
+      scopedPages={scopedPages}
+      scopedGaps={scopedGaps}
+      directory={spaceDirectory}
+      activeSpaceFilter={activeSpaceFilter}
+      selectSpaceFilter={selectSpaceFilter}
+      clearSpaceFilter={clearSpaceFilter}
       reportCount={reports.length}
       reviewCount={reviews.length}
       ragStatus={ragStatus}
-      selectedSource={sources.find((source) => source.id === selectedSourceId)}
+      selectedSource={scopedSources.find((source) => source.id === selectedSourceId)}
       sourcePreview={sourcePreview}
       refresh={refresh}
       syncPostgresRag={syncPostgresRag}

@@ -1,0 +1,11 @@
+{
+    "schema_version": 1,
+    "commit": "",
+    "indexed_at": "2026-06-29T20:19:08Z",
+    "project": "D-XM-LGDO",
+    "nodes": 25744,
+    "edges": 79920,
+    "original_size": 41418752,
+    "compressed_size": 9725326,
+    "compression_level": 9
+}

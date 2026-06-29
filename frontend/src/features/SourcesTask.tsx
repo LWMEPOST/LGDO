@@ -1,5 +1,5 @@
 import { Detail, List, Panel } from "../components/common";
-import type { IngestReport, SourcePreview, SourceRecord } from "../types";
+import type { IngestReport, SourcePreview, SourceRecord, SpaceFilter } from "../types";
 import {
   formatAclTags,
   formatBool,
@@ -12,10 +12,14 @@ import {
   translateSourceStatus,
   translateSourceType,
 } from "../utils/format";
+import { countSourcesByBucket } from "../utils/space";
 
 export function SourcesTask({
   sources,
+  allSources,
   reports,
+  activeSpaceFilter,
+  clearSpaceFilter,
   selectedSourceId,
   setSelectedSourceId,
   sourcePreview,
@@ -25,7 +29,10 @@ export function SourcesTask({
   showToast,
 }: {
   sources: SourceRecord[];
+  allSources: SourceRecord[];
   reports: IngestReport[];
+  activeSpaceFilter: SpaceFilter;
+  clearSpaceFilter: () => void;
   selectedSourceId: string | null;
   setSelectedSourceId: (sourceId: string | null) => void;
   sourcePreview: SourcePreview | null;
@@ -37,12 +44,21 @@ export function SourcesTask({
   const reportBySource = new Map(reports.map((report) => [report.source_id, report]));
   const selected = sources.find((source) => source.id === selectedSourceId) || sources[0];
   const selectedReport = selected ? reportBySource.get(selected.id) : null;
+  const buckets = countSourcesByBucket(sources);
   return (
     <section className="source-workspace">
       <Panel title="资料目录" badge={`${sources.length} 份`}>
         <div className="source-filter-bar">
-          <span>全部资料</span>
-          <small>按上方搜索框过滤</small>
+          <span>{activeSpaceFilter.label}</span>
+          <small>{sources.length}/{allSources.length} 份 · 按上方搜索框过滤</small>
+          {activeSpaceFilter.id !== "all" && <button className="link-button" onClick={clearSpaceFilter} type="button">清除</button>}
+        </div>
+        <div className="source-bucket-strip">
+          <Bucket label="全部" value={buckets.all} />
+          <Bucket label="文档" value={buckets.document} />
+          <Bucket label="数据" value={buckets.data} />
+          <Bucket label="演示" value={buckets.deck} />
+          <Bucket label="警告" value={buckets.warning} tone={buckets.warning ? "warn" : "idle"} />
         </div>
         <List rows={sources} empty="暂无资料" render={(source) => {
           const report = reportBySource.get(source.id);
@@ -55,7 +71,7 @@ export function SourcesTask({
               <span className="file-icon">{sourceFileKind(source.source_type)}</span>
               <span>
                 <strong>{source.title}</strong>
-                <small>{translateSourceType(source.source_type)} · {report ? `${report.chunk_count} 个分块` : "未分块"} · {source.owner || "未分配"}</small>
+                <small>{translateSourceType(source.source_type)} · {translateDomain(source.domain)} · {report ? `${report.chunk_count} 个分块` : "未分块"} · {source.owner || "未分配"}</small>
               </span>
             </button>
           );
@@ -126,5 +142,14 @@ export function SourcesTask({
         )}
       </section>
     </section>
+  );
+}
+
+function Bucket({ label, value, tone = "idle" }: { label: string; value: number; tone?: "idle" | "warn" }) {
+  return (
+    <div className={`source-bucket ${tone}`}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
   );
 }

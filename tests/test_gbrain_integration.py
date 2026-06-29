@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from app.config import Settings
-from app.gbrain import GBrainHit, _QUERY_CACHE, gbrain_query_candidates, normalize_gbrain_hits, query_gbrain
+from app.gbrain import (
+    GBrainError,
+    GBrainHit,
+    _QUERY_CACHE,
+    _query_gbrain_with_caller,
+    gbrain_query_candidates,
+    normalize_gbrain_hits,
+    query_gbrain,
+)
 from app.models import AskRequest
 from app.search import ask
 
@@ -152,6 +160,40 @@ def test_gbrain_candidates_prioritize_domain_codes_before_generic_tokens():
     assert "API-0010" in candidates
     assert "API-0011" in candidates
     assert candidates.index("PRD-0001") < candidates.index("从 PRD 文档中提取所有明确标注了优先级 P0 P1 P2 的功能需求 并分析各 PRD 模块之间的依赖关系")
+
+
+def test_query_gbrain_keeps_hits_when_one_candidate_search_fails(monkeypatch):
+    calls = []
+
+    def caller(tool_name, params):
+        calls.append((tool_name, params["query"]))
+        if tool_name == "query":
+            return [{"slug": "main", "title": "时间窗口制度", "content": "退款窗口期 7天。", "score": 0.8}]
+        if "失败候选" in params["query"]:
+            raise GBrainError("candidate failed")
+        return [{"slug": "other", "title": "报销制度", "content": "次月5日提交。", "score": 0.7}]
+
+    monkeypatch.setattr(
+        "app.gbrain.gbrain_query_candidates",
+        lambda question, candidate_limit=8: ["失败候选", "期限"],
+    )
+
+    hits = _query_gbrain_with_caller(caller, {"query": "时间窗口和期限", "limit": 5}, "时间窗口和期限", 5, 8)
+
+    assert [hit.slug for hit in hits] == ["main", "other"]
+    assert ("search", "期限") in calls
+
+
+def test_gbrain_candidates_trim_low_information_cjk_windows():
+    candidates = gbrain_query_candidates(
+        "梳理公司所有制度文档中，与时间窗口或期限相关的全部条款，并判断是否存在相互矛盾。",
+        candidate_limit=8,
+    )
+
+    assert "时间窗口" in candidates
+    assert "期限" in candidates
+    assert len(candidates) <= 8
+    assert not any(len(item) == 4 and item in {"梳理公司", "公司所有", "所有制度"} for item in candidates)
 
 
 def test_query_gbrain_uses_short_ttl_cache(monkeypatch):

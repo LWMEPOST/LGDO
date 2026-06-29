@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     database_path: Path = Path("data/lgdo.db")
     database_backend: str = "sqlite"
     postgres_host: str = "localhost"
-    postgres_port: int = 54322
+    postgres_port: int = 5432
     postgres_user: str = "postgres"
     postgres_password: str | None = None
     postgres_database: str = "lgdo"
@@ -39,6 +39,19 @@ class Settings(BaseSettings):
     gbrain_import_timeout_seconds: int = 600
     gbrain_import_on_compile: bool = False
     gbrain_import_no_embed: bool = False
+    oidc_enabled: bool = False
+    oidc_issuer: str | None = None
+    oidc_jwks_url: str | None = None
+    oidc_client_id: str | None = None
+    oidc_audience: str | None = None
+    oidc_username_claim: str = "preferred_username"
+    oidc_role_claim: str = "role"
+    oidc_acl_claim: str = "acl_tags"
+    oidc_groups_claim: str = "groups"
+    auth_dev_fallback_enabled: bool = True
+    auth_dev_user_id: str = "admin"
+    auth_dev_username: str = "管理员"
+    auth_trust_request_user_context: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

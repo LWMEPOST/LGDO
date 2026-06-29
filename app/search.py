@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import dataclass
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
+from app.aliases import expand_query_with_aliases
 from app.answer_modes import AnswerModeConfig, get_answer_mode_config
+from app.auth import UserContext, apply_request_user_override, can_read_metadata
 from app.config import Settings
 from app.db import audit, connect_app, init_app_db, json_dump
 from app.gbrain import GBrainHit, query_gbrain
-from app.llm import generate_answer
+from app.llm import generate_answer, stream_generate_answer
 from app.models import AskRequest, AskResponse, Citation, MemoryHit
 from app.rag import clip_snippet, score_text, search_chunks, tokenize
 from app.timeutil import now_iso
@@ -32,32 +37,63 @@ def find_wiki_page_by_source(conn, source_id: str, domain: str | None = None) ->
     return dict(row) if row else None
 
 
-def active_source_ids(conn, source_ids: list[str]) -> list[str]:
+def active_source_ids(conn, source_ids: list[str], user_context: UserContext | None = None) -> list[str]:
     active: list[str] = []
     for source_id in source_ids:
-        row = conn.execute("SELECT status FROM sources WHERE id = ?", (source_id,)).fetchone()
+        row = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
         if row is not None and row["status"] != "deleted":
+            metadata = __import__("json").loads(row["metadata_json"] or "{}")
+            if not can_read_metadata(metadata, user_context, row["owner"]):
+                continue
             active.append(source_id)
     return active
 
 
-def ask(settings: Settings, request: AskRequest) -> AskResponse:
+@dataclass
+class AskAssembly:
+    query_id: str
+    timestamp: str
+    request: AskRequest
+    mode_config: AnswerModeConfig
+    resolved_user: UserContext | None
+    chunk_hits: list[dict[str, Any]]
+    gbrain_hits: list[GBrainHit]
+    memory_hits: list[MemoryHit]
+    citations: list[Citation]
+    answer_parts: list[str]
+    context_blocks: list[str]
+    gbrain_context_blocks: list[str]
+    missing_info: list[str]
+    confidence: str
+    retrieval_strategy: dict[str, Any]
+    answer_override: str | None = None
+
+
+def build_ask_assembly(
+    settings: Settings,
+    request: AskRequest,
+    user_context: UserContext | None = None,
+) -> AskAssembly:
     init_app_db(settings)
     timestamp = now_iso()
     query_id = f"qry_{uuid.uuid4().hex[:12]}"
     mode_config = get_answer_mode_config(request.answer_mode)
-    tokens = tokenize(request.question)
+    resolved_user = apply_request_user_override(settings, user_context, request) if user_context else None
+    expanded_question, matched_aliases = expand_query_with_aliases(settings, request.question, request.domain)
+    tokens = tokenize(expanded_question)
     with ThreadPoolExecutor(max_workers=2) as executor:
         chunk_future = executor.submit(
             search_chunks,
             settings,
-            request.question,
+            expanded_question,
             request.domain,
             mode_config.retrieval_limit,
             keyword_weight=mode_config.keyword_weight,
             vector_weight=mode_config.vector_weight,
+            user_context=resolved_user,
+            alias_context={"matched_aliases": matched_aliases, "expansion_terms": []},
         )
-        gbrain_future = executor.submit(query_gbrain, settings, request.question, settings.gbrain_query_limit)
+        gbrain_future = executor.submit(query_gbrain, settings, expanded_question, settings.gbrain_query_limit)
         chunk_hits = chunk_future.result()
         try:
             gbrain_hits = gbrain_future.result()
@@ -68,9 +104,12 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
         citations: list[Citation] = []
         answer_parts: list[str] = []
         context_blocks: list[str] = []
-        memory_hits = search_query_memory(conn, request, tokens, mode_config)
+        memory_hits = search_query_memory(conn, request, tokens, mode_config, resolved_user)
+        gbrain_hits = filter_authorized_gbrain_hits(conn, gbrain_hits, resolved_user)
         for item in chunk_hits[: mode_config.context_limit]:
             source_id = item["source_id"]
+            if not can_read_source_id(conn, source_id, resolved_user):
+                continue
             page = find_wiki_page_by_source(conn, source_id, request.domain)
             page_path = page["path"] if page else None
             snippet = item["snippet"]
@@ -93,42 +132,58 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
         answer_parts.extend(build_gbrain_answer_parts(gbrain_hits, mode_config.context_limit))
 
         if not citations:
-            citations, answer_parts, context_blocks = fallback_wiki_search(conn, settings, request, tokens, mode_config)
+            citations, answer_parts, context_blocks = fallback_wiki_search(
+                conn,
+                settings,
+                request,
+                tokens,
+                mode_config,
+                resolved_user,
+            )
             context_blocks.extend(gbrain_context_blocks)
             answer_parts.extend(build_gbrain_answer_parts(gbrain_hits, mode_config.context_limit))
 
         missing_info: list[str] = []
+        answer_override: str | None = None
         if not citations and not gbrain_context_blocks:
-            answer = "当前知识库没有找到足够依据回答这个问题。建议补充相关产品/客服资料后重新编译知识库。"
+            answer_override = "当前知识库没有找到足够依据回答这个问题。建议补充相关产品/客服资料后重新编译知识库。"
             confidence = "low"
             missing_info.append(request.question)
         else:
-            memory_blocks = build_memory_context(memory_hits)
-            generated = generate_answer(
-                settings,
-                request.question,
-                context_blocks,
-                mode_config.key,
-                memory_blocks=memory_blocks,
-            )
-            answer = generated or build_local_answer(mode_config, answer_parts, memory_hits)
             best_score = chunk_hits[0]["score"] if chunk_hits else 0
             confidence = "high" if best_score >= mode_config.confidence_high else "medium"
             if not chunk_hits and citations:
                 confidence = "medium"
             if not chunk_hits and gbrain_context_blocks:
                 confidence = "medium"
+        citations = filter_authorized_citations(conn, citations, resolved_user)
+        if request.require_citations and not citations and not gbrain_context_blocks:
+            answer_override = "当前用户权限范围内没有找到足够依据回答这个问题。请确认资料 ACL 标签或补充授权资料。"
+            confidence = "low"
+            missing_info = [request.question]
 
         retrieval_strategy = {
             "answer_mode": mode_config.key,
             "mode_label": mode_config.label,
             "chunk_hits": len(chunk_hits),
+            "authorized_chunk_hits": len(
+                [item for item in chunk_hits if can_read_source_id(conn, item.get("source_id"), resolved_user)]
+            ),
             "context_limit": mode_config.context_limit,
             "memory_hits": len(memory_hits),
             "gbrain_hits": len(gbrain_hits),
             "gbrain_enabled": settings.gbrain_enabled,
             "keyword_weight": mode_config.keyword_weight,
             "vector_weight": mode_config.vector_weight,
+            "alias_expanded": expanded_question != request.question,
+            "matched_aliases": [
+                {
+                    "canonical_name": item.get("canonical_name"),
+                    "alias": item.get("alias"),
+                    "domain": item.get("domain"),
+                }
+                for item in matched_aliases
+            ],
             "top_hits": [
                 {
                     "source_id": item.get("source_id"),
@@ -141,9 +196,11 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
                     "table_boost": item.get("table_boost"),
                     "context_boost": item.get("context_boost"),
                     "doc_code_boost": item.get("doc_code_boost"),
+                    "alias_boost": item.get("alias_boost"),
                     "rrf_score": item.get("rrf_score"),
                 }
                 for item in chunk_hits[: mode_config.context_limit]
+                if can_read_source_id(conn, item.get("source_id"), resolved_user)
             ],
             "gbrain_top_hits": [
                 {
@@ -160,6 +217,43 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
             ],
         }
 
+    return AskAssembly(
+        query_id=query_id,
+        timestamp=timestamp,
+        request=request,
+        mode_config=mode_config,
+        resolved_user=resolved_user,
+        chunk_hits=chunk_hits,
+        gbrain_hits=gbrain_hits,
+        memory_hits=memory_hits,
+        citations=citations,
+        answer_parts=answer_parts,
+        context_blocks=context_blocks,
+        gbrain_context_blocks=gbrain_context_blocks,
+        missing_info=missing_info,
+        confidence=confidence,
+        retrieval_strategy=retrieval_strategy,
+        answer_override=answer_override,
+    )
+
+
+def _memory_blocks_for_assembly(assembly: AskAssembly) -> list[str]:
+    return build_memory_context(assembly.memory_hits)
+
+
+def finalize_ask_response(settings: Settings, assembly: AskAssembly, answer: str) -> AskResponse:
+    request = assembly.request
+    mode_config = assembly.mode_config
+    resolved_user = assembly.resolved_user
+    citations = assembly.citations
+    memory_hits = assembly.memory_hits
+    confidence = assembly.confidence
+    missing_info = assembly.missing_info
+    retrieval_strategy = assembly.retrieval_strategy
+    timestamp = assembly.timestamp
+    query_id = assembly.query_id
+
+    with connect_app(settings) as conn:
         conn.execute(
             """
             INSERT INTO query_logs(
@@ -187,6 +281,8 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
                 "citation_count": len(citations),
                 "confidence": confidence,
                 "memory_hits": len(memory_hits),
+                "user_context": resolved_user.to_public_dict() if resolved_user else None,
+                "alias_expanded": retrieval_strategy.get("alias_expanded", False),
             },
             timestamp,
         )
@@ -204,7 +300,69 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
         missing_info=missing_info,
         memory_hits=memory_hits,
         retrieval_strategy=retrieval_strategy,
+        user_context=resolved_user.to_public_dict() if resolved_user else {},
     )
+
+
+def ask(settings: Settings, request: AskRequest, user_context: UserContext | None = None) -> AskResponse:
+    assembly = build_ask_assembly(settings, request, user_context)
+    if assembly.answer_override:
+        answer = assembly.answer_override
+    else:
+        generated = generate_answer(
+            settings,
+            request.question,
+            assembly.context_blocks,
+            assembly.mode_config.key,
+            memory_blocks=_memory_blocks_for_assembly(assembly),
+        )
+        answer = generated or build_local_answer(assembly.mode_config, assembly.answer_parts, assembly.memory_hits)
+    return finalize_ask_response(settings, assembly, answer)
+
+
+def _ndjson_event(payload: dict[str, Any]) -> str:
+    return f"{json_dump(payload)}\n"
+
+
+def stream_ask_events(
+    settings: Settings,
+    request: AskRequest,
+    user_context: UserContext | None = None,
+) -> Iterator[str]:
+    assembly = build_ask_assembly(settings, request, user_context)
+    yield _ndjson_event(
+        {
+            "event": "metadata",
+            "query_id": assembly.query_id,
+            "confidence": assembly.confidence,
+            "citations": [citation.model_dump() for citation in assembly.citations],
+            "retrieval_strategy": assembly.retrieval_strategy,
+        }
+    )
+
+    chunks: list[str] = []
+    if assembly.answer_override:
+        chunks.append(assembly.answer_override)
+        yield _ndjson_event({"event": "answer_delta", "text": assembly.answer_override})
+    else:
+        for chunk in stream_generate_answer(
+            settings,
+            request.question,
+            assembly.context_blocks,
+            assembly.mode_config.key,
+            memory_blocks=_memory_blocks_for_assembly(assembly),
+        ):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            yield _ndjson_event({"event": "answer_delta", "text": chunk})
+        if not chunks:
+            fallback = build_local_answer(assembly.mode_config, assembly.answer_parts, assembly.memory_hits)
+            chunks.append(fallback)
+            yield _ndjson_event({"event": "answer_delta", "text": fallback})
+
+    response = finalize_ask_response(settings, assembly, "".join(chunks))
+    yield _ndjson_event({"event": "done", "response": response.model_dump()})
 
 
 def fallback_wiki_search(
@@ -213,6 +371,7 @@ def fallback_wiki_search(
     request: AskRequest,
     tokens: list[str],
     mode_config: AnswerModeConfig,
+    user_context: UserContext | None = None,
 ):
     params: list[object] = []
     query = "SELECT * FROM wiki_pages"
@@ -224,7 +383,7 @@ def fallback_wiki_search(
     for page in pages:
         text = load_page_text(settings.vault_path, page["path"])
         source_ids = __import__("json").loads(page["source_ids_json"] or "[]")
-        active_ids = active_source_ids(conn, source_ids)
+        active_ids = active_source_ids(conn, source_ids, user_context)
         if not active_ids:
             continue
         score = score_text(tokens, text, title=page["title"])
@@ -252,6 +411,7 @@ def search_query_memory(
     request: AskRequest,
     tokens: list[str],
     mode_config: AnswerModeConfig,
+    user_context: UserContext | None = None,
 ) -> list[MemoryHit]:
     if mode_config.memory_limit <= 0 or not tokens:
         return []
@@ -266,6 +426,8 @@ def search_query_memory(
 
     ranked: list[MemoryHit] = []
     for row in rows:
+        if not query_log_is_authorized(conn, row["citations_json"] or "[]", user_context):
+            continue
         row_question = row["question"] or ""
         if row_question.strip() == request.question.strip():
             continue
@@ -287,6 +449,46 @@ def search_query_memory(
 
     ranked.sort(key=lambda item: (item.score, item.created_at), reverse=True)
     return ranked[: mode_config.memory_limit]
+
+
+def can_read_source_id(conn, source_id: str | None, user_context: UserContext | None = None) -> bool:
+    if not source_id:
+        return False
+    row = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+    if row is None or row["status"] == "deleted":
+        return False
+    metadata = __import__("json").loads(row["metadata_json"] or "{}")
+    return can_read_metadata(metadata, user_context, row["owner"])
+
+
+def filter_authorized_citations(
+    conn,
+    citations: list[Citation],
+    user_context: UserContext | None = None,
+) -> list[Citation]:
+    return [citation for citation in citations if can_read_source_id(conn, citation.source_id, user_context)]
+
+
+def filter_authorized_gbrain_hits(
+    conn,
+    hits: list[GBrainHit],
+    user_context: UserContext | None = None,
+) -> list[GBrainHit]:
+    if user_context is None or user_context.is_admin:
+        return hits
+    return [hit for hit in hits if hit.source_id and can_read_source_id(conn, hit.source_id, user_context)]
+
+
+def query_log_is_authorized(conn, citations_json: str, user_context: UserContext | None = None) -> bool:
+    if user_context is None or user_context.is_admin:
+        return True
+    try:
+        citations = __import__("json").loads(citations_json or "[]")
+    except Exception:
+        return False
+    if not citations:
+        return False
+    return all(can_read_source_id(conn, citation.get("source_id"), user_context) for citation in citations)
 
 
 def build_memory_context(memory_hits: list[MemoryHit]) -> list[str]:

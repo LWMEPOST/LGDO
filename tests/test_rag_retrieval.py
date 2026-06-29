@@ -65,7 +65,7 @@ def test_rag_chunks_are_indexed_and_retrieval_prefers_matching_source(tmp_path, 
     assert status.json()["embedding_count"] >= 3
     assert status.json()["embedding_model"] == "local-hash-v1"
     assert status.json()["external_system_apis"]["feishu"] == "not_connected"
-    assert status.json()["postgres"]["port"] == 54322
+    assert status.json()["postgres"]["port"] == 5432
 
     with connect(settings.database_path) as conn:
         embedding_rows = conn.execute("SELECT metadata_json FROM document_chunks").fetchall()

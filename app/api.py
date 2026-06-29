@@ -4,7 +4,11 @@ from pathlib import Path
 import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, Request
+from fastapi.responses import StreamingResponse
 
+from app.aliases import delete_entity_alias, list_entity_aliases, upsert_entity_alias
+from app.auth import UserContext, resolve_user_context
 from app.catalog import (
     delete_source,
     list_knowledge_gaps,
@@ -21,7 +25,7 @@ from app.catalog import (
     update_wiki_page_status,
 )
 from app.config import get_settings
-from app.eval import add_eval_question, run_eval
+from app.eval import add_eval_question, compare_upgraded_eval, run_eval
 from app.feedback import submit_feedback
 from app.ingest import scan_sources
 from app.migration import migrate_sqlite_to_postgres
@@ -32,6 +36,7 @@ from app.models import (
     CompileResponse,
     EvalQuestionRequest,
     EvalRunResponse,
+    EntityAliasRequest,
     FeedbackRequest,
     FeedbackResponse,
     GapUpdateRequest,
@@ -39,12 +44,13 @@ from app.models import (
     ScanRequest,
     ScanResponse,
     SourcePreviewResponse,
+    UpgradedEvalRunRequest,
     UploadResponse,
     WikiPageContentResponse,
     WikiPageSaveRequest,
     WikiStatusUpdateRequest,
 )
-from app.search import ask
+from app.search import ask, stream_ask_events
 from app.vault import slugify
 from app.wiki import compile_wiki
 
@@ -52,13 +58,18 @@ from app.wiki import compile_wiki
 router = APIRouter()
 
 
+def current_user(request: Request) -> UserContext:
+    return resolve_user_context(get_settings(), request)
+
+
 @router.get("/sources")
 def list_sources_endpoint(
     domain: str | None = Query(default=None),
     include_deleted: bool = Query(default=False),
+    user: UserContext = Depends(current_user),
 ) -> list[dict]:
     try:
-        return list_sources(get_settings(), domain, include_deleted)
+        return list_sources(get_settings(), domain, include_deleted, user)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -75,9 +86,12 @@ def delete_source_endpoint(source_id: str, note: str | None = Query(default=None
 def source_preview_endpoint(
     source_id: str,
     max_chars: int = Query(default=8000, ge=200, le=50000),
+    user: UserContext = Depends(current_user),
 ) -> SourcePreviewResponse:
     try:
-        return SourcePreviewResponse(**read_source_preview(get_settings(), source_id, max_chars))
+        return SourcePreviewResponse(**read_source_preview(get_settings(), source_id, max_chars, user))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -241,9 +255,20 @@ def compile_endpoint(request: CompileRequest) -> CompileResponse:
 
 
 @router.post("/ask", response_model=AskResponse)
-def ask_endpoint(request: AskRequest) -> AskResponse:
+def ask_endpoint(request: AskRequest, user: UserContext = Depends(current_user)) -> AskResponse:
     try:
-        return ask(get_settings(), request)
+        return ask(get_settings(), request, user)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/ask/stream")
+def ask_stream_endpoint(request: AskRequest, user: UserContext = Depends(current_user)) -> StreamingResponse:
+    try:
+        return StreamingResponse(
+            stream_ask_events(get_settings(), request, user),
+            media_type="application/x-ndjson",
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -268,5 +293,45 @@ def eval_question_endpoint(request: EvalQuestionRequest) -> dict[str, str]:
 def eval_run_endpoint(domain: str | None = Query(default=None)) -> EvalRunResponse:
     try:
         return run_eval(get_settings(), domain)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/eval/upgraded")
+def upgraded_eval_endpoint(request: UpgradedEvalRunRequest) -> dict:
+    try:
+        return compare_upgraded_eval(get_settings(), domain=request.domain, mode=request.gbrain_mode)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/aliases")
+def list_aliases_endpoint(domain: str | None = Query(default=None)) -> list[dict]:
+    try:
+        return list_entity_aliases(get_settings(), domain)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/aliases")
+def upsert_alias_endpoint(request: EntityAliasRequest, user: UserContext = Depends(current_user)) -> dict:
+    try:
+        if not user.is_admin and user.role not in {"editor"}:
+            raise HTTPException(status_code=403, detail="需要 admin/editor 权限维护实体别名")
+        return upsert_entity_alias(get_settings(), request, user.user_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/aliases/{alias_id}")
+def delete_alias_endpoint(alias_id: str, user: UserContext = Depends(current_user)) -> dict:
+    try:
+        if not user.is_admin and user.role not in {"editor"}:
+            raise HTTPException(status_code=403, detail="需要 admin/editor 权限维护实体别名")
+        return delete_entity_alias(get_settings(), alias_id, user.user_id)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

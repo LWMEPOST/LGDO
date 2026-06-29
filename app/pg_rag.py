@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.auth import UserContext, filter_rows_by_acl
 from app.config import Settings
 from app.db import connect, rows_to_dicts
 from app.rag import diversify_ranked_rows, embed_text, rank_search_rows, tokenize
@@ -173,11 +174,46 @@ def search_pg_chunks(
     *,
     keyword_weight: float = 1.0,
     vector_weight: float = 12.0,
+    user_context: UserContext | None = None,
+    alias_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     init_pg_rag(settings)
+    query_vector = embed_text(question)
     with connect_postgres(settings) as conn:
         with conn.cursor() as cur:
-            if domain:
+            used_pgvector = False
+            if query_vector and _can_use_pgvector_search(cur):
+                candidate_limit = _pg_candidate_limit(limit)
+                try:
+                    if domain:
+                        cur.execute(
+                            """
+                            SELECT id, source_id, domain, title, chunk_index, text, tokens, metadata, embedding,
+                                   embedding_vector <=> %s::vector AS pgvector_distance
+                            FROM rag_document_chunks
+                            WHERE domain = %s AND embedding_vector IS NOT NULL
+                            ORDER BY embedding_vector <=> %s::vector
+                            LIMIT %s
+                            """,
+                            (_vector(query_vector), domain, _vector(query_vector), candidate_limit),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, source_id, domain, title, chunk_index, text, tokens, metadata, embedding,
+                                   embedding_vector <=> %s::vector AS pgvector_distance
+                            FROM rag_document_chunks
+                            WHERE embedding_vector IS NOT NULL
+                            ORDER BY embedding_vector <=> %s::vector
+                            LIMIT %s
+                            """,
+                            (_vector(query_vector), _vector(query_vector), candidate_limit),
+                        )
+                    used_pgvector = True
+                except Exception:
+                    used_pgvector = False
+
+            if not used_pgvector and domain:
                 cur.execute(
                     """
                     SELECT id, source_id, domain, title, chunk_index, text, tokens, metadata, embedding
@@ -186,7 +222,7 @@ def search_pg_chunks(
                     """,
                     (domain,),
                 )
-            else:
+            elif not used_pgvector:
                 cur.execute(
                     """
                     SELECT id, source_id, domain, title, chunk_index, text, tokens, metadata, embedding
@@ -196,11 +232,13 @@ def search_pg_chunks(
             columns = [desc.name for desc in cur.description]
             rows = [dict(zip(columns, row)) for row in cur.fetchall()]
 
+    rows = filter_rows_by_acl(rows, user_context)
     ranked = rank_search_rows(
         rows,
         question,
         keyword_weight=keyword_weight,
         vector_weight=vector_weight,
+        alias_context=alias_context,
     )
     return diversify_ranked_rows(ranked, limit)
 
@@ -313,6 +351,14 @@ def _upsert_pg_chunk(cur: Any, row: dict[str, Any], *, has_vector_column: bool) 
 
 def _vector(values: list[float]) -> str:
     return "[" + ",".join(f"{value:.6f}" for value in values) + "]"
+
+
+def _pg_candidate_limit(limit: int) -> int:
+    return max(limit * 8, 40)
+
+
+def _can_use_pgvector_search(cur: Any) -> bool:
+    return _pgvector_available(cur) and _column_exists(cur, "rag_document_chunks", "embedding_vector")
 
 
 def _try_enable_pgvector(settings: Settings) -> bool:

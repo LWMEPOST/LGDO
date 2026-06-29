@@ -10,13 +10,13 @@ from app.main import app
 
 def pg_available() -> bool:
     try:
-        with socket.create_connection(("localhost", 54322), timeout=1):
+        with socket.create_connection(("localhost", 5432), timeout=1):
             return True
     except OSError:
         return False
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 54322 is not available")
+@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
 def test_postgres_metadata_backend_runs_internal_flow(tmp_path, monkeypatch):
     sample_dir = tmp_path / "samples"
     sample_dir.mkdir()
@@ -32,7 +32,7 @@ def test_postgres_metadata_backend_runs_internal_flow(tmp_path, monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "database_backend", "postgres")
     monkeypatch.setattr(settings, "postgres_host", "localhost")
-    monkeypatch.setattr(settings, "postgres_port", 54322)
+    monkeypatch.setattr(settings, "postgres_port", 5432)
     monkeypatch.setattr(settings, "postgres_user", "postgres")
     monkeypatch.setattr(settings, "postgres_password", "postgres")
     monkeypatch.setattr(settings, "postgres_database", "lgdo_meta_test")

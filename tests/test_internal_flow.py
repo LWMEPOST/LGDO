@@ -35,7 +35,7 @@ def test_internal_mvp_flow(tmp_path, monkeypatch):
     assert console_asset.status_code == 200
     assert "知识库核心" in console_asset.text or "React" in console_asset.text
     console_js = client.get("/static/console.jsx").text
-    assert "产品客服知识空间" in console_js
+    assert "产品、客服与行政知识空间" in console_js
     assert "资料已删除" in console_js
 
     scan = client.post(

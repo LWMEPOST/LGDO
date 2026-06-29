@@ -224,15 +224,20 @@ def _query_gbrain_with_caller(
     limit: int,
     candidate_limit: int = 8,
 ) -> list[GBrainHit]:
+    collected: list[GBrainHit] = []
     try:
-        collected: list[GBrainHit] = []
         collected.extend(normalize_gbrain_hits(caller("query", params)))
-        for candidate in gbrain_query_candidates(question, candidate_limit):
-            collected.extend(normalize_gbrain_hits(caller("search", {"query": candidate, "limit": limit})))
-        return rank_gbrain_hits(dedupe_gbrain_hits(collected), question, limit)
     except GBrainError:
-        return []
-    return []
+        pass
+    for candidate in gbrain_query_candidates(question, candidate_limit):
+        try:
+            collected.extend(normalize_gbrain_hits(caller("search", {"query": candidate, "limit": limit})))
+        except GBrainError:
+            continue
+    return rank_gbrain_hits(dedupe_gbrain_hits(collected), question, limit)
+
+
+LOW_INFORMATION_CJK_PREFIXES = ("梳理", "公司", "所有", "全部", "哪些", "如果", "一个")
 
 
 def gbrain_query_candidates(question: str, candidate_limit: int = 8) -> list[str]:
@@ -245,14 +250,26 @@ def gbrain_query_candidates(question: str, candidate_limit: int = 8) -> list[str
     for phrase in _domain_query_phrases(question):
         if phrase not in candidates:
             candidates.append(phrase)
+    for phrase in ["时间窗口", "期限", "时限", "条款", "相互矛盾", "部门总监", "部门负责人"]:
+        if phrase in question and phrase not in candidates:
+            candidates.append(phrase)
     if cleaned and cleaned != question and cleaned not in candidates:
         candidates.append(cleaned)
-    for cjk_part in re.findall(r"[\u4e00-\u9fff]{4,}", cleaned):
-        for size in (4, 5, 6):
-            for index in range(0, max(0, len(cjk_part) - size + 1)):
-                token = cjk_part[index : index + size]
-                if token not in candidates:
-                    candidates.append(token)
+    if len(candidates) < max(2, candidate_limit // 2):
+        for cjk_part in re.findall(r"[\u4e00-\u9fff]{4,}", cleaned):
+            for size in (4, 5, 6):
+                for index in range(0, max(0, len(cjk_part) - size + 1)):
+                    token = cjk_part[index : index + size]
+                    if token.startswith(LOW_INFORMATION_CJK_PREFIXES):
+                        continue
+                    if token not in candidates:
+                        candidates.append(token)
+                    if len(candidates) >= candidate_limit:
+                        break
+                if len(candidates) >= candidate_limit:
+                    break
+            if len(candidates) >= candidate_limit:
+                break
     try:
         from app.rag import tokenize
 

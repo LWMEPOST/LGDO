@@ -74,6 +74,7 @@ export function IngestTask({
               <select value={scanForm.domain} onChange={(e) => setScanForm({ ...scanForm, domain: e.target.value })}>
                 <option value="product">产品知识</option>
                 <option value="customer_service">客服知识</option>
+                <option value="administration">行政知识</option>
               </select>
             </Field>
             <Field label="负责人">
