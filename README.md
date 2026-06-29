@@ -24,7 +24,6 @@
   <img src="https://img.shields.io/badge/图谱记忆-GBrain-6366f1?style=flat-square" alt="GBrain">
   <img src="https://img.shields.io/badge/生成模型-DeepSeek-111827?style=flat-square" alt="DeepSeek">
   <img src="https://img.shields.io/badge/Wiki工作流-Obsidian-7c3aed?style=flat-square" alt="Obsidian">
-  <img src="https://img.shields.io/badge/RAG准确率-93.55%25-22c55e?style=flat-square" alt="93.55% Accuracy">
   <img src="https://img.shields.io/badge/许可证-Apache_2.0-green?style=flat-square" alt="Apache 2.0">
 </p>
 
