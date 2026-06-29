@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.playwright-cli/
+.venv/
+venv/
+.env
+data/
+dist/
+node_modules/
+output/
+vault/
+uploads/
+frontend/node_modules/
+frontend/dist/

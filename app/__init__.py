@@ -1,0 +1,2 @@
+"""LGDO internal knowledge core."""
+

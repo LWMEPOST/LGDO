@@ -1,0 +1,7 @@
+{"ticket_id":"TK-2026-0412","created_at":"2026-04-12","customer_plan":"企业版","module":"知识库推荐","issue_summary":"客户反馈知识库命中率下降","status":"已解决","resolution_owner":"产品运营","resolution_summary":"发现 18 条 FAQ 已过期且同义词未配置，更新 FAQ 后首条命中率恢复到 68%"}
+{"ticket_id":"TK-2026-0428","created_at":"2026-04-28","customer_plan":"专业版","module":"邮件渠道","issue_summary":"邮件附件无法预览","status":"已关闭","resolution_owner":"研发支持","resolution_summary":"附件名包含空格导致预览服务解析失败，v2.4.0 已修复"}
+{"ticket_id":"TK-2026-0507","created_at":"2026-05-07","customer_plan":"标准版","module":"售后申请","issue_summary":"客户申请月付订阅退款","status":"已解决","resolution_owner":"售后专员","resolution_summary":"支付后第 5 天申请且未开票，有效会话 23 次，符合退款条件"}
+{"ticket_id":"TK-2026-0521","created_at":"2026-05-21","customer_plan":"企业版","module":"数据导出","issue_summary":"客户要求客服直接发送聊天记录","status":"已关闭","resolution_owner":"客服主管","resolution_summary":"已告知必须由企业管理员在客户后台发起导出申请，客服不能代为导出"}
+{"ticket_id":"TK-2026-0603","created_at":"2026-06-03","customer_plan":"专业版","module":"工单流转","issue_summary":"待客户确认工单被重复计时","status":"已解决","resolution_owner":"研发支持","resolution_summary":"确认 SLA 统计重复计时，v2.4.0 修复"}
+{"ticket_id":"TK-2026-0619","created_at":"2026-06-19","customer_plan":"企业版","module":"分派规则","issue_summary":"高等级客户未优先分派","status":"处理中","resolution_owner":"客服主管","resolution_summary":"已临时调整技能组权重，等待分派规则观察 3 个工作日"}
+
