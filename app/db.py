@@ -20,6 +20,7 @@ MAIN_TABLES = [
     "eval_questions",
     "ingest_reports",
     "document_chunks",
+    "entity_aliases",
     "audit_logs",
 ]
 
@@ -33,6 +34,7 @@ TABLE_PRIMARY_KEYS = {
     "eval_questions": "id",
     "ingest_reports": "id",
     "document_chunks": "id",
+    "entity_aliases": "id",
     "audit_logs": "id",
 }
 
@@ -188,6 +190,25 @@ ON document_chunks(domain);
 
 CREATE INDEX IF NOT EXISTS idx_document_chunks_source
 ON document_chunks(source_id);
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+  id TEXT PRIMARY KEY,
+  domain TEXT,
+  canonical_name TEXT NOT NULL,
+  canonical_key TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  alias_key TEXT NOT NULL,
+  entity_type TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_domain_alias
+ON entity_aliases(domain, alias_key);
+
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_canonical
+ON entity_aliases(domain, canonical_key);
 """
 
 PG_SCHEMA = """
@@ -340,6 +361,25 @@ ON document_chunks(domain);
 
 CREATE INDEX IF NOT EXISTS idx_document_chunks_source
 ON document_chunks(source_id);
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+  id TEXT PRIMARY KEY,
+  domain TEXT,
+  canonical_name TEXT NOT NULL,
+  canonical_key TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  alias_key TEXT NOT NULL,
+  entity_type TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_domain_alias
+ON entity_aliases(domain, alias_key);
+
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_canonical
+ON entity_aliases(domain, canonical_key);
 """
 
 

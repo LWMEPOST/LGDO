@@ -21,10 +21,12 @@ export function formatAnswer(answer: AskResponse): string {
   const strategyText = strategy
     ? [
         `回答模式：${strategy.mode_label || strategy.answer_mode || "-"}`,
-        `检索分块：${strategy.chunk_hits ?? 0}`,
+        `检索分块：${strategy.authorized_chunk_hits ?? strategy.chunk_hits ?? 0}/${strategy.chunk_hits ?? 0}`,
         `上下文：${strategy.context_limit ?? 0}`,
         `历史记忆：${strategy.memory_hits ?? 0}`,
-      ].join(" / ")
+        strategy.alias_expanded ? `别名：${strategy.matched_aliases?.map((item) => `${item.alias}->${item.canonical_name}`).join("，") || "已扩展"}` : "",
+        answer.user_context?.user_id ? `用户：${answer.user_context.user_id} (${answer.user_context.role || "-"})` : "",
+      ].filter(Boolean).join(" / ")
     : "";
   const memories = answer.memory_hits?.length
     ? `\n\n相似历史问答：\n${answer.memory_hits.map((hit) => `- ${hit.question}\n  ${hit.answer_snippet}`).join("\n")}`
@@ -79,6 +81,7 @@ export function translateDomain(value: unknown): string {
   return ({
     product: "产品知识",
     customer_service: "客服知识",
+    administration: "行政知识",
   } as Record<string, string>)[String(value)] || String(value || "-");
 }
 
@@ -195,6 +198,8 @@ export function translateAclTag(value: unknown): string {
     "产品": "产品",
     customer_service: "客服",
     "客服": "客服",
+    administration: "行政",
+    "行政": "行政",
     upload: "上传",
     "上传": "上传",
   } as Record<string, string>)[String(value)] || String(value || "-");

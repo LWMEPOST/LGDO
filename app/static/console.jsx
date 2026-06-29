@@ -82,9 +82,9 @@ function App() {
 
   async function refresh() {
     const [nextSources, nextReports, nextPages, nextReviews, nextGaps, nextRagStatus] = await Promise.all([
-      api("/api/internal/sources?domain=product"),
+      api("/api/internal/sources"),
       api("/api/internal/ingest/reports"),
-      api("/api/internal/wiki/pages?domain=product"),
+      api("/api/internal/wiki/pages"),
       api("/api/internal/reviews?status=pending"),
       api("/api/internal/gaps"),
       api("/api/internal/rag/status"),
@@ -291,7 +291,7 @@ function App() {
           <div className="brand-mark">LG</div>
           <div>
             <strong>知识库核心</strong>
-            <span>产品客服知识空间 · 飞书知识库式内部空间</span>
+            <span>产品、客服与行政知识空间 · 飞书知识库式内部空间</span>
           </div>
         </div>
         <div className="global-search">
@@ -329,7 +329,7 @@ function App() {
           <div className="space-header">
             <span className="space-avatar">知</span>
             <div>
-              <strong>产品客服知识库</strong>
+              <strong>核心知识库</strong>
               <small>{sources.length} 份资料 · {pages.length} 个知识页</small>
             </div>
           </div>
@@ -380,13 +380,14 @@ function App() {
         <main className="task-area">
           <header className="task-header">
             <div>
-              <p className="eyebrow">产品客服知识库 / {active.label}</p>
+              <p className="eyebrow">核心知识库 / {active.label}</p>
               <h1>{active.label}</h1>
               <p>{active.desc}</p>
             </div>
             <div className="header-meta">
               <span className="pill">产品知识</span>
-              <span className="pill">内部可见</span>
+              <span className="pill">客服知识</span>
+              <span className="pill">行政知识</span>
             </div>
           </header>
 
@@ -491,7 +492,7 @@ function Overview({ stats, reports, pages, gaps, ragStatus }) {
           <div className="stat"><strong>{ragStatus?.chunk_count || 0}</strong><span>检索分块</span></div>
           <div className="stat"><strong>{ragStatus?.source_count || 0}</strong><span>已索引资料</span></div>
           <div className="stat"><strong>{ragStatus?.database_backend || "sqlite"}</strong><span>元数据存储</span></div>
-          <div className="stat"><strong>{ragStatus?.postgres?.port || 54322}</strong><span>Pg 目标端口</span></div>
+          <div className="stat"><strong>{ragStatus?.postgres?.port || 5432}</strong><span>Pg 目标端口</span></div>
         </div>
       </Panel>
       <Panel title="外部系统接入状态" badge="未接入">
@@ -537,6 +538,7 @@ function IngestTask({ scanForm, setScanForm, scan, compileWiki, reports, showToa
             <select value={scanForm.domain} onChange={(e) => setScanForm({ ...scanForm, domain: e.target.value })}>
               <option value="product">产品知识</option>
               <option value="customer_service">客服知识</option>
+              <option value="administration">行政知识</option>
             </select>
           </Field>
           <Field label="负责人">
@@ -698,6 +700,7 @@ function QaTask({ askForm, setAskForm, ask, answer, feedback, setFeedback, creat
             <select value={askForm.domain} onChange={(e) => setAskForm({ ...askForm, domain: e.target.value })}>
               <option value="product">产品知识</option>
               <option value="customer_service">客服知识</option>
+              <option value="administration">行政知识</option>
             </select>
           </Field>
           <Field label="回答模式">
@@ -815,7 +818,7 @@ function KnowledgeAside({
           <StatusLine label="检索分块" value={ragStatus?.chunk_count || 0} state="ok" />
           <StatusLine label="已索引资料" value={ragStatus?.source_count || 0} state="ok" />
           <StatusLine label="元数据存储" value={ragStatus?.database_backend || "sqlite"} state="idle" />
-          <StatusLine label="Pg 目标端口" value={ragStatus?.postgres?.port || 54322} state="idle" />
+          <StatusLine label="Pg 目标端口" value={ragStatus?.postgres?.port || 5432} state="idle" />
         </div>
         <button className="secondary full-button" onClick={() => syncPostgresRag().catch((error) => showToast(error.message))}>
           同步 PostgreSQL RAG
@@ -1006,6 +1009,7 @@ function translateDomain(value) {
   return ({
     product: "产品知识",
     customer_service: "客服知识",
+    administration: "行政知识",
   })[value] || value || "-";
 }
 
@@ -1122,6 +1126,8 @@ function translateAclTag(value) {
     "产品": "产品",
     customer_service: "客服",
     "客服": "客服",
+    administration: "行政",
+    "行政": "行政",
     upload: "上传",
     "上传": "上传",
   })[value] || value || "-";

@@ -1,9 +1,12 @@
 import { Field, Item, List, Panel } from "../components/common";
-import type { EditorState, WikiPage } from "../types";
+import type { EditorState, SpaceFilter, WikiPage } from "../types";
 import { translatePageType, translateReviewStatus } from "../utils/format";
+import { countPagesByType } from "../utils/space";
 
 export function WikiTask({
   pages,
+  activeSpaceFilter,
+  clearSpaceFilter,
   editor,
   setEditor,
   loadPage,
@@ -12,6 +15,8 @@ export function WikiTask({
   showToast,
 }: {
   pages: WikiPage[];
+  activeSpaceFilter: SpaceFilter;
+  clearSpaceFilter: () => void;
   editor: EditorState;
   setEditor: (editor: EditorState) => void;
   loadPage: (path: string) => Promise<void>;
@@ -19,11 +24,25 @@ export function WikiTask({
   markPageStale: (path?: string) => Promise<void>;
   showToast: (message: string) => void;
 }) {
+  const buckets = countPagesByType(pages);
   return (
-    <section className="split-task">
+    <section className="wiki-workspace">
       <Panel title="知识页列表" badge={pages.length}>
+        <div className="source-filter-bar">
+          <span>{activeSpaceFilter.label}</span>
+          <small>{activeSpaceFilter.desc}</small>
+          {activeSpaceFilter.id !== "all" && <button className="link-button" onClick={clearSpaceFilter} type="button">清除</button>}
+        </div>
+        <div className="wiki-type-strip">
+          <TypeStat label="全部" value={buckets.all} />
+          <TypeStat label="政策" value={buckets.policy} />
+          <TypeStat label="FAQ" value={buckets.faq} />
+          <TypeStat label="功能" value={buckets.feature} />
+          <TypeStat label="草稿" value={buckets.draft} />
+          <TypeStat label="过期" value={buckets.stale} tone={buckets.stale ? "warn" : "idle"} />
+        </div>
         <List rows={pages} empty="暂无知识页" render={(page) => (
-          <Item title={page.title} meta={[translatePageType(page.page_type), translateReviewStatus(page.review_status), page.path]}>
+          <Item title={page.title} meta={[translatePageType(page.page_type), translateReviewStatus(page.review_status), page.domain, page.path]}>
             <button onClick={() => loadPage(page.path).catch((error) => showToast(error.message))}>编辑</button>
             <button className="warn" onClick={() => markPageStale(page.path).catch((error) => showToast(error.message))}>标记过期</button>
           </Item>
@@ -53,5 +72,14 @@ export function WikiTask({
         </div>
       </Panel>
     </section>
+  );
+}
+
+function TypeStat({ label, value, tone = "idle" }: { label: string; value: number; tone?: "idle" | "warn" }) {
+  return (
+    <div className={`wiki-type ${tone}`}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
   );
 }

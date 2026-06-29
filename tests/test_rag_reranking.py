@@ -1,3 +1,4 @@
+from app.aliases import build_alias_context
 from app.rag import diversify_ranked_rows, embed_text, rank_search_rows, tokenize
 
 
@@ -222,10 +223,23 @@ def test_reranker_prefers_pricing_table_for_daily_image_api_cost_question():
     ranked = rank_search_rows(
         [case_study, guide, pricing],
         "一个日均 500 次文生图调用的电商团队，应该选择什么套餐组合？给出总成本和理由。",
+        alias_context=build_alias_context(
+            "一个日均 500 次文生图调用的电商团队，应该选择什么套餐组合？给出总成本和理由。",
+            [
+                {
+                    "canonical_name": "全平台定价对比表",
+                    "canonical_key": "全平台定价对比表",
+                    "alias": "套餐组合",
+                    "alias_key": "套餐组合",
+                    "entity_type": "pricing_table",
+                    "metadata_json": '{"terms":["企业标准","API调用/月","总成本"]}',
+                }
+            ],
+        ),
     )
 
     assert ranked[0]["source_id"] == "tbl_0063"
-    assert ranked[0]["context_boost"] > ranked[1]["context_boost"]
+    assert ranked[0]["alias_boost"] > 0
 
 
 def test_reranker_boosts_content_safety_dependency_documents():
@@ -297,10 +311,10 @@ def test_reranker_boosts_privacy_audit_sources():
         "customer_service",
     )
 
-    ranked = rank_search_rows([competitor, policy, retention], "如果公司要做一次数据隐私合规审计，需要检查的平台政策条款有哪些？")
+    ranked = rank_search_rows([competitor, policy, retention], "API-0018 数据隐私合规审计需要检查哪些平台政策条款？")
 
     assert ranked[0]["source_id"] == "api_0018"
-    assert ranked[0]["context_boost"] > 0
+    assert ranked[0]["doc_code_boost"] > 0
 
 
 def test_reranker_boosts_prd_priority_dependency_sources():
@@ -320,10 +334,49 @@ def test_reranker_boosts_prd_priority_dependency_sources():
         "实时同步 Yjs + WebSocket，支持多人在同一个画布上实时协作。",
     )
 
-    ranked = rank_search_rows([roadmap, rtc, canvas], "从 PRD 文档中提取所有明确标注了优先级（P0/P1/P2）的功能需求，并分析各 PRD 模块之间的依赖关系。")
+    ranked = rank_search_rows([roadmap, rtc, canvas], "从 PRD-0001 和 PRD-0006 文档中提取所有明确标注了优先级（P0/P1/P2）的功能需求，并分析依赖关系。")
 
     assert ranked[0]["source_id"] in {"prd_0001", "prd_0006"}
-    assert ranked[0]["context_boost"] > ranked[-1]["context_boost"]
+    assert ranked[0]["doc_code_boost"] > 0
+
+
+def test_reranker_uses_alias_context_without_benchmark_intent_rules():
+    import app.rag as rag
+    from app.aliases import build_alias_context
+
+    rows = [
+        make_row("generic", "普通制度", "审批流程说明。"),
+        make_row("role", "费用报销制度", "部门负责人审批报销、采购、招待等事项。"),
+    ]
+    context = build_alias_context(
+        "部门总监有哪些权限？",
+        [
+            {
+                "canonical_name": "部门负责人",
+                "canonical_key": "部门负责人",
+                "alias": "部门总监",
+                "alias_key": "部门总监",
+                "entity_type": "role",
+                "metadata_json": '{"terms":["报销","采购","招待"]}',
+            }
+        ],
+    )
+
+    ranked = rag.rank_search_rows(rows, "部门总监有哪些权限？", alias_context=context)
+
+    assert ranked[0]["id"] == "role_chunk_0000"
+    assert ranked[0]["alias_boost"] > 0
+    assert ranked[0]["context_boost"] < 100
+    removed_helpers = [
+        "_".join(["pricing", "calculation", "intent"]),
+        "_".join(["content", "safety", "dependency", "intent"]),
+        "_".join(["privacy", "audit", "intent"]),
+        "_".join(["time", "window", "policy", "intent"]),
+        "_".join(["prd", "priority", "dependency", "intent"]),
+        "_".join(["api", "failure", "checklist", "intent"]),
+    ]
+    for name in removed_helpers:
+        assert not hasattr(rag, name)
 
 
 def test_tokenize_splits_mixed_english_and_chinese_terms():

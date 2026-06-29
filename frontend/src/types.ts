@@ -102,10 +102,20 @@ export interface AskResponse {
     answer_mode?: string;
     mode_label?: string;
     chunk_hits?: number;
+    authorized_chunk_hits?: number;
     context_limit?: number;
     memory_hits?: number;
+    alias_expanded?: boolean;
+    matched_aliases?: Array<{ canonical_name?: string; alias?: string; domain?: string }>;
     keyword_weight?: number;
     vector_weight?: number;
+  };
+  user_context?: {
+    user_id?: string;
+    username?: string;
+    role?: string;
+    acl_tags?: string[];
+    auth_provider?: string;
   };
   memory_hits?: Array<{
     query_id: string;
@@ -127,4 +137,22 @@ export interface EditorState {
   content: string;
   review_status: string;
   owner: string;
+}
+
+export type SpaceFilterKind = "all" | "domain" | "page_type" | "review_status" | "gaps";
+
+export interface SpaceFilter {
+  id: string;
+  label: string;
+  desc: string;
+  kind: SpaceFilterKind;
+  value?: string;
+  targetSection?: "overview" | "sources" | "wiki" | "qa" | "gaps" | "reviews";
+  count: number;
+}
+
+export interface SpaceDirectoryGroup {
+  id: string;
+  label: string;
+  items: SpaceFilter[];
 }

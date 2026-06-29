@@ -1,8 +1,8 @@
 import type { ReactNode } from "react";
 
 import { APP_RAIL_ITEMS, NAV_ITEMS, type SectionId } from "../constants";
-import type { KnowledgeGap, RagStatus, SourcePreview, SourceRecord, WikiPage } from "../types";
-import { countByPageType, translateSourceType } from "../utils/format";
+import type { KnowledgeGap, RagStatus, SourcePreview, SourceRecord, SpaceDirectoryGroup, SpaceFilter, WikiPage } from "../types";
+import { translateSourceType } from "../utils/format";
 
 interface LayoutProps {
   activeSection: SectionId;
@@ -12,6 +12,13 @@ interface LayoutProps {
   sources: SourceRecord[];
   pages: WikiPage[];
   gaps: KnowledgeGap[];
+  scopedSources: SourceRecord[];
+  scopedPages: WikiPage[];
+  scopedGaps: KnowledgeGap[];
+  directory: SpaceDirectoryGroup[];
+  activeSpaceFilter: SpaceFilter;
+  selectSpaceFilter: (filter: SpaceFilter) => void;
+  clearSpaceFilter: () => void;
   reportCount: number;
   reviewCount: number;
   ragStatus: RagStatus | null;
@@ -31,6 +38,13 @@ export function Layout({
   sources,
   pages,
   gaps,
+  scopedSources,
+  scopedPages,
+  scopedGaps,
+  directory,
+  activeSpaceFilter,
+  selectSpaceFilter,
+  clearSpaceFilter,
   reportCount,
   reviewCount,
   ragStatus,
@@ -48,21 +62,34 @@ export function Layout({
     sources: sources.length,
     wiki: pages.length,
     qa: gaps.length,
+    gaps: gaps.length,
     reviews: reviewCount,
   };
+  const spaceFilters = directory.flatMap((group) => group.items);
+  const activeDomain = activeSpaceFilter.kind === "domain" ? activeSpaceFilter.value : "";
+  const domainPills = [
+    { value: "product", label: "产品知识" },
+    { value: "customer_service", label: "客服知识" },
+    { value: "administration", label: "行政知识" },
+  ].map((domain) => ({
+    ...domain,
+    filter: spaceFilters.find((filter) => filter.kind === "domain" && filter.value === domain.value),
+    active: activeDomain === domain.value,
+  }));
 
   return (
     <div className="wiki-shell">
       <header className="wiki-topbar">
         <div className="topbar-brand">
           <div className="brand-mark">L</div>
-          <div>
-            <strong>LGDO 知识库</strong>
-            <span>内部核心空间 · 产品与客服</span>
+          <div className="brand-copy">
+            <span className="brand-kicker">LGDO Console</span>
+            <strong>知识工作台</strong>
+            <span>内部核心空间 · 产品、客服与行政</span>
           </div>
         </div>
         <div className="global-search">
-          <span>⌕</span>
+          <span className="search-icon">⌕</span>
           <input
             value={searchText}
             onChange={(event) => setSearchText(event.target.value)}
@@ -70,15 +97,15 @@ export function Layout({
           />
         </div>
         <div className="topbar-actions">
-          <span className="sync-state"><span className="status-dot"></span>核心功能优先</span>
-          <button onClick={() => setActiveSection("ingest")}>导入</button>
+          <span className="sync-state"><span className="status-dot"></span><span>核心功能稳定</span></span>
+          <button className="primary-action" onClick={() => setActiveSection("ingest")}>导入</button>
           <button className="secondary" onClick={() => refresh().catch((error) => showToast(error.message))}>刷新</button>
         </div>
       </header>
 
       <div className="wiki-layout">
         <aside className="app-rail" aria-label="知识库快捷入口">
-          <div className="rail-logo">知</div>
+          <div className="rail-logo">L</div>
           {APP_RAIL_ITEMS.map((item) => (
             <button
               key={item.id}
@@ -96,12 +123,12 @@ export function Layout({
           <div className="space-header">
             <span className="space-avatar">知</span>
             <div>
-              <strong>产品客服知识库</strong>
-              <small>{sources.length} 份资料 · {pages.length} 个知识页 · 内部可见</small>
+              <strong>核心知识库</strong>
+              <small>{activeSpaceFilter.label} · {activeSpaceFilter.count} 项 · 内部可见</small>
             </div>
           </div>
           <button className="new-page-button" onClick={() => setActiveSection("ingest")} type="button">
-            <span>+</span>
+            <span className="new-page-icon">+</span>
             <strong>导入资料</strong>
           </button>
 
@@ -111,6 +138,7 @@ export function Layout({
                 key={item.id}
                 className={`nav-item ${activeSection === item.id ? "active" : ""}`}
                 onClick={() => setActiveSection(item.id)}
+                aria-current={activeSection === item.id ? "page" : undefined}
                 type="button"
               >
                 <span className="nav-icon">{item.icon}</span>
@@ -123,13 +151,12 @@ export function Layout({
             ))}
           </nav>
 
-          <div className="tree-section">
-            <div className="tree-title">空间目录</div>
-            <TreeItem label="产品政策" count={countByPageType(pages, "policy")} onClick={() => setActiveSection("wiki")} />
-            <TreeItem label="客服问答" count={countByPageType(pages, "faq")} onClick={() => setActiveSection("wiki")} />
-            <TreeItem label="功能说明" count={countByPageType(pages, "feature")} onClick={() => setActiveSection("wiki")} />
-            <TreeItem label="待补充内容" count={gaps.length} onClick={() => setActiveSection("qa")} />
-          </div>
+          <SpaceTree
+            directory={directory}
+            activeSpaceFilter={activeSpaceFilter}
+            selectSpaceFilter={selectSpaceFilter}
+            clearSpaceFilter={clearSpaceFilter}
+          />
 
           <div className="tree-section muted-tree">
             <div className="tree-title">外部连接</div>
@@ -141,15 +168,30 @@ export function Layout({
 
         <main className="task-area">
           <header className="task-header">
-            <div>
-              <p className="eyebrow">产品客服知识库 / {active.label}</p>
+            <div className="task-heading">
+              <p className="eyebrow">核心知识库 / {active.label}</p>
               <h1>{active.label}</h1>
               <p>{active.desc}</p>
             </div>
-            <div className="header-meta">
-              <span className="pill strong-pill">产品知识</span>
-              <span className="pill">客服知识</span>
-              <span className="pill muted-pill">外部平台未接入</span>
+            <div className="header-meta" aria-label="知识域标签">
+              {domainPills.map((domain) => (
+                <button
+                  key={domain.value}
+                  className={`pill domain-pill ${domain.active ? "strong-pill active" : ""} ${domain.filter ? "" : "muted-pill"}`}
+                  type="button"
+                  aria-pressed={domain.active}
+                  onClick={() => domain.filter ? selectSpaceFilter(domain.filter) : showToast(`${domain.label}暂无内容`)}
+                >
+                  {domain.label}
+                </button>
+              ))}
+              <button
+                className="pill muted-pill domain-pill"
+                type="button"
+                onClick={() => showToast("外部平台会在第二阶段接入")}
+              >
+                外部平台未接入
+              </button>
             </div>
           </header>
           <div className="content-canvas">{children}</div>
@@ -157,9 +199,10 @@ export function Layout({
 
         <KnowledgeAside
           activeLabel={active.label}
-          sources={sources}
-          pages={pages}
-          gaps={gaps}
+          sources={scopedSources}
+          pages={scopedPages}
+          gaps={scopedGaps}
+          activeSpaceFilter={activeSpaceFilter}
           ragStatus={ragStatus}
           selectedSource={selectedSource}
           sourcePreview={sourcePreview}
@@ -172,11 +215,66 @@ export function Layout({
   );
 }
 
-function TreeItem({ label, count, muted = false, onClick }: { label: string; count: number; muted?: boolean; onClick: () => void }) {
+function SpaceTree({
+  directory,
+  activeSpaceFilter,
+  selectSpaceFilter,
+  clearSpaceFilter,
+}: {
+  directory: SpaceDirectoryGroup[];
+  activeSpaceFilter: SpaceFilter;
+  selectSpaceFilter: (filter: SpaceFilter) => void;
+  clearSpaceFilter: () => void;
+}) {
   return (
-    <button className={`tree-item ${muted ? "muted" : ""}`} onClick={onClick} type="button">
+    <div className="space-tree" aria-label="空间目录">
+      {directory.map((group) => (
+        <div className="tree-section" key={group.id}>
+          <div className="tree-title">{group.label}</div>
+          {group.items.map((item) => (
+            <div key={item.id}>
+              <TreeItem
+                label={item.label}
+                desc={item.desc}
+                count={item.count}
+                active={activeSpaceFilter.id === item.id}
+                onClick={() => selectSpaceFilter(item)}
+              />
+            </div>
+          ))}
+        </div>
+      ))}
+      {activeSpaceFilter.id !== "all" && (
+        <button className="clear-tree-filter" type="button" onClick={clearSpaceFilter}>
+          清除目录筛选
+        </button>
+      )}
+    </div>
+  );
+}
+
+function TreeItem({
+  label,
+  desc,
+  count,
+  active = false,
+  muted = false,
+  onClick,
+}: {
+  label: string;
+  desc?: string;
+  count: number;
+  active?: boolean;
+  muted?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button className={`tree-item ${muted ? "muted" : ""} ${active ? "active" : ""}`} onClick={onClick} type="button">
       <span className="tree-caret">⌄</span>
-      <span>{label}</span>
+      <span>
+        <strong>{label}</strong>
+        {desc && <small className="tree-desc">{desc}</small>}
+      </span>
       <small>{count}</small>
     </button>
   );
@@ -187,6 +285,7 @@ function KnowledgeAside({
   sources,
   pages,
   gaps,
+  activeSpaceFilter,
   ragStatus,
   selectedSource,
   sourcePreview,
@@ -198,6 +297,7 @@ function KnowledgeAside({
   sources: SourceRecord[];
   pages: WikiPage[];
   gaps: KnowledgeGap[];
+  activeSpaceFilter: SpaceFilter;
   ragStatus: RagStatus | null;
   selectedSource?: SourceRecord;
   sourcePreview: SourcePreview | null;
@@ -211,8 +311,9 @@ function KnowledgeAside({
       <section className="aside-card">
         <div className="aside-title">
           <h2>{activeLabel}</h2>
-          <span className="pill strong-pill">内部空间</span>
+          <span className="pill strong-pill">{activeSpaceFilter.label}</span>
         </div>
+        <p className="aside-context">{activeSpaceFilter.desc} · 当前视图</p>
         <div className="aside-metrics">
           <Metric label="资料" value={sources.length} />
           <Metric label="知识页" value={pages.length} />
@@ -232,7 +333,7 @@ function KnowledgeAside({
           <StatusLine label="向量后端" value={ragStatus?.vector_backend || "jsonb"} state={ragStatus?.pgvector_enabled ? "ok" : "idle"} />
           <StatusLine label="PgVector 列" value={ragStatus?.vector_count ?? 0} state={ragStatus?.vector_count ? "ok" : "idle"} />
           <StatusLine label="元数据存储" value={ragStatus?.database_backend || "sqlite"} state="idle" />
-          <StatusLine label="Pg 目标端口" value={ragStatus?.postgres?.port || 54322} state="idle" />
+          <StatusLine label="Pg 目标端口" value={ragStatus?.postgres?.port || 5432} state="idle" />
         </div>
         <button className="secondary full-button" onClick={() => syncPostgresRag().catch((error) => showToast(error.message))}>
           同步 PostgreSQL RAG

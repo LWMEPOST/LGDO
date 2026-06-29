@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.config import Settings
+from app.auth import UserContext, can_read_metadata, filter_rows_by_acl
 from app.db import audit, connect_app, init_app_db, row_to_dict, rows_to_dicts
 from app.gbrain import get_gbrain_status
 from app.models import GapUpdateRequest, ReviewUpdateRequest, WikiPageSaveRequest, WikiStatusUpdateRequest
@@ -9,7 +10,12 @@ from app.timeutil import now_iso
 from app.vault import append_log, ensure_vault
 
 
-def list_sources(settings: Settings, domain: str | None = None, include_deleted: bool = False) -> list[dict]:
+def list_sources(
+    settings: Settings,
+    domain: str | None = None,
+    include_deleted: bool = False,
+    user_context: UserContext | None = None,
+) -> list[dict]:
     init_app_db(settings)
     query = "SELECT * FROM sources"
     params: list[object] = []
@@ -23,16 +29,23 @@ def list_sources(settings: Settings, domain: str | None = None, include_deleted:
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY updated_at DESC"
     with connect_app(settings) as conn:
-        return rows_to_dicts(conn.execute(query, params).fetchall())
+        return filter_rows_by_acl(rows_to_dicts(conn.execute(query, params).fetchall()), user_context)
 
 
-def read_source_preview(settings: Settings, source_id: str, max_chars: int = 8000) -> dict:
+def read_source_preview(
+    settings: Settings,
+    source_id: str,
+    max_chars: int = 8000,
+    user_context: UserContext | None = None,
+) -> dict:
     init_app_db(settings)
     ensure_vault(settings.vault_path)
     with connect_app(settings) as conn:
         source = row_to_dict(conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone())
     if source is None:
         raise ValueError(f"source 不存在: {source_id}")
+    if not can_read_metadata(source.get("metadata") or {}, user_context, source.get("owner")):
+        raise PermissionError(f"当前用户无权预览 source: {source_id}")
 
     metadata = source.get("metadata") or {}
     preview_path = metadata.get("normalized_path") or source.get("raw_path")

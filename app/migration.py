@@ -150,4 +150,16 @@ _KNOWN_COLUMNS = {
         "created_at",
     },
     "document_chunks": {"id", "source_id", "domain", "title", "chunk_index", "text", "token_json", "metadata_json", "created_at", "updated_at"},
+    "entity_aliases": {
+        "id",
+        "domain",
+        "canonical_name",
+        "canonical_key",
+        "alias",
+        "alias_key",
+        "entity_type",
+        "metadata_json",
+        "created_at",
+        "updated_at",
+    },
 }

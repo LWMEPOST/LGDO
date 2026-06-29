@@ -11,13 +11,13 @@ from app.migration import migrate_sqlite_to_postgres
 
 def pg_available() -> bool:
     try:
-        with socket.create_connection(("localhost", 54322), timeout=1):
+        with socket.create_connection(("localhost", 5432), timeout=1):
             return True
     except OSError:
         return False
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 54322 is not available")
+@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
 def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, monkeypatch):
     sample_dir = tmp_path / "samples"
     sample_dir.mkdir()
@@ -105,7 +105,7 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     assert answer_after.json()["citations"][0]["source_id"] == expected_source_id
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 54322 is not available")
+@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
 def test_migration_endpoint_returns_table_counts(tmp_path, monkeypatch):
     sample_dir = tmp_path / "samples"
     sample_dir.mkdir()

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+DOMAIN_PATTERN = "^(product|customer_service|administration)$"
+
 
 class ScanRequest(BaseModel):
     root_path: str
-    domain: str = Field(pattern="^(product|customer_service)$")
+    domain: str = Field(pattern=DOMAIN_PATTERN)
     owner: str | None = None
     acl_tags: list[str] = []
     metadata_defaults: dict = {}
@@ -38,7 +40,7 @@ class SourcePreviewResponse(BaseModel):
 
 class CompileRequest(BaseModel):
     source_ids: list[str] | None = None
-    domain: str = Field(pattern="^(product|customer_service)$")
+    domain: str = Field(pattern=DOMAIN_PATTERN)
     page_types: list[str] | None = None
 
 
@@ -51,9 +53,13 @@ class CompileResponse(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
-    domain: str | None = Field(default=None, pattern="^(product|customer_service)$")
+    domain: str | None = Field(default=None, pattern=DOMAIN_PATTERN)
     answer_mode: str = "detail"
     require_citations: bool = True
+    user_id: str | None = None
+    username: str | None = None
+    role: str | None = None
+    acl_tags: list[str] | None = None
 
 
 class Citation(BaseModel):
@@ -79,6 +85,7 @@ class AskResponse(BaseModel):
     missing_info: list[str]
     memory_hits: list[MemoryHit] = []
     retrieval_strategy: dict = {}
+    user_context: dict = {}
 
 
 class FeedbackRequest(BaseModel):
@@ -95,7 +102,7 @@ class FeedbackResponse(BaseModel):
 
 class EvalQuestionRequest(BaseModel):
     question: str
-    domain: str = Field(pattern="^(product|customer_service)$")
+    domain: str = Field(pattern=DOMAIN_PATTERN)
     expected_sources: list[str] = []
     expected_answer_points: list[str] = []
     risk_level: str = Field(default="low", pattern="^(low|medium|high)$")
@@ -107,6 +114,11 @@ class EvalRunResponse(BaseModel):
     with_citations: int
     missing: int
     citation_rate: float
+
+
+class UpgradedEvalRunRequest(BaseModel):
+    domain: str | None = Field(default=None, pattern=DOMAIN_PATTERN)
+    gbrain_mode: str = Field(default="both", pattern="^(on|off|both)$")
 
 
 class ReviewUpdateRequest(BaseModel):
@@ -140,3 +152,11 @@ class GapUpdateRequest(BaseModel):
     owner: str | None = None
     linked_page_path: str | None = None
     note: str | None = None
+
+
+class EntityAliasRequest(BaseModel):
+    canonical_name: str
+    alias: str
+    domain: str | None = Field(default=None, pattern=DOMAIN_PATTERN)
+    entity_type: str | None = None
+    metadata: dict = {}
