@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import json
 import re
 import urllib.error
@@ -56,6 +57,70 @@ def generate_answer(
     message = choices[0].get("message") or {}
     content = message.get("content")
     return content.strip() if isinstance(content, str) and content.strip() else None
+
+
+def _iter_sse_lines(response) -> Iterator[str]:
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="ignore").strip()
+        if line:
+            yield line
+
+
+def stream_generate_answer(
+    settings: Settings,
+    question: str,
+    context_blocks: list[str],
+    answer_mode: str = "detail",
+    *,
+    memory_blocks: list[str] | None = None,
+) -> Iterator[str]:
+    if not settings.deepseek_api_key or not settings.deepseek_model:
+        return
+
+    prompt = build_prompt(question, context_blocks, answer_mode, memory_blocks or [])
+    payload = {
+        "model": settings.deepseek_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是内部产品/客服知识库助手。只能基于给定资料回答；资料不足时明确说明缺口。"
+                    "回答必须保留资料中的关键数字、单位、日期、英文参数名、错误码和金额，不要改写成近义但丢失精确信息的表达。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "stream": True,
+    }
+    request = urllib.request.Request(
+        f"{settings.deepseek_base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.deepseek_api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            for line in _iter_sse_lines(response):
+                if not line.startswith("data:"):
+                    continue
+                data = line.removeprefix("data:").strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    body = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                for choice in body.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        yield content
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return
 
 
 def build_prompt(
