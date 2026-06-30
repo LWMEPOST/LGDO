@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -107,6 +109,22 @@ class EvalRunResponse(BaseModel):
     with_citations: int
     missing: int
     citation_rate: float
+
+
+class EntityAliasRequest(BaseModel):
+    domain: str | None = Field(default=None, pattern="^(product|customer_service)$")
+    canonical_name: str
+    alias: str
+    entity_type: str = "entity"
+    metadata: dict = Field(default_factory=dict)
+
+
+class UpgradedEvalRunRequest(BaseModel):
+    domain: str | None = Field(default=None, pattern="^(product|customer_service)$")
+    gbrain_mode: Literal["on", "off", "both"] = "both"
+    pass_rate_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    citation_rate_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    p95_ms_threshold: float | None = Field(default=None, gt=0)
 
 
 class ReviewUpdateRequest(BaseModel):

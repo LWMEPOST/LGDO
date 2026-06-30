@@ -18,6 +18,7 @@ MAIN_TABLES = [
     "feedback",
     "knowledge_gaps",
     "eval_questions",
+    "entity_aliases",
     "ingest_reports",
     "document_chunks",
     "audit_logs",
@@ -31,6 +32,7 @@ TABLE_PRIMARY_KEYS = {
     "feedback": "id",
     "knowledge_gaps": "id",
     "eval_questions": "id",
+    "entity_aliases": "id",
     "ingest_reports": "id",
     "document_chunks": "id",
     "audit_logs": "id",
@@ -142,6 +144,25 @@ CREATE TABLE IF NOT EXISTS eval_questions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+  id TEXT PRIMARY KEY,
+  domain TEXT,
+  canonical_name TEXT NOT NULL,
+  canonical_key TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  alias_key TEXT NOT NULL,
+  entity_type TEXT NOT NULL DEFAULT 'entity',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_unique
+ON entity_aliases(COALESCE(domain, ''), entity_type, canonical_key, alias_key);
+
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_domain
+ON entity_aliases(domain);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -294,6 +315,25 @@ CREATE TABLE IF NOT EXISTS eval_questions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+  id TEXT PRIMARY KEY,
+  domain TEXT,
+  canonical_name TEXT NOT NULL,
+  canonical_key TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  alias_key TEXT NOT NULL,
+  entity_type TEXT NOT NULL DEFAULT 'entity',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_unique
+ON entity_aliases(COALESCE(domain, ''), entity_type, canonical_key, alias_key);
+
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_domain
+ON entity_aliases(domain);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id BIGSERIAL PRIMARY KEY,

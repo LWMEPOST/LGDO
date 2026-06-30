@@ -5,6 +5,7 @@ import re
 from collections import Counter
 from typing import Any
 
+from app.aliases import score_alias_context
 from app.config import Settings
 from app.db import connect_app, init_app_db, json_dump, rows_to_dicts
 from app.timeutil import now_iso
@@ -166,6 +167,7 @@ def rank_search_rows(
     *,
     keyword_weight: float = 1.0,
     vector_weight: float = 12.0,
+    alias_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     tokens = tokenize(question)
     phrases = extract_query_phrases(question)
@@ -184,6 +186,7 @@ def rank_search_rows(
         context_score = contextual_boost(question, text, title)
         bm25_score = bm25_by_id.get(str(row.get("id") or ""), 0.0)
         doc_code_score = document_code_boost(question, title, text, row.get("source_id"))
+        alias_score = score_alias_context(alias_context, title, text)
         if (
             keyword_score <= 0
             and phrase_score <= 0
@@ -191,6 +194,7 @@ def rank_search_rows(
             and context_score <= 0
             and bm25_score <= 0
             and doc_code_score <= 0
+            and alias_score <= 0
             and vector_score <= 0.08
         ):
             continue
@@ -202,6 +206,7 @@ def rank_search_rows(
         ranked_row["table_boost"] = round(table_score, 6)
         ranked_row["context_boost"] = round(context_score, 6)
         ranked_row["doc_code_boost"] = round(doc_code_score, 6)
+        ranked_row["alias_boost"] = round(alias_score, 6)
         ranked_row["_lexical_rank_score"] = (
             keyword_score * keyword_weight
             + bm25_score * 18.0
@@ -209,6 +214,7 @@ def rank_search_rows(
             + table_score
             + context_score
             + doc_code_score
+            + alias_score
         )
         candidates.append(ranked_row)
 
@@ -236,6 +242,7 @@ def rank_search_rows(
             + item["table_boost"]
             + item["context_boost"]
             + item["doc_code_boost"]
+            + item["alias_boost"]
             + keyword_component
             + vector_component,
             6,
@@ -248,6 +255,7 @@ def rank_search_rows(
             item["score"],
             item["phrase_boost"] + item["table_boost"],
             item["doc_code_boost"],
+            item["alias_boost"],
             item["keyword_score"],
             len(item.get("text") or "") * -1,
         ),
@@ -359,7 +367,7 @@ def document_code_boost(question: str, title: str, text: str, source_id: Any = N
     row_codes = set(extract_document_codes(haystack))
     boost = 0.0
     if query_codes and row_codes:
-        boost += len(query_codes & row_codes) * 240.0
+        boost += len(query_codes & row_codes) * 96.0
 
     query = normalize_for_match(question)
     title_key = normalize_for_match(title)
@@ -368,60 +376,24 @@ def document_code_boost(question: str, title: str, text: str, source_id: Any = N
         prefix, number = code.split("-", 1)
         compact = f"{prefix.lower()}{number}"
         if compact in query or code.lower() in query:
-            boost += 220.0
+            boost += 96.0
         if compact in title_key or code.lower() in title_key:
             boost += 30.0
 
     if "内容安全审核引擎" in query and "内容安全审核引擎" in haystack_key:
-        boost += 220.0
+        boost += 88.0
     if "透明通道" in query and "透明通道" in haystack_key:
-        boost += 180.0
+        boost += 88.0
     if "积分不够" in query and "积分获取方式" in haystack_key:
-        boost += 220.0
+        boost += 88.0
     if "补充积分" in query and "积分获取方式" in haystack_key:
-        boost += 220.0
+        boost += 88.0
     if "年度套餐" in query and "退款条件" in haystack_key:
-        boost += 160.0
+        boost += 88.0
     if "第8天" in query and "退款窗口期" in haystack_key:
-        boost += 160.0
+        boost += 88.0
     if "企业客户" in query and "个人" in query and ("企业套餐" in haystack_key or "企业账号" in haystack_key):
-        boost += 120.0
-    if pricing_calculation_intent(query):
-        if "全平台定价对比表" in haystack_key or "tbl0063" in haystack_key:
-            boost += 300.0
-        if "积分系统完全指南" in haystack_key or "kb0045" in haystack_key:
-            boost += 180.0
-        if "企业标准" in haystack_key and ("api调用月" in haystack_key or "api调用/月" in haystack.lower()):
-            boost += 240.0
-    if content_safety_dependency_intent(query):
-        dependency_codes = {"API-0010", "API-0011", "API-0012", "API-0017", "PRD-0001", "PRD-0007", "PPT-0056", "TKT-0038"}
-        if row_codes & dependency_codes:
-            boost += 240.0
-        if any(term in haystack_key for term in content_safety_dependency_terms()):
-            boost += 180.0
-    if privacy_audit_intent(query):
-        if row_codes & {"API-0018", "API-0017"}:
-            boost += 340.0
-        if any(term in haystack_key for term in ["数据保留与隐私白皮书", "不用于模型训练", "aes256", "数据与隐私"]):
-            boost += 300.0
-        if any(term in haystack_key for term in ["售后服务政策", "办公行为规范", "数据安全", "个人网盘", "加密通道"]):
-            boost += 220.0
-    if time_window_policy_intent(query):
-        if any(term in haystack_key for term in ["费用报销制度", "次月5日"]):
-            boost += 340.0
-        if any(term in haystack_key for term in ["售后服务政策", "行政管理制度", "办公行为规范", "采购管理制度", "历史客服工单"]):
-            boost += 240.0
-    if prd_priority_dependency_intent(query):
-        priority_codes = {"PRD-0001", "PRD-0006", "PRD-0007", "API-0010", "API-0011"}
-        if row_codes & priority_codes:
-            boost += 340.0
-        if any(term in haystack_key for term in ["实时协作引擎", "内容安全审核引擎", "文生图api", "文生视频api", "优先级p0", "can001"]):
-            boost += 260.0
-    if api_failure_checklist_intent(query):
-        if row_codes & {"API-0014", "API-0009"}:
-            boost += 300.0
-        if any(term in haystack_key for term in ["历史客服工单", "tk202506104", "tk202506215", "prompttoolong", "serviceunavailable"]):
-            boost += 220.0
+        boost += 88.0
     return boost
 
 
@@ -475,126 +447,54 @@ def contextual_boost(question: str, text: str, title: str = "") -> float:
     if ticket_intent and "工单" in haystack and "处理记录" in haystack and not generic_fact_intent and not policy_lookup_intent and not troubleshooting_intent and not faq_policy_intent:
         boost += 95.0
     if ("充值" in query or "少了" in query) and "充值" in haystack and "积分" in haystack and "处理记录" in haystack:
-        boost += 160.0
+        boost += 80.0
     if ("客服" in query or "建议检查" in query or "工单" in query) and (
         "用户问题" in haystack and "处理记录" in haystack
     ):
-        boost += 140.0
+        boost += 80.0
     if ("没过期" in query or "没有过期" in query) and (
         "确认没有过期" in haystack or "没有过期" in haystack or "没过期" in haystack
     ):
         boost += 70.0
     if ("roadmap" in query or "ppt" in query) and ("roadmap" in haystack or "ppt" in haystack):
-        boost += 170.0
+        boost += 70.0
     if "roadmap" in query and "roadmap" in normalize_for_match(title):
-        boost += 120.0
+        boost += 70.0
     if "注册" in query and "赠送" in query and ("faq" in haystack or "常见问题" in haystack):
-        boost += 180.0
+        boost += 80.0
     if ("积分不够" in query or "补充积分" in query) and "积分获取方式" in haystack:
-        boost += 260.0
+        boost += 80.0
     if "透明通道" in query and "输出格式" in haystack:
-        boost += 240.0
+        boost += 80.0
     if "429" in query and ("rate_limited" in haystack or "频率限制" in haystack):
-        boost += 220.0
+        boost += 80.0
     if ("第8天" in query or "超过" in query) and "退款窗口期" in haystack:
-        boost += 220.0
+        boost += 80.0
     if "内容安全审核引擎" in query and "内容安全审核引擎" in haystack:
-        boost += 260.0
+        boost += 80.0
     if faq_policy_intent and (
         "faq" in haystack or "常见问题" in haystack or "故障与售后" in haystack
     ):
-        boost += 280.0
+        boost += 80.0
     if ("生成失败请重试" in query or troubleshooting_intent) and (
         "常见生成失败原因" in haystack or "错误类型速查表" in haystack or "生成失败请重试" in haystack
     ):
-        boost += 180.0
+        boost += 80.0
+    if any(term in query for term in ["套餐", "成本", "价格", "费用", "年费"]) and any(
+        term in haystack for term in ["定价", "年费", "价格", "月费", "api调用月", "api调用/月"]
+    ):
+        boost += 70.0
+    if any(term in query for term in ["隐私", "合规", "审计", "政策条款"]) and any(
+        term in haystack for term in ["隐私白皮书", "数据保留", "不用于模型训练", "aes256", "加密存储"]
+    ):
+        boost += 80.0
+    elif any(term in query for term in ["隐私", "合规", "审计", "政策条款"]) and any(
+        term in haystack for term in ["数据安全", "个人网盘", "加密通道"]
+    ):
+        boost += 40.0
     if "套餐" in query and ("faq" in haystack or "定价" in haystack or "套餐" in haystack):
         boost += 20.0
-    if pricing_calculation_intent(query):
-        if "全平台定价对比表" in haystack or "tbl0063" in haystack:
-            boost += 320.0
-        if "企业标准" in haystack and ("api调用月" in haystack or "文生图api" in haystack):
-            boost += 260.0
-        if "积分系统完全指南" in haystack or "kb0045" in haystack:
-            boost += 160.0
-    if content_safety_dependency_intent(query):
-        if "内容安全审核引擎" in haystack:
-            boost += 260.0
-        if any(term in haystack for term in content_safety_dependency_terms()):
-            boost += 220.0
-    if privacy_audit_intent(query):
-        if "数据保留与隐私白皮书" in haystack or "api0018" in haystack:
-            boost += 360.0
-        if any(term in haystack for term in ["不用于模型训练", "90天", "30天", "aes256", "加密存储"]):
-            boost += 280.0
-        if any(term in haystack for term in ["数据与隐私", "数据安全", "个人网盘", "内容安全审核规则"]):
-            boost += 220.0
-    if time_window_policy_intent(query):
-        if "次月5日" in haystack or "费用报销制度" in haystack:
-            boost += 360.0
-        if any(term in haystack for term in ["退款窗口期", "24小时", "10分钟", "15个工作日", "远程办公", "采购流程"]):
-            boost += 240.0
-    if prd_priority_dependency_intent(query):
-        if any(term in haystack for term in ["prd0001", "prd0006", "prd0007", "api0010", "api0011"]):
-            boost += 300.0
-        if any(term in haystack for term in ["can001", "can002", "实时协作引擎", "内容安全审核引擎", "文生图api", "文生视频api"]):
-            boost += 260.0
-    if api_failure_checklist_intent(query):
-        if "api错误码完整参考" in haystack or "api0014" in haystack:
-            boost += 300.0
-        if any(term in haystack for term in ["历史客服工单", "bearer", "1024", "500", "503", "prompttoolong"]):
-            boost += 220.0
     return boost
-
-
-def pricing_calculation_intent(normalized_query: str) -> bool:
-    return (
-        ("套餐组合" in normalized_query or "总成本" in normalized_query or "日均" in normalized_query)
-        and ("文生图" in normalized_query or "api" in normalized_query)
-    ) or ("500次" in normalized_query and ("套餐" in normalized_query or "成本" in normalized_query))
-
-
-def content_safety_dependency_intent(normalized_query: str) -> bool:
-    return "内容安全审核引擎" in normalized_query and any(
-        term in normalized_query for term in ["依赖", "子系统", "api", "模块", "哪些"]
-    )
-
-
-def privacy_audit_intent(normalized_query: str) -> bool:
-    return any(term in normalized_query for term in ["数据隐私合规审计", "隐私合规审计", "数据隐私", "合规审计"]) and any(
-        term in normalized_query for term in ["检查", "审计", "政策条款", "条款"]
-    )
-
-
-def time_window_policy_intent(normalized_query: str) -> bool:
-    return any(term in normalized_query for term in ["时间窗口", "期限", "时限"]) and any(
-        term in normalized_query for term in ["制度", "条款", "全部", "相互矛盾"]
-    )
-
-
-def prd_priority_dependency_intent(normalized_query: str) -> bool:
-    return "prd" in normalized_query and "优先级" in normalized_query and any(
-        term in normalized_query for term in ["依赖关系", "依赖", "p0", "p1", "p2"]
-    )
-
-
-def api_failure_checklist_intent(normalized_query: str) -> bool:
-    return "api" in normalized_query and "调用失败" in normalized_query and any(
-        term in normalized_query for term in ["排查清单", "错误码", "工单案例", "完整"]
-    )
-
-
-def content_safety_dependency_terms() -> list[str]:
-    return [
-        "文生图api",
-        "文生视频api",
-        "webhook",
-        "智能画布",
-        "内容审核结果",
-        "内容安全审核结果",
-        "申诉",
-        "审核回调",
-    ]
 
 
 def is_generic_lookup_table(line: str, full_text: str = "") -> bool:
@@ -725,6 +625,7 @@ def search_chunks(
     *,
     keyword_weight: float = 1.0,
     vector_weight: float = 12.0,
+    alias_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if settings.rag_store_backend == "postgres":
         from app.pg_rag import search_pg_chunks
@@ -736,6 +637,7 @@ def search_chunks(
             limit,
             keyword_weight=keyword_weight,
             vector_weight=vector_weight,
+            alias_context=alias_context,
         )
 
     init_app_db(settings)
@@ -752,6 +654,7 @@ def search_chunks(
         question,
         keyword_weight=keyword_weight,
         vector_weight=vector_weight,
+        alias_context=alias_context,
     )
     return diversify_ranked_rows(ranked, limit)
 

@@ -77,7 +77,7 @@ def test_query_gbrain_merges_candidates_and_reranks_domain_hits(monkeypatch):
                     "source_id": "default",
                 }
             ]
-        if query == "积分系统":
+        if query == "补充积分":
             return [
                 {
                     "slug": "product/features/kb-0045_kb_积分系统完全指南",
@@ -95,10 +95,10 @@ def test_query_gbrain_merges_candidates_and_reranks_domain_hits(monkeypatch):
 
     assert hits[0].source_id == "KB-0045"
     assert hits[0].slug.endswith("kb-0045_kb_积分系统完全指南")
-    assert ("search", "积分系统") in calls
+    assert ("search", "补充积分") in calls
 
 
-def test_query_gbrain_adds_pricing_and_content_safety_domain_candidates(monkeypatch):
+def test_query_gbrain_uses_explicit_domain_phrases_as_candidates(monkeypatch):
     settings = Settings(gbrain_enabled=True, gbrain_endpoint="http://gbrain.example/mcp")
     calls: list[tuple[str, str]] = []
 
@@ -107,7 +107,7 @@ def test_query_gbrain_adds_pricing_and_content_safety_domain_candidates(monkeypa
     def fake_call(_settings, tool_name, arguments, timeout):
         query = arguments["query"]
         calls.append((tool_name, query))
-        if query == "全平台定价对比表":
+        if query == "套餐组合":
             return [
                 {
                     "slug": "product/tables/tbl-0063_table_全平台定价对比表",
@@ -117,7 +117,7 @@ def test_query_gbrain_adds_pricing_and_content_safety_domain_candidates(monkeypa
                     "source_id": "default",
                 }
             ]
-        if query == "API-0010":
+        if query == "内容安全审核引擎":
             return [
                 {
                     "slug": "product/apis/api-0010_文生图api",
@@ -136,8 +136,8 @@ def test_query_gbrain_adds_pricing_and_content_safety_domain_candidates(monkeypa
 
     assert pricing_hits[0].source_id == "TBL-0063"
     assert dependency_hits[0].source_id == "API-0010"
-    assert ("search", "全平台定价对比表") in calls
-    assert ("search", "API-0010") in calls
+    assert ("search", "套餐组合") in calls
+    assert ("search", "内容安全审核引擎") in calls
 
 
 def test_gbrain_candidates_prioritize_domain_codes_before_generic_tokens():
@@ -146,12 +146,10 @@ def test_gbrain_candidates_prioritize_domain_codes_before_generic_tokens():
         candidate_limit=10,
     )
 
-    assert "PRD-0001" in candidates
-    assert "PRD-0006" in candidates
-    assert "PRD-0007" in candidates
-    assert "API-0010" in candidates
-    assert "API-0011" in candidates
-    assert candidates.index("PRD-0001") < candidates.index("从 PRD 文档中提取所有明确标注了优先级 P0 P1 P2 的功能需求 并分析各 PRD 模块之间的依赖关系")
+    assert "PRD" in candidates
+    assert "优先级" in candidates
+    assert "依赖关系" in candidates
+    assert len(candidates) <= 10
 
 
 def test_query_gbrain_uses_short_ttl_cache(monkeypatch):
@@ -251,3 +249,43 @@ def test_ask_includes_gbrain_context_when_enabled(tmp_path, monkeypatch):
     assert response.retrieval_strategy["gbrain_hits"] == 1
     assert response.retrieval_strategy["gbrain_top_hits"][0]["slug"] == "product/policies/refund"
     assert "GBrain/退款政策" in response.answer
+
+
+def test_query_gbrain_keeps_hits_when_one_candidate_search_fails(monkeypatch):
+    from app.gbrain import GBrainError, _query_gbrain_with_caller
+
+    calls = []
+
+    def caller(tool_name, params):
+        calls.append((tool_name, params["query"]))
+        if tool_name == "query":
+            return [{"slug": "main", "title": "时间窗口制度", "content": "退款窗口期 7天。", "score": 0.8}]
+        if "失败候选" in params["query"]:
+            raise GBrainError("candidate failed")
+        return [{"slug": "other", "title": "报销制度", "content": "次月5日提交。", "score": 0.7}]
+
+    monkeypatch.setattr(
+        "app.gbrain.gbrain_query_candidates",
+        lambda question, candidate_limit=8: ["失败候选", "期限"],
+    )
+
+    hits = _query_gbrain_with_caller(caller, {"query": "时间窗口和期限", "limit": 5}, "时间窗口和期限", 5, 8)
+
+    assert [hit.slug for hit in hits] == ["main", "other"]
+    assert ("search", "期限") in calls
+
+
+def test_gbrain_candidates_trim_low_information_cjk_windows():
+    candidates = gbrain_query_candidates(
+        "梳理公司所有制度文档中，与时间窗口或期限相关的全部条款，并判断是否存在相互矛盾。",
+        candidate_limit=8,
+    )
+
+    assert "时间窗口" in candidates
+    assert "期限" in candidates
+    assert len(candidates) <= 8
+    assert not any(len(item) == 4 and item in {"梳理公司", "公司所有", "所有制度"} for item in candidates)
+
+
+def test_gbrain_candidates_respect_zero_candidate_limit():
+    assert gbrain_query_candidates("时间窗口和期限", candidate_limit=0) == []

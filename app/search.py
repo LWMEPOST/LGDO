@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.answer_modes import AnswerModeConfig, get_answer_mode_config
+from app.aliases import build_alias_context, expand_query_with_aliases
 from app.config import Settings
 from app.db import audit, connect_app, init_app_db, json_dump
 from app.gbrain import GBrainHit, query_gbrain
@@ -46,16 +47,22 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
     timestamp = now_iso()
     query_id = f"qry_{uuid.uuid4().hex[:12]}"
     mode_config = get_answer_mode_config(request.answer_mode)
-    tokens = tokenize(request.question)
+    try:
+        expanded_question, matched_aliases = expand_query_with_aliases(settings, request.question, request.domain)
+    except Exception:
+        expanded_question, matched_aliases = request.question, []
+    alias_context = build_alias_context(request.question, matched_aliases) if matched_aliases else None
+    tokens = tokenize(expanded_question)
     with ThreadPoolExecutor(max_workers=2) as executor:
         chunk_future = executor.submit(
             search_chunks,
             settings,
-            request.question,
+            expanded_question,
             request.domain,
             mode_config.retrieval_limit,
             keyword_weight=mode_config.keyword_weight,
             vector_weight=mode_config.vector_weight,
+            alias_context=alias_context,
         )
         gbrain_future = executor.submit(query_gbrain, settings, request.question, settings.gbrain_query_limit)
         chunk_hits = chunk_future.result()
@@ -127,6 +134,15 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
             "memory_hits": len(memory_hits),
             "gbrain_hits": len(gbrain_hits),
             "gbrain_enabled": settings.gbrain_enabled,
+            "matched_aliases": [
+                {
+                    "domain": item.get("domain"),
+                    "canonical_name": item.get("canonical_name"),
+                    "alias": item.get("alias"),
+                    "entity_type": item.get("entity_type"),
+                }
+                for item in matched_aliases
+            ],
             "keyword_weight": mode_config.keyword_weight,
             "vector_weight": mode_config.vector_weight,
             "top_hits": [
@@ -141,6 +157,7 @@ def ask(settings: Settings, request: AskRequest) -> AskResponse:
                     "table_boost": item.get("table_boost"),
                     "context_boost": item.get("context_boost"),
                     "doc_code_boost": item.get("doc_code_boost"),
+                    "alias_boost": item.get("alias_boost"),
                     "rrf_score": item.get("rrf_score"),
                 }
                 for item in chunk_hits[: mode_config.context_limit]

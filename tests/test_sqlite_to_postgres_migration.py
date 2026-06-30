@@ -60,6 +60,17 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     )
     assert answer_before.status_code == 200
     expected_source_id = answer_before.json()["citations"][0]["source_id"]
+    alias_response = client.post(
+        "/api/internal/aliases",
+        json={
+            "domain": "product",
+            "canonical_name": "权限清单",
+            "alias": "成员权限导出",
+            "entity_type": "feature",
+            "metadata": {"terms": ["管理员"]},
+        },
+    )
+    assert alias_response.status_code == 200
 
     monkeypatch.setattr(settings, "postgres_database", "lgdo_migration_test")
     from app.db import init_postgres_schema
@@ -78,6 +89,7 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
                 "document_chunks",
                 "sources",
                 "eval_questions",
+                "entity_aliases",
             ]:
                 cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
 
@@ -85,6 +97,7 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     assert result["tables"]["sources"] == 2
     assert result["tables"]["wiki_pages"] >= 2
     assert result["tables"]["document_chunks"] >= 2
+    assert result["tables"]["entity_aliases"] == 1
     assert result["total_rows"] >= 6
 
     monkeypatch.setattr(settings, "database_backend", "postgres")
@@ -139,6 +152,7 @@ def test_migration_endpoint_returns_table_counts(tmp_path, monkeypatch):
                 "document_chunks",
                 "sources",
                 "eval_questions",
+                "entity_aliases",
             ]:
                 cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
 

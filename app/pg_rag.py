@@ -173,6 +173,7 @@ def search_pg_chunks(
     *,
     keyword_weight: float = 1.0,
     vector_weight: float = 12.0,
+    alias_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     init_pg_rag(settings)
     with connect_postgres(settings) as conn:
@@ -201,6 +202,7 @@ def search_pg_chunks(
         question,
         keyword_weight=keyword_weight,
         vector_weight=vector_weight,
+        alias_context=alias_context,
     )
     return diversify_ranked_rows(ranked, limit)
 

@@ -323,7 +323,7 @@ def test_reranker_boosts_prd_priority_dependency_sources():
     ranked = rank_search_rows([roadmap, rtc, canvas], "从 PRD 文档中提取所有明确标注了优先级（P0/P1/P2）的功能需求，并分析各 PRD 模块之间的依赖关系。")
 
     assert ranked[0]["source_id"] in {"prd_0001", "prd_0006"}
-    assert ranked[0]["context_boost"] > ranked[-1]["context_boost"]
+    assert ranked[0]["phrase_boost"] + ranked[0]["doc_code_boost"] > ranked[-1]["phrase_boost"] + ranked[-1]["doc_code_boost"]
 
 
 def test_tokenize_splits_mixed_english_and_chinese_terms():
@@ -332,3 +332,46 @@ def test_tokenize_splits_mixed_english_and_chinese_terms():
     assert "api" in tokens
     assert "key" in tokens
     assert "文生" in tokens
+
+
+def test_reranker_uses_alias_context_without_benchmark_intent_rules(monkeypatch):
+    import app.rag as rag
+    from app.aliases import build_alias_context
+
+    monkeypatch.setattr(rag, "embed_text", lambda _: [1.0, 0.0])
+    rows = [
+        make_row("generic", "普通制度", "审批流程说明。"),
+        make_row("role", "费用报销制度", "部门负责人审批报销、采购、招待等事项。"),
+    ]
+    context = build_alias_context(
+        "部门总监有哪些权限？",
+        [
+            {
+                "canonical_name": "部门负责人",
+                "canonical_key": "部门负责人",
+                "alias": "部门总监",
+                "alias_key": "部门总监",
+                "entity_type": "role",
+                "metadata_json": '{"terms":["报销","采购","招待"]}',
+            }
+        ],
+    )
+
+    ranked = rag.rank_search_rows(rows, "部门总监有哪些权限？", alias_context=context)
+
+    assert ranked[0]["id"] == "role_chunk_0000"
+    assert ranked[0]["alias_boost"] > 0
+    assert ranked[0]["context_boost"] < 100
+    removed_helper_names = [
+        "_".join(parts)
+        for parts in [
+            ("pricing", "calculation", "intent"),
+            ("content", "safety", "dependency", "intent"),
+            ("privacy", "audit", "intent"),
+            ("time", "window", "policy", "intent"),
+            ("prd", "priority", "dependency", "intent"),
+            ("api", "failure", "checklist", "intent"),
+        ]
+    ]
+    for name in removed_helper_names:
+        assert not hasattr(rag, name)

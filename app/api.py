@@ -20,8 +20,9 @@ from app.catalog import (
     update_review_item,
     update_wiki_page_status,
 )
+from app.aliases import list_entity_aliases, seed_default_entity_aliases, upsert_entity_alias
 from app.config import get_settings
-from app.eval import add_eval_question, run_eval
+from app.eval import add_eval_question, compare_upgraded_eval, run_eval
 from app.feedback import submit_feedback
 from app.ingest import scan_sources
 from app.migration import migrate_sqlite_to_postgres
@@ -32,6 +33,7 @@ from app.models import (
     CompileResponse,
     EvalQuestionRequest,
     EvalRunResponse,
+    EntityAliasRequest,
     FeedbackRequest,
     FeedbackResponse,
     GapUpdateRequest,
@@ -39,6 +41,7 @@ from app.models import (
     ScanRequest,
     ScanResponse,
     SourcePreviewResponse,
+    UpgradedEvalRunRequest,
     UploadResponse,
     WikiPageContentResponse,
     WikiPageSaveRequest,
@@ -268,5 +271,45 @@ def eval_question_endpoint(request: EvalQuestionRequest) -> dict[str, str]:
 def eval_run_endpoint(domain: str | None = Query(default=None)) -> EvalRunResponse:
     try:
         return run_eval(get_settings(), domain)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/eval/upgraded")
+def upgraded_eval_endpoint(request: UpgradedEvalRunRequest) -> dict:
+    try:
+        return compare_upgraded_eval(
+            get_settings(),
+            domain=request.domain,
+            mode=request.gbrain_mode,
+            pass_rate_threshold=request.pass_rate_threshold,
+            citation_rate_threshold=request.citation_rate_threshold,
+            p95_ms_threshold=request.p95_ms_threshold,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/aliases")
+def list_aliases_endpoint(domain: str | None = Query(default=None)) -> list[dict]:
+    try:
+        return list_entity_aliases(get_settings(), domain)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/aliases")
+def upsert_alias_endpoint(request: EntityAliasRequest) -> dict:
+    try:
+        return upsert_entity_alias(get_settings(), request, actor="api")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/aliases/seed")
+def seed_aliases_endpoint() -> dict:
+    try:
+        seeded = seed_default_entity_aliases(get_settings(), actor="api")
+        return {"seeded": seeded}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

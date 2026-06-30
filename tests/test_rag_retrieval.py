@@ -27,6 +27,7 @@ def test_rag_chunks_are_indexed_and_retrieval_prefers_matching_source(tmp_path, 
     monkeypatch.setattr(settings, "database_backend", "sqlite")
     monkeypatch.setattr(settings, "rag_store_backend", "sqlite")
     monkeypatch.setattr(settings, "database_path", data_dir / "test.db")
+    monkeypatch.setattr(settings, "postgres_port", 54322)
     monkeypatch.setattr(settings, "vault_path", vault_dir)
     monkeypatch.setattr(settings, "upload_path", tmp_path / "uploads")
     monkeypatch.setattr(settings, "deepseek_api_key", None)
