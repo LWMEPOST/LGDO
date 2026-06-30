@@ -7,7 +7,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi import Depends, Request
 from fastapi.responses import StreamingResponse
 
-from app.aliases import delete_entity_alias, list_entity_aliases, upsert_entity_alias
+from app.aliases import delete_entity_alias, list_entity_aliases, seed_default_entity_aliases, upsert_entity_alias
 from app.auth import UserContext, resolve_user_context
 from app.catalog import (
     delete_source,
@@ -300,7 +300,14 @@ def eval_run_endpoint(domain: str | None = Query(default=None)) -> EvalRunRespon
 @router.post("/eval/upgraded")
 def upgraded_eval_endpoint(request: UpgradedEvalRunRequest) -> dict:
     try:
-        return compare_upgraded_eval(get_settings(), domain=request.domain, mode=request.gbrain_mode)
+        return compare_upgraded_eval(
+            get_settings(),
+            domain=request.domain,
+            mode=request.gbrain_mode,
+            pass_rate_threshold=request.pass_rate_threshold,
+            citation_rate_threshold=request.citation_rate_threshold,
+            p95_ms_threshold=request.p95_ms_threshold,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -331,6 +338,19 @@ def delete_alias_endpoint(alias_id: str, user: UserContext = Depends(current_use
         if not user.is_admin and user.role not in {"editor"}:
             raise HTTPException(status_code=403, detail="需要 admin/editor 权限维护实体别名")
         return delete_entity_alias(get_settings(), alias_id, user.user_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/aliases/seed")
+def seed_aliases_endpoint(user: UserContext = Depends(current_user)) -> dict:
+    try:
+        if not user.is_admin and user.role not in {"editor"}:
+            raise HTTPException(status_code=403, detail="需要 admin/editor 权限维护实体别名")
+        seeded = seed_default_entity_aliases(get_settings(), actor=user.user_id)
+        return {"seeded": seeded}
     except HTTPException:
         raise
     except Exception as exc:

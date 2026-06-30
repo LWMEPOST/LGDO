@@ -5,7 +5,7 @@ from typing import Any
 from app.auth import UserContext, filter_rows_by_acl
 from app.config import Settings
 from app.db import connect, rows_to_dicts
-from app.rag import diversify_ranked_rows, embed_text, rank_search_rows, tokenize
+from app.rag import diversify_ranked_rows, embed_text_with_model, rank_search_rows, tokenize
 
 
 PGVECTOR_DIMENSION = 96
@@ -106,8 +106,9 @@ def sync_sqlite_chunks_to_pg(settings: Settings) -> int:
             for chunk in chunks:
                 metadata: dict[str, Any] = chunk.get("metadata") or {}
                 tokens = chunk.get("token") or tokenize(f"{chunk['title']}\n{chunk['text']}")
-                embedding = metadata.get("embedding") or embed_text(f"{chunk['title']}\n{chunk['text']}")
-                metadata = {**metadata, "embedding_model": metadata.get("embedding_model") or "local-hash-v1"}
+                embedding, configured_model = embed_text_with_model(f"{chunk['title']}\n{chunk['text']}", settings=settings)
+                embedding = metadata.get("embedding") or embedding
+                metadata = {**metadata, "embedding_model": metadata.get("embedding_model") or configured_model}
                 _upsert_pg_chunk(
                     cur,
                     {
@@ -139,8 +140,8 @@ def upsert_pg_document_chunks(settings: Settings, chunks: list[dict[str, Any]]) 
                 title = metadata.get("title") or ""
                 text = chunk.get("text") or ""
                 tokens = tokenize(f"{title}\n{text}")
-                embedding = embed_text(f"{title}\n{text}")
-                metadata = {**metadata, "embedding_model": "local-hash-v1"}
+                embedding, embedding_model = embed_text_with_model(f"{title}\n{text}", settings=settings)
+                metadata = {**metadata, "embedding_model": embedding_model}
                 _upsert_pg_chunk(
                     cur,
                     {
@@ -178,7 +179,7 @@ def search_pg_chunks(
     alias_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     init_pg_rag(settings)
-    query_vector = embed_text(question)
+    query_vector, _ = embed_text_with_model(question, settings=settings)
     with connect_postgres(settings) as conn:
         with conn.cursor() as cur:
             used_pgvector = False
@@ -239,6 +240,7 @@ def search_pg_chunks(
         keyword_weight=keyword_weight,
         vector_weight=vector_weight,
         alias_context=alias_context,
+        settings=settings,
     )
     return diversify_ranked_rows(ranked, limit)
 
@@ -259,6 +261,18 @@ def pg_rag_status(settings: Settings) -> dict[str, Any]:
                 vector_count = 0
             cur.execute(
                 """
+                SELECT metadata->>'embedding_model' AS embedding_model, COUNT(*) AS count
+                FROM rag_document_chunks
+                WHERE metadata ? 'embedding_model'
+                GROUP BY metadata->>'embedding_model'
+                ORDER BY count DESC, embedding_model
+                LIMIT 1
+                """
+            )
+            model_row = cur.fetchone()
+            embedding_model = model_row[0] if model_row else settings.rag_embedding_model
+            cur.execute(
+                """
                 SELECT domain, COUNT(*) AS chunk_count
                 FROM rag_document_chunks
                 GROUP BY domain
@@ -271,7 +285,7 @@ def pg_rag_status(settings: Settings) -> dict[str, Any]:
         "source_count": source_count,
         "embedding_count": embedding_count,
         "vector_count": vector_count,
-        "embedding_model": "local-hash-v1",
+        "embedding_model": embedding_model,
         "vector_backend": "pgvector" if pgvector_enabled else "jsonb",
         "pgvector_enabled": pgvector_enabled,
         "domains": domains,
@@ -286,6 +300,7 @@ def _json(value: Any) -> str:
 
 def _upsert_pg_chunk(cur: Any, row: dict[str, Any], *, has_vector_column: bool) -> None:
     if has_vector_column:
+        embedding_vector = _vector(row["embedding"]) if len(row["embedding"]) == PGVECTOR_DIMENSION else None
         cur.execute(
             """
             INSERT INTO rag_document_chunks(
@@ -314,7 +329,7 @@ def _upsert_pg_chunk(cur: Any, row: dict[str, Any], *, has_vector_column: bool) 
                 _json(row["tokens"]),
                 _json(row["metadata"]),
                 _json(row["embedding"]),
-                _vector(row["embedding"]),
+                embedding_vector,
             ),
         )
         return

@@ -174,7 +174,7 @@ def test_search_pg_chunks_uses_pgvector_preselection_when_available(monkeypatch)
     monkeypatch.setattr(pg_rag, "connect_postgres", lambda settings: Conn())
     monkeypatch.setattr(pg_rag, "_pgvector_available", lambda cur: True)
     monkeypatch.setattr(pg_rag, "_column_exists", lambda cur, table, column: column == "embedding_vector")
-    monkeypatch.setattr(pg_rag, "embed_text", lambda question: [0.1, 0.2])
+    monkeypatch.setattr(pg_rag, "embed_text_with_model", lambda question, settings=None: ([0.1, 0.2], "test-embedding"))
     monkeypatch.setattr(pg_rag, "rank_search_rows", lambda rows, question, **kwargs: rows)
     monkeypatch.setattr(pg_rag, "diversify_ranked_rows", lambda rows, limit: rows[:limit])
 
@@ -224,7 +224,7 @@ def test_search_pg_chunks_falls_back_without_pgvector(monkeypatch):
     monkeypatch.setattr(pg_rag, "connect_postgres", lambda settings: Conn())
     monkeypatch.setattr(pg_rag, "_pgvector_available", lambda cur: False)
     monkeypatch.setattr(pg_rag, "_column_exists", lambda cur, table, column: False)
-    monkeypatch.setattr(pg_rag, "embed_text", lambda question: [0.1, 0.2])
+    monkeypatch.setattr(pg_rag, "embed_text_with_model", lambda question, settings=None: ([0.1, 0.2], "test-embedding"))
     monkeypatch.setattr(pg_rag, "rank_search_rows", lambda rows, question, **kwargs: rows)
 
     pg_rag.search_pg_chunks(object(), "退款期限", "customer_service", limit=5)

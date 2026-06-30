@@ -59,6 +59,7 @@ def test_postgres_metadata_backend_runs_internal_flow(tmp_path, monkeypatch):
                 "document_chunks",
                 "sources",
                 "eval_questions",
+                "entity_aliases",
             ]:
                 cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
 

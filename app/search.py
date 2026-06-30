@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from app.aliases import expand_query_with_aliases
+from app.aliases import build_alias_context, expand_query_with_aliases
 from app.answer_modes import AnswerModeConfig, get_answer_mode_config
 from app.auth import UserContext, apply_request_user_override, can_read_metadata
 from app.config import Settings
@@ -79,7 +79,11 @@ def build_ask_assembly(
     query_id = f"qry_{uuid.uuid4().hex[:12]}"
     mode_config = get_answer_mode_config(request.answer_mode)
     resolved_user = apply_request_user_override(settings, user_context, request) if user_context else None
-    expanded_question, matched_aliases = expand_query_with_aliases(settings, request.question, request.domain)
+    try:
+        expanded_question, matched_aliases = expand_query_with_aliases(settings, request.question, request.domain)
+    except Exception:
+        expanded_question, matched_aliases = request.question, []
+    alias_context = build_alias_context(request.question, matched_aliases) if matched_aliases else None
     tokens = tokenize(expanded_question)
     with ThreadPoolExecutor(max_workers=2) as executor:
         chunk_future = executor.submit(
@@ -91,7 +95,7 @@ def build_ask_assembly(
             keyword_weight=mode_config.keyword_weight,
             vector_weight=mode_config.vector_weight,
             user_context=resolved_user,
-            alias_context={"matched_aliases": matched_aliases, "expansion_terms": []},
+            alias_context=alias_context,
         )
         gbrain_future = executor.submit(query_gbrain, settings, expanded_question, settings.gbrain_query_limit)
         chunk_hits = chunk_future.result()
@@ -181,6 +185,7 @@ def build_ask_assembly(
                     "canonical_name": item.get("canonical_name"),
                     "alias": item.get("alias"),
                     "domain": item.get("domain"),
+                    "entity_type": item.get("entity_type"),
                 }
                 for item in matched_aliases
             ],

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-import uuid
+from threading import Lock
 from typing import Any
 
 from app.config import Settings
@@ -12,7 +13,7 @@ from app.timeutil import now_iso
 
 
 def normalize_alias(value: str) -> str:
-    return re.sub(r"[\s_\-:：/\\|,，。；;?？!！()（）<>《》\"'`]+", "", value.lower())
+    return re.sub(r"[\s_\-:：/\\|,，。；;?？!！()（）<>《》\"'`]+", "", (value or "").lower())
 
 
 def _parse_alias_metadata(item: dict[str, Any]) -> dict[str, Any]:
@@ -54,7 +55,10 @@ def build_alias_context(question: str, aliases: list[dict[str, Any]]) -> dict[st
             continue
         matched.append(item)
         for term in _alias_terms(item):
-            if term not in expansion_terms:
+            term_key = normalize_alias(term)
+            if term_key in {alias_key, canonical_key} and term_key in question_key:
+                continue
+            if term_key and term not in expansion_terms:
                 expansion_terms.append(term)
     return {"matched_aliases": matched, "expansion_terms": expansion_terms}
 
@@ -79,94 +83,19 @@ def score_alias_context(alias_context: dict[str, Any] | None, title: str, text: 
     return min(score, 48.0)
 
 
-def list_entity_aliases(settings: Settings, domain: str | None = None) -> list[dict]:
-    init_app_db(settings)
-    query = "SELECT * FROM entity_aliases"
-    params: list[object] = []
-    if domain:
-        query += " WHERE domain = ? OR domain IS NULL OR domain = ''"
-        params.append(domain)
-    query += " ORDER BY domain, canonical_name, alias"
-    with connect_app(settings) as conn:
-        return rows_to_dicts(conn.execute(query, params).fetchall())
-
-
-def upsert_entity_alias(settings: Settings, request: EntityAliasRequest, actor: str | None = None) -> dict:
-    init_app_db(settings)
-    timestamp = now_iso()
-    canonical = request.canonical_name.strip()
-    alias = request.alias.strip()
-    if not canonical or not alias:
-        raise ValueError("canonical_name 和 alias 不能为空")
-
-    domain = request.domain or ""
-    alias_key = normalize_alias(alias)
-    canonical_key = normalize_alias(canonical)
-    alias_id = f"alias_{uuid.uuid4().hex[:12]}"
-    with connect_app(settings) as conn:
-        existing = conn.execute(
-            "SELECT * FROM entity_aliases WHERE domain = ? AND alias_key = ?",
-            (domain, alias_key),
-        ).fetchone()
-        if existing:
-            alias_id = existing["id"]
-            conn.execute(
-                """
-                UPDATE entity_aliases
-                SET canonical_name = ?, canonical_key = ?, alias = ?, entity_type = ?,
-                    metadata_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    canonical,
-                    canonical_key,
-                    alias,
-                    request.entity_type,
-                    json_dump(request.metadata),
-                    timestamp,
-                    alias_id,
-                ),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO entity_aliases(
-                  id, domain, canonical_name, canonical_key, alias, alias_key,
-                  entity_type, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    alias_id,
-                    domain,
-                    canonical,
-                    canonical_key,
-                    alias,
-                    alias_key,
-                    request.entity_type,
-                    json_dump(request.metadata),
-                    timestamp,
-                    timestamp,
-                ),
-            )
-        audit(
-            conn,
-            "entity_alias_upserted",
-            {"alias_id": alias_id, "canonical_name": canonical, "alias": alias, "domain": domain, "actor": actor},
-            timestamp,
-        )
-        return row_to_dict(conn.execute("SELECT * FROM entity_aliases WHERE id = ?", (alias_id,)).fetchone()) or {}
-
-
-def delete_entity_alias(settings: Settings, alias_id: str, actor: str | None = None) -> dict:
-    init_app_db(settings)
-    timestamp = now_iso()
-    with connect_app(settings) as conn:
-        row = row_to_dict(conn.execute("SELECT * FROM entity_aliases WHERE id = ?", (alias_id,)).fetchone())
-        if row is None:
-            raise ValueError(f"entity alias 不存在: {alias_id}")
-        conn.execute("DELETE FROM entity_aliases WHERE id = ?", (alias_id,))
-        audit(conn, "entity_alias_deleted", {"alias_id": alias_id, "actor": actor}, timestamp)
-    return row
+def expand_query_with_aliases(
+    settings: Settings,
+    question: str,
+    domain: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    ensure_default_entity_aliases(settings)
+    aliases = list_entity_aliases(settings, domain)
+    context = build_alias_context(question, aliases)
+    additions = context["expansion_terms"]
+    matched = context["matched_aliases"]
+    if not additions:
+        return question, matched
+    return f"{question}\n\n实体别名扩展：{'、'.join(additions)}", matched
 
 
 DEFAULT_ENTITY_ALIASES: list[dict[str, Any]] = [
@@ -184,7 +113,28 @@ DEFAULT_ENTITY_ALIASES: list[dict[str, Any]] = [
         "entity_type": "role",
         "metadata": {"terms": ["审批", "请假", "远程办公"]},
     },
+    {
+        "domain": "customer_service",
+        "canonical_name": "审批人",
+        "alias": "部门总监",
+        "entity_type": "role",
+        "metadata": {"terms": ["审批", "报销", "采购", "招待"]},
+    },
 ]
+
+_DEFAULT_ALIAS_SEED_LOCK = Lock()
+_DEFAULT_ALIAS_SEEDED: set[str] = set()
+
+
+def ensure_default_entity_aliases(settings: Settings) -> None:
+    key = _settings_seed_key(settings)
+    if key in _DEFAULT_ALIAS_SEEDED:
+        return
+    with _DEFAULT_ALIAS_SEED_LOCK:
+        if key in _DEFAULT_ALIAS_SEEDED:
+            return
+        seed_default_entity_aliases(settings)
+        _DEFAULT_ALIAS_SEEDED.add(key)
 
 
 def seed_default_entity_aliases(settings: Settings, actor: str | None = "system") -> int:
@@ -195,11 +145,111 @@ def seed_default_entity_aliases(settings: Settings, actor: str | None = "system"
     return count
 
 
-def expand_query_with_aliases(settings: Settings, question: str, domain: str | None = None) -> tuple[str, list[dict[str, Any]]]:
-    aliases = list_entity_aliases(settings, domain)
-    context = build_alias_context(question, aliases)
-    additions = context["expansion_terms"]
-    matched = context["matched_aliases"]
-    if not additions:
-        return question, []
-    return f"{question}\n\n实体别名扩展：{'、'.join(additions)}", matched
+def list_entity_aliases(settings: Settings, domain: str | None = None) -> list[dict[str, Any]]:
+    init_app_db(settings)
+    params: list[object] = []
+    query = "SELECT * FROM entity_aliases"
+    if domain:
+        query += " WHERE domain IS NULL OR domain = '' OR domain = ?"
+        params.append(domain)
+    query += " ORDER BY domain, entity_type, canonical_name, alias"
+    with connect_app(settings) as conn:
+        return rows_to_dicts(conn.execute(query, params).fetchall())
+
+
+def upsert_entity_alias(
+    settings: Settings,
+    request: EntityAliasRequest,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    init_app_db(settings)
+    timestamp = now_iso()
+    canonical = request.canonical_name.strip()
+    alias = request.alias.strip()
+    if not canonical or not alias:
+        raise ValueError("canonical_name 和 alias 不能为空")
+
+    domain = request.domain
+    canonical_key = normalize_alias(canonical)
+    alias_key = normalize_alias(alias)
+    entity_type = request.entity_type or "entity"
+    alias_id = _alias_id(domain, canonical_key, alias_key, entity_type)
+    metadata = request.metadata or {}
+
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO entity_aliases(
+              id, domain, canonical_name, canonical_key, alias, alias_key,
+              entity_type, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              domain = excluded.domain,
+              canonical_name = excluded.canonical_name,
+              canonical_key = excluded.canonical_key,
+              alias = excluded.alias,
+              alias_key = excluded.alias_key,
+              entity_type = excluded.entity_type,
+              metadata_json = excluded.metadata_json,
+              updated_at = excluded.updated_at
+            """,
+            (
+                alias_id,
+                domain,
+                canonical,
+                canonical_key,
+                alias,
+                alias_key,
+                entity_type,
+                json_dump(metadata),
+                timestamp,
+                timestamp,
+            ),
+        )
+        audit(
+            conn,
+            "entity_alias_upserted",
+            {
+                "alias_id": alias_id,
+                "domain": domain,
+                "canonical_name": canonical,
+                "alias": alias,
+                "actor": actor,
+            },
+            timestamp,
+        )
+        row = row_to_dict(conn.execute("SELECT * FROM entity_aliases WHERE id = ?", (alias_id,)).fetchone()) or {}
+    row["metadata"] = metadata
+    return row
+
+
+def delete_entity_alias(settings: Settings, alias_id: str, actor: str | None = None) -> dict[str, Any]:
+    init_app_db(settings)
+    timestamp = now_iso()
+    with connect_app(settings) as conn:
+        row = row_to_dict(conn.execute("SELECT * FROM entity_aliases WHERE id = ?", (alias_id,)).fetchone())
+        if row is None:
+            raise ValueError(f"entity alias 不存在: {alias_id}")
+        conn.execute("DELETE FROM entity_aliases WHERE id = ?", (alias_id,))
+        audit(conn, "entity_alias_deleted", {"alias_id": alias_id, "actor": actor}, timestamp)
+    return row
+
+
+def _alias_id(domain: str | None, canonical_key: str, alias_key: str, entity_type: str) -> str:
+    raw = f"{domain or '*'}|{entity_type}|{canonical_key}|{alias_key}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return f"alias_{digest}"
+
+
+def _settings_seed_key(settings: Settings) -> str:
+    if settings.database_backend == "postgres":
+        return "|".join(
+            [
+                "postgres",
+                str(settings.postgres_host),
+                str(settings.postgres_port),
+                str(settings.postgres_database),
+                str(settings.postgres_user),
+            ]
+        )
+    return f"sqlite|{settings.database_path}"

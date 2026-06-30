@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import copy
 import re
+import uuid
 from dataclasses import dataclass
 from time import perf_counter
 from types import SimpleNamespace
-from typing import Any
-import uuid
+from typing import Any, Callable
 
 from app.config import Settings
 from app.db import audit, connect_app, init_app_db, json_dump
+from app.gbrain import gbrain_query_candidates
 from app.models import AskRequest, EvalQuestionRequest, EvalRunResponse
 from app.search import ask
 from app.timeutil import now_iso
@@ -132,20 +133,22 @@ def run_eval(settings: Settings, domain: str | None = None) -> EvalRunResponse:
 
 def _term_matches(answer: str, patterns: list[str]) -> list[str]:
     matched: list[str] = []
+    normalized = _normalize_eval_text(answer)
     for pattern in patterns:
         alternatives = [part.strip() for part in pattern.split("|") if part.strip()]
-        if any(re.search(re.escape(part), answer, flags=re.I) for part in alternatives):
+        if any(_normalize_eval_text(part) in normalized for part in alternatives):
             matched.append(pattern)
     return matched
 
 
-def _source_matches(citations: list[dict], expected_sources: list[str]) -> list[str]:
+def _source_matches(citations: list[dict[str, Any]], expected_sources: list[str]) -> list[str]:
     matched: list[str] = []
     for expected in expected_sources:
         expected_key = expected.lower()
         for citation in citations:
             source_id = str(citation.get("source_id") or "").lower()
-            if expected_key and expected_key in source_id:
+            wiki_page = str(citation.get("wiki_page") or "").lower()
+            if expected_key and (expected_key in source_id or expected_key in wiki_page):
                 matched.append(expected)
                 break
     return matched
@@ -159,20 +162,38 @@ def _percentile(values: list[float], pct: float) -> float:
     return float(ordered[index])
 
 
-def summarize_upgraded_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_upgraded_rows(
+    rows: list[dict[str, Any]],
+    *,
+    pass_rate_threshold: float | None = None,
+    citation_rate_threshold: float | None = None,
+    p95_ms_threshold: float | None = None,
+) -> dict[str, Any]:
     total = len(rows)
     passed = sum(1 for row in rows if row.get("passed"))
     citation_count = sum(1 for row in rows if row.get("citations"))
     latencies = [float(row.get("elapsed_ms") or 0) for row in rows]
-    return {
+    pass_rate = round(passed / total, 4) if total else 0.0
+    citation_rate = round(citation_count / total, 4) if total else 0.0
+    p95_ms = round(_percentile(latencies, 0.95), 2)
+    summary = {
         "total": total,
         "passed": passed,
-        "pass_rate": round(passed / total, 4) if total else 0.0,
+        "pass_rate": pass_rate,
         "with_citations": citation_count,
-        "citation_rate": round(citation_count / total, 4) if total else 0.0,
+        "citation_rate": citation_rate,
         "p50_ms": round(_percentile(latencies, 0.5), 2),
-        "p95_ms": round(_percentile(latencies, 0.95), 2),
+        "p95_ms": p95_ms,
     }
+    summary["quality_gate"] = _quality_gate(
+        pass_rate,
+        citation_rate,
+        p95_ms,
+        pass_rate_threshold=pass_rate_threshold,
+        citation_rate_threshold=citation_rate_threshold,
+        p95_ms_threshold=p95_ms_threshold,
+    )
+    return summary
 
 
 def run_upgraded_question(settings: Settings, question: UpgradedEvalQuestion) -> dict[str, Any]:
@@ -184,16 +205,19 @@ def run_upgraded_question(settings: Settings, question: UpgradedEvalQuestion) ->
     elapsed_ms = (perf_counter() - started) * 1000
     citations = [citation.model_dump() if hasattr(citation, "model_dump") else dict(citation) for citation in result.citations]
     matched_sources = _source_matches(citations, question.expected_sources)
-    matched_terms = _term_matches(result.answer, question.required_terms)
+    combined_answer = result.answer + "\n" + "\n".join(str(citation.get("snippet") or "") for citation in citations)
+    matched_terms = _term_matches(combined_answer, question.required_terms)
+    min_terms = max(1, min(len(question.required_terms), 2)) if question.required_terms else 0
     passed = (
         (not question.expected_sources or len(matched_sources) > 0)
-        and len(matched_terms) >= max(1, min(len(question.required_terms), 2))
+        and len(matched_terms) >= min_terms
         and result.confidence != "low"
     )
     return {
         "id": question.id,
         "tier": question.tier,
         "category": question.category,
+        "risk": question.risk,
         "question": question.question,
         "domain": question.domain,
         "expected_sources": question.expected_sources,
@@ -206,6 +230,7 @@ def run_upgraded_question(settings: Settings, question: UpgradedEvalQuestion) ->
         "citations": citations,
         "elapsed_ms": round(elapsed_ms, 2),
         "retrieval_strategy": result.retrieval_strategy,
+        "gbrain_diagnostics": _gbrain_diagnostics(settings, question.question),
     }
 
 
@@ -213,12 +238,31 @@ def run_upgraded_eval(
     settings: Settings,
     questions: list[UpgradedEvalQuestion] | None = None,
     domain: str | None = None,
+    pass_rate_threshold: float | None = None,
+    citation_rate_threshold: float | None = None,
+    p95_ms_threshold: float | None = None,
+    progress_callback: Callable[[str, int, int, UpgradedEvalQuestion, dict[str, Any]], None] | None = None,
+    mode_label: str = "eval",
 ) -> dict[str, Any]:
-    selected = list(questions or UPGRADED_QUESTIONS)
+    selected = list(UPGRADED_QUESTIONS if questions is None else questions)
     if domain:
         selected = [question for question in selected if question.domain == domain]
-    rows = [run_upgraded_question(settings, question) for question in selected]
-    return {"summary": summarize_upgraded_rows(rows), "rows": rows}
+    rows = []
+    total = len(selected)
+    for index, question in enumerate(selected, start=1):
+        row = run_upgraded_question(settings, question)
+        rows.append(row)
+        if progress_callback:
+            progress_callback(mode_label, index, total, question, row)
+    return {
+        "summary": summarize_upgraded_rows(
+            rows,
+            pass_rate_threshold=pass_rate_threshold,
+            citation_rate_threshold=citation_rate_threshold,
+            p95_ms_threshold=p95_ms_threshold,
+        ),
+        "rows": rows,
+    }
 
 
 def _settings_with_gbrain(settings: Settings, enabled: bool) -> Settings:
@@ -235,18 +279,130 @@ def compare_upgraded_eval(
     questions: list[UpgradedEvalQuestion] | None = None,
     domain: str | None = None,
     mode: str = "both",
+    pass_rate_threshold: float | None = None,
+    citation_rate_threshold: float | None = None,
+    p95_ms_threshold: float | None = None,
+    progress_callback: Callable[[str, int, int, UpgradedEvalQuestion, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    if mode not in {"on", "off", "both"}:
-        raise ValueError("mode must be one of: on, off, both")
+    if mode not in {"off", "on", "both"}:
+        raise ValueError("mode must be one of: off, on, both")
     result: dict[str, Any] = {}
     if mode in {"off", "both"}:
-        result["off"] = run_upgraded_eval(_settings_with_gbrain(settings, False), questions=questions, domain=domain)
+        result["off"] = run_upgraded_eval(
+            _settings_with_gbrain(settings, False),
+            questions=questions,
+            domain=domain,
+            pass_rate_threshold=pass_rate_threshold,
+            citation_rate_threshold=citation_rate_threshold,
+            p95_ms_threshold=p95_ms_threshold,
+            progress_callback=progress_callback,
+            mode_label="off",
+        )
     if mode in {"on", "both"}:
-        result["on"] = run_upgraded_eval(_settings_with_gbrain(settings, True), questions=questions, domain=domain)
+        result["on"] = run_upgraded_eval(
+            _settings_with_gbrain(settings, True),
+            questions=questions,
+            domain=domain,
+            pass_rate_threshold=pass_rate_threshold,
+            citation_rate_threshold=citation_rate_threshold,
+            p95_ms_threshold=p95_ms_threshold,
+            progress_callback=progress_callback,
+            mode_label="on",
+        )
     if "off" in result and "on" in result:
         result["delta"] = {
             "passed": result["on"]["summary"]["passed"] - result["off"]["summary"]["passed"],
             "pass_rate": round(result["on"]["summary"]["pass_rate"] - result["off"]["summary"]["pass_rate"], 4),
             "p95_ms": round(result["on"]["summary"]["p95_ms"] - result["off"]["summary"]["p95_ms"], 2),
         }
+        result["failure_diff"] = failure_diff(result)
     return result
+
+
+def failure_diff(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    off_rows = {row.get("id"): row for row in result.get("off", {}).get("rows", [])}
+    on_rows = {row.get("id"): row for row in result.get("on", {}).get("rows", [])}
+    ids = [row_id for row_id in off_rows if row_id in on_rows]
+    diff = {
+        "off_pass_on_fail": [],
+        "off_fail_on_pass": [],
+        "both_fail": [],
+    }
+    for row_id in ids:
+        off = off_rows[row_id]
+        on = on_rows[row_id]
+        off_passed = bool(off.get("passed"))
+        on_passed = bool(on.get("passed"))
+        item = {
+            "id": row_id,
+            "question": off.get("question") or on.get("question"),
+            "domain": off.get("domain") or on.get("domain"),
+            "off": _diff_row_summary(off),
+            "on": _diff_row_summary(on),
+        }
+        if off_passed and not on_passed:
+            diff["off_pass_on_fail"].append(item)
+        elif not off_passed and on_passed:
+            diff["off_fail_on_pass"].append(item)
+        elif not off_passed and not on_passed:
+            diff["both_fail"].append(item)
+    return diff
+
+
+def _diff_row_summary(row: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = row.get("gbrain_diagnostics") or {}
+    retrieval = row.get("retrieval_strategy") or {}
+    return {
+        "passed": bool(row.get("passed")),
+        "confidence": row.get("confidence"),
+        "elapsed_ms": row.get("elapsed_ms"),
+        "matched_sources": row.get("matched_sources") or [],
+        "matched_terms": row.get("matched_terms") or [],
+        "gbrain_candidate_count": diagnostics.get("candidate_count"),
+        "gbrain_candidates": diagnostics.get("candidates") or [],
+        "gbrain_hits": retrieval.get("gbrain_hits"),
+    }
+
+
+def _quality_gate(
+    pass_rate: float,
+    citation_rate: float,
+    p95_ms: float,
+    *,
+    pass_rate_threshold: float | None,
+    citation_rate_threshold: float | None,
+    p95_ms_threshold: float | None,
+) -> dict[str, Any]:
+    thresholds = {
+        "pass_rate": pass_rate_threshold,
+        "citation_rate": citation_rate_threshold,
+        "p95_ms": p95_ms_threshold,
+    }
+    failures: list[str] = []
+    if pass_rate_threshold is not None and pass_rate < pass_rate_threshold:
+        failures.append("pass_rate")
+    if citation_rate_threshold is not None and citation_rate < citation_rate_threshold:
+        failures.append("citation_rate")
+    if p95_ms_threshold is not None and p95_ms > p95_ms_threshold:
+        failures.append("p95_ms")
+    configured = any(value is not None for value in thresholds.values())
+    return {
+        "configured": configured,
+        "passed": not failures,
+        "failures": failures,
+        "thresholds": thresholds,
+    }
+
+
+def _gbrain_diagnostics(settings: Settings, question: str) -> dict[str, Any]:
+    candidates = gbrain_query_candidates(question, settings.gbrain_candidate_limit)
+    return {
+        "enabled": settings.gbrain_enabled,
+        "candidate_limit": settings.gbrain_candidate_limit,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+def _normalize_eval_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").lower()

@@ -135,7 +135,7 @@ def rag_status(settings: Settings) -> dict:
     init_app_db(settings)
     gbrain = get_gbrain_status(settings)
     embedding_count = 0
-    embedding_model = "local-hash-v1"
+    embedding_model = settings.rag_embedding_model
     if settings.rag_store_backend == "postgres":
         from app.pg_rag import pg_rag_status
 
@@ -162,10 +162,16 @@ def rag_status(settings: Settings) -> dict:
         domains = [dict(row) for row in domain_rows]
         import json
 
+        model_counts: dict[str, int] = {}
         for row in metadata_rows:
             metadata = json.loads(row["metadata_json"] or "{}")
             if metadata.get("embedding"):
                 embedding_count += 1
+            model = metadata.get("embedding_model")
+            if model:
+                model_counts[model] = model_counts.get(model, 0) + 1
+        if model_counts:
+            embedding_model = sorted(model_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
     return {
         "database_backend": settings.database_backend,
         "rag_store_backend": settings.rag_store_backend,

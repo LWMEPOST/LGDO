@@ -237,30 +237,79 @@ def _query_gbrain_with_caller(
     return rank_gbrain_hits(dedupe_gbrain_hits(collected), question, limit)
 
 
-LOW_INFORMATION_CJK_PREFIXES = ("梳理", "公司", "所有", "全部", "哪些", "如果", "一个")
+LOW_INFORMATION_CJK_PREFIXES = ("梳理", "公司", "所有", "全部", "哪些", "有哪些", "如果", "一个", "文档")
+LOW_INFORMATION_PHRASES = {
+    "哪些",
+    "如果",
+    "一个",
+    "所有",
+    "全部",
+    "公司",
+    "文档",
+    "用户",
+    "客户",
+    "系统",
+    "平台",
+    "办法",
+    "方式",
+    "相关",
+}
+LOW_INFORMATION_SUBSTRINGS = ("哪些", "什么", "所有", "全部", "公司", "文档", "用户", "客户", "相关")
+CANDIDATE_SIGNAL_TERMS = (
+    "窗口",
+    "期限",
+    "条款",
+    "矛盾",
+    "优先级",
+    "依赖",
+    "审核",
+    "引擎",
+    "套餐",
+    "组合",
+    "积分",
+    "权限",
+    "审批",
+    "错误",
+    "失败",
+    "限制",
+    "api",
+)
+QUERY_CONNECTOR_RE = re.compile(r"(?:或者|以及|并且|并|和|与|或|及|、|之间的|相关(?:的)?|直接依赖|间接依赖|依赖于)")
+CORE_TERM_SUFFIX_RE = re.compile(
+    r"[\u4e00-\u9fff]{2,18}(?:"
+    r"优先级|引擎|关系|组合|窗口|期限|条款|规则|政策|指南|白皮书|文档|需求|模块|系统|接口|套餐|"
+    r"积分|权限|审批人|负责人|总监|调用|成本|清单"
+    r")"
+)
+STATE_PHRASE_RE = re.compile(r"[\u4e00-\u9fff]{2,16}(?:不够|不足|失败|异常|过期|限制|错误|矛盾)")
 
 
 def gbrain_query_candidates(question: str, candidate_limit: int = 8) -> list[str]:
+    if candidate_limit <= 0:
+        return []
     cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", question).strip()
     candidates: list[str] = []
     for code in re.findall(r"\b(?:API|KB|PRD|TBL|PPT|SUP|TKT)-\d{4}\b", question, flags=re.I):
         code = code.upper()
         if code not in candidates:
             candidates.append(code)
-    for phrase in _domain_query_phrases(question):
-        if phrase not in candidates:
+    for phrase in extract_gbrain_key_phrases(question):
+        if phrase in question and _useful_gbrain_candidate(phrase) and phrase not in candidates:
             candidates.append(phrase)
-    for phrase in ["时间窗口", "期限", "时限", "条款", "相互矛盾", "部门总监", "部门负责人"]:
-        if phrase in question and phrase not in candidates:
-            candidates.append(phrase)
-    if cleaned and cleaned != question and cleaned not in candidates:
+    if (
+        cleaned
+        and cleaned != question
+        and len(_normalize_match(cleaned)) <= 48
+        and _useful_gbrain_candidate(cleaned)
+        and cleaned not in candidates
+    ):
         candidates.append(cleaned)
-    if len(candidates) < max(2, candidate_limit // 2):
+    if not candidates:
         for cjk_part in re.findall(r"[\u4e00-\u9fff]{4,}", cleaned):
             for size in (4, 5, 6):
                 for index in range(0, max(0, len(cjk_part) - size + 1)):
                     token = cjk_part[index : index + size]
-                    if token.startswith(LOW_INFORMATION_CJK_PREFIXES):
+                    if not _useful_gbrain_candidate(token):
                         continue
                     if token not in candidates:
                         candidates.append(token)
@@ -270,98 +319,165 @@ def gbrain_query_candidates(question: str, candidate_limit: int = 8) -> list[str
                     break
             if len(candidates) >= candidate_limit:
                 break
-    try:
-        from app.rag import tokenize
+    if not candidates:
+        try:
+            from app.rag import tokenize
 
-        tokens = tokenize(question)
-    except Exception:
-        tokens = []
-    for token in tokens:
-        if 3 <= len(token) <= 8 and token not in candidates:
-            candidates.append(token)
-    for token in tokens:
-        if len(token) == 2 and token not in candidates:
-            candidates.append(token)
-    return candidates[: max(1, candidate_limit)]
+            tokens = tokenize(question)
+        except Exception:
+            tokens = []
+        for token in tokens:
+            if len(candidates) >= candidate_limit:
+                break
+            if 3 <= len(token) <= 8 and _useful_gbrain_candidate(token) and token not in candidates:
+                candidates.append(token)
+        for token in tokens:
+            if len(candidates) >= candidate_limit:
+                break
+            if len(token) == 2 and _useful_gbrain_candidate(token) and token not in candidates:
+                candidates.append(token)
+    return _rank_gbrain_candidates(candidates)[:candidate_limit]
+
+
+def extract_gbrain_key_phrases(question: str) -> list[str]:
+    phrases: list[str] = []
+    for quoted in re.findall(r"[“\"']([^”\"']{2,24})[”\"']", question):
+        phrases.extend(_phrase_variants(quoted))
+    for phrase in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]{1,16}\b", question):
+        phrases.extend(_phrase_variants(phrase))
+    for phrase in CORE_TERM_SUFFIX_RE.findall(question):
+        phrases.extend(_phrase_variants(phrase))
+    for phrase in STATE_PHRASE_RE.findall(question):
+        phrases.extend(_phrase_variants(phrase))
+    for clause in re.split(r"[\s,，。；;：:?？!！()（）<>《》\"'`]+", question):
+        phrases.extend(_phrase_variants(clause))
+    return _dedupe_phrases([phrase for phrase in phrases if _useful_gbrain_phrase(phrase)])
+
+
+def _phrase_variants(raw_phrase: str) -> list[str]:
+    phrase = _clean_gbrain_phrase(raw_phrase)
+    if not phrase:
+        return []
+
+    variants: list[str] = []
+    _append_phrase_variant(variants, phrase)
+    _append_phrase_variant(variants, _trim_query_glue(phrase))
+
+    for marker in ("有哪些", "选择什么", "应该选择", "什么", "哪些", "标注了", "之间的", "直接依赖", "间接依赖", "依赖于", "依赖"):
+        if marker in phrase:
+            for part in phrase.split(marker):
+                _append_phrase_variant(variants, _trim_query_glue(part))
+
+    for part in QUERY_CONNECTOR_RE.split(phrase):
+        _append_phrase_variant(variants, _trim_query_glue(part))
+
+    for term in CORE_TERM_SUFFIX_RE.findall(phrase):
+        _append_phrase_variant(variants, _trim_query_glue(term))
+
+    for term in STATE_PHRASE_RE.findall(phrase):
+        _append_phrase_variant(variants, _trim_query_glue(_tail_after_context_marker(term)))
+
+    return variants
+
+
+def _append_phrase_variant(variants: list[str], phrase: str) -> None:
+    phrase = _clean_gbrain_phrase(phrase)
+    if not phrase:
+        return
+    if _useful_gbrain_phrase(phrase) and phrase not in variants:
+        variants.append(phrase)
+
+
+def _clean_gbrain_phrase(phrase: str) -> str:
+    cleaned = re.sub(r"\s+", " ", phrase or "").strip(" -_/()（）[]【】{}<>《》:：,，。；;?？!！、")
+    return cleaned.strip()
+
+
+def _trim_query_glue(phrase: str) -> str:
+    cleaned = _clean_gbrain_phrase(phrase)
+    if not cleaned:
+        return ""
+
+    changed = True
+    while changed:
+        before = cleaned
+        cleaned = re.sub(r"^(?:请|帮我|从|把|将|在|对|若|如果|哪些|什么|有哪些|应该|选择|明确|标注了|提取|分析|判断|全部|所有|相关的?|直接|间接|并)+", "", cleaned)
+        cleaned = re.sub(r"(?:是什么|有哪些|多少|是谁|吗|呢|了|的办法|的方法|的方式|相关的全部条款|全部条款|相关条款|条款|中|里|内|时)$", "", cleaned)
+        cleaned = _clean_gbrain_phrase(cleaned)
+        changed = cleaned != before
+    return _tail_after_context_marker(cleaned)
+
+
+def _tail_after_context_marker(phrase: str) -> str:
+    cleaned = _clean_gbrain_phrase(phrase)
+    for marker in ("时", "后"):
+        if marker in cleaned and not cleaned.startswith("时间"):
+            tail = cleaned.rsplit(marker, 1)[-1]
+            if len(_normalize_match(tail)) >= 2:
+                return _clean_gbrain_phrase(tail)
+    return cleaned
+
+
+def _useful_gbrain_phrase(phrase: str) -> bool:
+    key = _normalize_match(phrase)
+    if len(key) < 2:
+        return False
+    if key in LOW_INFORMATION_PHRASES:
+        return False
+    if re.fullmatch(r"\d+", key):
+        return False
+    if any(key.startswith(_normalize_match(prefix)) for prefix in LOW_INFORMATION_CJK_PREFIXES):
+        return False
+    if len(key) > 24:
+        return False
+    return True
+
+
+def _useful_gbrain_candidate(phrase: str) -> bool:
+    key = _normalize_match(phrase)
+    if not _useful_gbrain_phrase(phrase):
+        return False
+    if len(key) > 18 and not re.search(r"\b[A-Z]+-\d{4}\b", phrase, flags=re.I):
+        return False
+    if any(part in key for part in LOW_INFORMATION_SUBSTRINGS) and len(key) > 12:
+        return False
+    if len(key) > 8 and any(part in key for part in ("怎么", "如何", "原因", "办法")):
+        return False
+    if any(part in key for part in LOW_INFORMATION_SUBSTRINGS) and not any(signal in key for signal in CANDIDATE_SIGNAL_TERMS):
+        return False
+    return True
+
+
+def _rank_gbrain_candidates(candidates: list[str]) -> list[str]:
+    indexed = list(enumerate(_dedupe_phrases(candidates)))
+
+    def sort_key(item: tuple[int, str]) -> tuple[int, int, int, int, int]:
+        index, candidate = item
+        key = _normalize_match(candidate)
+        if re.fullmatch(r"(?:api|kb|prd|tbl|ppt|sup|tkt)-?\d{4}", key, flags=re.I):
+            return (0, 0, 0, len(key), index)
+        signal_count = sum(1 for term in CANDIDATE_SIGNAL_TERMS if term in key)
+        low_info = sum(1 for term in LOW_INFORMATION_SUBSTRINGS if term in key)
+        if signal_count and len(key) <= 10:
+            bucket = 1
+        elif signal_count:
+            bucket = 2
+        elif re.fullmatch(r"[a-z0-9_-]{2,16}", candidate, flags=re.I):
+            bucket = 3
+        elif len(key) <= 8:
+            bucket = 4
+        else:
+            bucket = 5
+        return (bucket, low_info, -signal_count, abs(len(key) - 6), index)
+
+    return [candidate for _, candidate in sorted(indexed, key=sort_key)]
 
 
 def _domain_query_phrases(question: str) -> list[str]:
-    text = question.lower()
-    compact = _normalize_match(question)
     phrases: list[str] = []
-    phrase_rules = [
-        ("积分", "积分系统"),
-        ("补充积分", "积分获取方式"),
-        ("积分不够", "积分获取方式"),
-        ("透明通道", "输出格式"),
-        ("429", "API-0014"),
-        ("频率限制", "API-0014"),
-        ("内容安全审核引擎", "内容安全审核引擎"),
-        ("企业客户", "企业客户入驻"),
-        ("个人用户", "企业套餐"),
-        ("api集成", "企业API集成"),
-        ("专属客户经理", "企业套餐"),
-        ("年度套餐", "售后服务政策"),
-        ("退款", "售后服务政策"),
-    ]
-    for needle, phrase in phrase_rules:
-        if needle.lower() in text and phrase not in phrases:
+    for phrase in extract_gbrain_key_phrases(question):
+        if phrase not in phrases:
             phrases.append(phrase)
-    if (
-        ("套餐组合" in compact or "总成本" in compact or "日均" in compact or "500次" in compact)
-        and ("文生图" in compact or "api" in compact)
-    ):
-        phrases.extend(["全平台定价对比表", "TBL-0063", "企业标准", "积分系统完全指南", "文生图 API"])
-    if "api" in compact and "调用量" in compact and any(term in compact for term in ["用完", "继续使用", "额外成本"]):
-        phrases.extend(["全平台定价对比表", "TBL-0063", "积分加购", "积分系统完全指南", "企业旗舰"])
-    if any(term in compact for term in ["数据隐私合规审计", "隐私合规审计", "数据隐私", "合规审计"]):
-        phrases.extend([
-            "API-0018",
-            "数据保留与隐私白皮书",
-            "售后服务政策 数据与隐私",
-            "API-0017",
-            "内容安全审核规则详解",
-            "办公行为规范 数据安全",
-            "采购管理制度 数据安全合规",
-        ])
-    if any(term in compact for term in ["时间窗口", "期限", "时限"]) and any(term in compact for term in ["制度", "条款", "相互矛盾"]):
-        phrases.extend([
-            "售后服务政策 退款窗口期",
-            "费用报销制度 次月5日",
-            "行政管理制度 24小时",
-            "办公行为规范 远程办公 10分钟",
-            "采购管理制度 24小时",
-            "历史客服工单",
-        ])
-    if "prd" in compact and "优先级" in compact and any(term in compact for term in ["依赖关系", "依赖", "p0", "p1", "p2"]):
-        phrases.extend([
-            "PRD-0001",
-            "PRD-0006",
-            "PRD-0007",
-            "API-0010",
-            "API-0011",
-            "实时协作引擎",
-            "内容安全审核引擎",
-            "文生图 API",
-            "文生视频 API",
-        ])
-    if "api" in compact and "调用失败" in compact and any(term in compact for term in ["排查清单", "错误码", "工单案例", "完整"]):
-        phrases.extend(["API-0014", "API-0009", "历史客服工单", "Bearer", "1024", "500 503"])
-    if "内容安全审核引擎" in compact and any(term in compact for term in ["依赖", "子系统", "api", "模块", "哪些"]):
-        phrases.extend([
-            "内容安全审核引擎",
-            "内容审核结果",
-            "文生图 API",
-            "文生视频 API",
-            "Webhook",
-            "智能画布",
-            "API-0010",
-            "API-0011",
-            "API-0012",
-            "API-0017",
-            "PRD-0001",
-            "TKT-0038",
-        ])
     return _dedupe_phrases(phrases)
 
 

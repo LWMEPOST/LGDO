@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from functools import lru_cache
 from typing import Any
 
-from app.auth import UserContext, filter_rows_by_acl
 from app.aliases import score_alias_context
+from app.auth import UserContext, filter_rows_by_acl
 from app.config import Settings
 from app.db import connect_app, init_app_db, json_dump, rows_to_dicts
 from app.timeutil import now_iso
@@ -35,7 +36,6 @@ STOP_WORDS = {
     "多久",
     "是谁",
     "是否",
-    "以及",
     "其中",
     "还是",
     "没有",
@@ -65,8 +65,8 @@ QUERY_SPLIT_RE = re.compile(
 )
 GENERIC_TITLE_RE = re.compile(r"^(page|slide)\s+\d+$", re.I)
 DOC_CODE_RE = re.compile(r"\b(?:API|KB|PRD|TBL|PPT|SUP|TKT)[-_\s]\d{4}\b", re.I)
-EXPLICIT_DOCUMENT_CODE_MATCH_BOOST = 220.0
-EXPLICIT_DOCUMENT_CODE_INTERSECTION_BOOST = 240.0
+DOCUMENT_CODE_MATCH_BOOST = 96.0
+DOCUMENT_CODE_TITLE_BOOST = 30.0
 CANONICAL_DOCUMENT_TOPICS = [
     "全平台定价对比表",
     "积分系统完全指南",
@@ -171,10 +171,11 @@ def rank_search_rows(
     keyword_weight: float = 1.0,
     vector_weight: float = 12.0,
     alias_context: dict[str, Any] | None = None,
+    settings: Settings | None = None,
 ) -> list[dict[str, Any]]:
     tokens = tokenize(question)
     phrases = extract_query_phrases(question)
-    question_embedding = embed_text(question)
+    question_embedding, _ = embed_text_with_model(question, settings=settings)
     bm25_by_id = bm25_scores(rows, tokens)
     candidates: list[dict[str, Any]] = []
 
@@ -370,7 +371,7 @@ def document_code_boost(question: str, title: str, text: str, source_id: Any = N
     row_codes = set(extract_document_codes(haystack))
     boost = 0.0
     if query_codes and row_codes:
-        boost += len(query_codes & row_codes) * EXPLICIT_DOCUMENT_CODE_INTERSECTION_BOOST
+        boost += len(query_codes & row_codes) * DOCUMENT_CODE_MATCH_BOOST
 
     query = normalize_for_match(question)
     title_key = normalize_for_match(title)
@@ -378,9 +379,9 @@ def document_code_boost(question: str, title: str, text: str, source_id: Any = N
         prefix, number = code.split("-", 1)
         compact = f"{prefix.lower()}{number}"
         if compact in query or code.lower() in query:
-            boost += EXPLICIT_DOCUMENT_CODE_MATCH_BOOST
+            boost += DOCUMENT_CODE_MATCH_BOOST
         if compact in title_key or code.lower() in title_key:
-            boost += 30.0
+            boost += DOCUMENT_CODE_TITLE_BOOST
     return boost
 
 
@@ -421,18 +422,21 @@ def table_row_boost(phrases: list[str], tokens: list[str], text: str) -> float:
 def contextual_boost(question: str, text: str, title: str = "") -> float:
     query = normalize_for_match(question)
     haystack = normalize_for_match(f"{title}\n{text}")
+    title_key = normalize_for_match(title)
     boost = 0.0
     ticket_intent = any(term in query for term in ["客服", "工单", "处理记录", "用户问题", "客户投诉"])
-    generic_fact_intent = any(term in query for term in ["注册", "赠送", "多少", "限制", "承诺", "标准", "范围"])
-    policy_lookup_intent = any(term in query for term in ["政策", "规则", "条件", "退款", "套餐", "积分不够", "补充积分", "支持哪些", "不支持"])
-    troubleshooting_intent = any(term in query for term in ["通常", "常见", "原因", "解决方案"])
-    faq_policy_intent = ("系统故障" in query or "没出图" in query) and "积分" in query
-    if ticket_intent and not policy_lookup_intent and not ("注册" in query and "赠送" in query) and not troubleshooting_intent and not faq_policy_intent and (
+    fact_intent = any(term in query for term in ["多少", "限制", "标准", "范围", "条件", "支持", "不支持"])
+    policy_intent = any(term in query for term in ["政策", "规则", "制度", "条款", "条件", "退款", "套餐", "权限"])
+    troubleshooting_intent = any(term in query for term in ["通常", "常见", "原因", "解决方案", "排查", "失败", "错误"])
+    calculation_intent = any(term in query for term in ["成本", "价格", "费用", "年费", "月费", "用量", "调用量"])
+    relation_intent = any(term in query for term in ["依赖", "影响", "引用", "关系", "共享组件", "复用"])
+
+    if ticket_intent and not fact_intent and not policy_intent and not troubleshooting_intent and (
         "工单" in haystack or "处理记录" in haystack
     ):
         boost += 55.0
-    if ticket_intent and "工单" in haystack and "处理记录" in haystack and not generic_fact_intent and not policy_lookup_intent and not troubleshooting_intent and not faq_policy_intent:
-        boost += 95.0
+    if ticket_intent and "工单" in haystack and "处理记录" in haystack and not fact_intent and not policy_intent and not troubleshooting_intent:
+        boost += 45.0
     if ("充值" in query or "少了" in query) and "充值" in haystack and "积分" in haystack and "处理记录" in haystack:
         boost += 80.0
     if ("客服" in query or "建议检查" in query or "工单" in query) and (
@@ -444,29 +448,47 @@ def contextual_boost(question: str, text: str, title: str = "") -> float:
     ):
         boost += 70.0
     if ("roadmap" in query or "ppt" in query) and ("roadmap" in haystack or "ppt" in haystack):
-        boost += 70.0
-    if "roadmap" in query and "roadmap" in normalize_for_match(title):
-        boost += 60.0
-    if "注册" in query and "赠送" in query and ("faq" in haystack or "常见问题" in haystack):
-        boost += 80.0
-    if ("积分不够" in query or "补充积分" in query) and "积分获取方式" in haystack:
-        boost += 80.0
-    if "透明通道" in query and "输出格式" in haystack:
-        boost += 80.0
+        boost += 45.0
+    if "roadmap" in query and "roadmap" in title_key:
+        boost += 35.0
+    if fact_intent and ("faq" in haystack or "常见问题" in haystack or "问答" in haystack):
+        boost += 45.0
+    if "积分" in query and any(term in query for term in ["不够", "不足", "补充", "获取", "用完", "继续生成"]) and "积分" in haystack:
+        credit_evidence = sum(
+            1
+            for term in ["购买", "签到", "邀请", "精选", "套餐", "积分包", "获取", "赠送", "充值"]
+            if term in haystack
+        )
+        if credit_evidence >= 2:
+            boost += 65.0
     if "429" in query and ("rate_limited" in haystack or "频率限制" in haystack):
         boost += 80.0
-    if ("第8天" in query or "超过" in query) and "退款窗口期" in haystack:
-        boost += 80.0
-    if "内容安全审核引擎" in query and "内容安全审核引擎" in haystack:
-        boost += 80.0
-    if faq_policy_intent and (
-        "faq" in haystack or "常见问题" in haystack or "故障与售后" in haystack
+    if any(term in query for term in ["超过", "逾期", "第"]) and any(term in haystack for term in ["期限", "时限", "窗口", "天", "小时"]):
+        boost += 45.0
+    if policy_intent and any(term in haystack for term in ["制度", "政策", "规则", "条款", "审批", "权限"]):
+        boost += 35.0
+    if troubleshooting_intent and (
+        "错误" in haystack or "失败" in haystack or "原因" in haystack or "解决方案" in haystack or "排查" in haystack
     ):
-        boost += 80.0
-    if ("生成失败请重试" in query or troubleshooting_intent) and (
-        "常见生成失败原因" in haystack or "错误类型速查表" in haystack or "生成失败请重试" in haystack
+        boost += 60.0
+    if calculation_intent and any(
+        term in haystack for term in ["定价", "年费", "价格", "月费", "api调用月", "api调用/月"]
     ):
-        boost += 80.0
+        boost += 70.0
+    if relation_intent and any(
+        term in haystack for term in ["依赖", "调用", "引用", "webhook", "api", "模块", "组件", "影响"]
+    ):
+        boost += 45.0
+    if any(term in query for term in ["隐私", "合规", "审计", "数据安全"]):
+        privacy_evidence = sum(
+            1
+            for term in ["隐私", "合规", "审计", "数据", "加密", "保留", "安全", "训练", "上传", "素材", "声明", "目的", "期限", "个人网盘"]
+            if term in haystack
+        )
+        if "数据" in haystack and privacy_evidence >= 4:
+            boost += 75.0
+        elif privacy_evidence >= 3:
+            boost += 45.0
     if "套餐" in query and ("faq" in haystack or "定价" in haystack or "套餐" in haystack):
         boost += 20.0
     return boost
@@ -506,6 +528,39 @@ def embed_text(text: str, *, dimension: int = EMBEDDING_DIMENSION) -> list[float
     return [round(value / norm, 6) for value in vector]
 
 
+def embed_text_with_model(text: str, settings: Settings | None = None) -> tuple[list[float], str]:
+    provider = (getattr(settings, "rag_embedding_provider", "local-hash") if settings else "local-hash").lower()
+    model_name = getattr(settings, "rag_embedding_model", "local-hash-v1") if settings else "local-hash-v1"
+    dimension = int(getattr(settings, "rag_embedding_dimension", EMBEDDING_DIMENSION) if settings else EMBEDDING_DIMENSION)
+    if provider in {"local", "local-hash", "local_hash", "hash"}:
+        if dimension == EMBEDDING_DIMENSION:
+            return embed_text(text), model_name or "local-hash-v1"
+        return embed_text(text, dimension=dimension), model_name or "local-hash-v1"
+    if provider in {"sentence-transformers", "sentence_transformers", "bge-m3", "bge_m3"}:
+        transformer = _load_sentence_transformer(model_name)
+        encoded = transformer.encode([text], normalize_embeddings=True)
+        vector = _coerce_vector(encoded[0] if encoded else [])
+        return vector, model_name
+    raise ValueError(f"unsupported rag_embedding_provider: {provider}")
+
+
+@lru_cache(maxsize=4)
+def _load_sentence_transformer(model_name: str):
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "rag_embedding_provider=sentence-transformers requires the optional sentence-transformers package"
+        ) from exc
+    return SentenceTransformer(model_name)
+
+
+def _coerce_vector(values: Any) -> list[float]:
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    return [round(float(value), 6) for value in values]
+
+
 def cosine_similarity(left: list[float] | None, right: list[float] | None) -> float:
     if not left or not right:
         return 0.0
@@ -543,24 +598,24 @@ def upsert_document_chunks(
     timestamp = now_iso()
     if conn is not None:
         for chunk in chunks:
-            _upsert_chunk(conn, chunk, timestamp)
+            _upsert_chunk(conn, chunk, timestamp, settings)
         upsert_configured_rag_store(settings, chunks)
         return
 
     init_app_db(settings)
     with connect_app(settings) as owned_conn:
         for chunk in chunks:
-            _upsert_chunk(owned_conn, chunk, timestamp)
+            _upsert_chunk(owned_conn, chunk, timestamp, settings)
     upsert_configured_rag_store(settings, chunks)
 
 
-def _upsert_chunk(conn: Any, chunk: dict[str, Any], timestamp: str) -> None:
+def _upsert_chunk(conn: Any, chunk: dict[str, Any], timestamp: str, settings: Settings) -> None:
     metadata = chunk.get("metadata") or {}
     domain = metadata.get("domain") or ""
     title = metadata.get("title") or ""
     text = chunk.get("text") or ""
     tokens = tokenize(f"{title}\n{text}")
-    embedding = embed_text(f"{title}\n{text}")
+    embedding, embedding_model = embed_text_with_model(f"{title}\n{text}", settings=settings)
     conn.execute(
         """
         INSERT INTO document_chunks(
@@ -585,7 +640,7 @@ def _upsert_chunk(conn: Any, chunk: dict[str, Any], timestamp: str) -> None:
             chunk["chunk_index"],
             text,
             json_dump(tokens),
-            json_dump({**metadata, "embedding": embedding, "embedding_model": "local-hash-v1"}),
+            json_dump({**metadata, "embedding": embedding, "embedding_model": embedding_model}),
             timestamp,
             timestamp,
         ),
@@ -633,6 +688,7 @@ def search_chunks(
         keyword_weight=keyword_weight,
         vector_weight=vector_weight,
         alias_context=alias_context,
+        settings=settings,
     )
     return diversify_ranked_rows(ranked, limit)
 

@@ -338,12 +338,22 @@ def test_reranker_boosts_prd_priority_dependency_sources():
 
     assert ranked[0]["source_id"] in {"prd_0001", "prd_0006"}
     assert ranked[0]["doc_code_boost"] > 0
+    assert ranked[0]["phrase_boost"] + ranked[0]["doc_code_boost"] > ranked[-1]["phrase_boost"] + ranked[-1]["doc_code_boost"]
 
 
-def test_reranker_uses_alias_context_without_benchmark_intent_rules():
+def test_tokenize_splits_mixed_english_and_chinese_terms():
+    tokens = tokenize("文生图API返回401但API Key没过期")
+
+    assert "api" in tokens
+    assert "key" in tokens
+    assert "文生" in tokens
+
+
+def test_reranker_uses_alias_context_without_benchmark_intent_rules(monkeypatch):
     import app.rag as rag
     from app.aliases import build_alias_context
 
+    monkeypatch.setattr(rag, "embed_text", lambda _: [1.0, 0.0])
     rows = [
         make_row("generic", "普通制度", "审批流程说明。"),
         make_row("role", "费用报销制度", "部门负责人审批报销、采购、招待等事项。"),
@@ -367,21 +377,44 @@ def test_reranker_uses_alias_context_without_benchmark_intent_rules():
     assert ranked[0]["id"] == "role_chunk_0000"
     assert ranked[0]["alias_boost"] > 0
     assert ranked[0]["context_boost"] < 100
-    removed_helpers = [
-        "_".join(["pricing", "calculation", "intent"]),
-        "_".join(["content", "safety", "dependency", "intent"]),
-        "_".join(["privacy", "audit", "intent"]),
-        "_".join(["time", "window", "policy", "intent"]),
-        "_".join(["prd", "priority", "dependency", "intent"]),
-        "_".join(["api", "failure", "checklist", "intent"]),
+    removed_helper_names = [
+        "_".join(parts)
+        for parts in [
+            ("pricing", "calculation", "intent"),
+            ("content", "safety", "dependency", "intent"),
+            ("privacy", "audit", "intent"),
+            ("time", "window", "policy", "intent"),
+            ("prd", "priority", "dependency", "intent"),
+            ("api", "failure", "checklist", "intent"),
+        ]
     ]
-    for name in removed_helpers:
+    for name in removed_helper_names:
         assert not hasattr(rag, name)
 
 
-def test_tokenize_splits_mixed_english_and_chinese_terms():
-    tokens = tokenize("文生图API返回401但API Key没过期")
+def test_reranker_does_not_keep_benchmark_phrase_boost_branches():
+    import inspect
+    import app.rag as rag
 
-    assert "api" in tokens
-    assert "key" in tokens
-    assert "文生" in tokens
+    source = "\n".join(
+        [
+            inspect.getsource(rag.contextual_boost),
+            inspect.getsource(rag.document_code_boost),
+        ]
+    )
+
+    forbidden_literals = [
+        "内容安全审核引擎",
+        "透明通道",
+        "积分获取方式",
+        "退款窗口期",
+        "隐私白皮书",
+        "数据保留",
+        "不用于模型训练",
+        "aes256",
+        "生成失败请重试",
+        "错误类型速查表",
+        "常见生成失败原因",
+    ]
+    for literal in forbidden_literals:
+        assert literal not in source

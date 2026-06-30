@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 DOMAIN_PATTERN = "^(product|customer_service|administration)$"
@@ -9,8 +11,8 @@ class ScanRequest(BaseModel):
     root_path: str
     domain: str = Field(pattern=DOMAIN_PATTERN)
     owner: str | None = None
-    acl_tags: list[str] = []
-    metadata_defaults: dict = {}
+    acl_tags: list[str] = Field(default_factory=list)
+    metadata_defaults: dict = Field(default_factory=dict)
     force_reindex: bool = False
 
 
@@ -35,7 +37,7 @@ class SourcePreviewResponse(BaseModel):
     content: str
     truncated: bool = False
     char_count: int = 0
-    warnings: list[str] = []
+    warnings: list[str] = Field(default_factory=list)
 
 
 class CompileRequest(BaseModel):
@@ -83,9 +85,9 @@ class AskResponse(BaseModel):
     citations: list[Citation]
     confidence: str
     missing_info: list[str]
-    memory_hits: list[MemoryHit] = []
-    retrieval_strategy: dict = {}
-    user_context: dict = {}
+    memory_hits: list[MemoryHit] = Field(default_factory=list)
+    retrieval_strategy: dict = Field(default_factory=dict)
+    user_context: dict = Field(default_factory=dict)
 
 
 class FeedbackRequest(BaseModel):
@@ -103,8 +105,8 @@ class FeedbackResponse(BaseModel):
 class EvalQuestionRequest(BaseModel):
     question: str
     domain: str = Field(pattern=DOMAIN_PATTERN)
-    expected_sources: list[str] = []
-    expected_answer_points: list[str] = []
+    expected_sources: list[str] = Field(default_factory=list)
+    expected_answer_points: list[str] = Field(default_factory=list)
     risk_level: str = Field(default="low", pattern="^(low|medium|high)$")
 
 
@@ -116,9 +118,20 @@ class EvalRunResponse(BaseModel):
     citation_rate: float
 
 
+class EntityAliasRequest(BaseModel):
+    canonical_name: str
+    alias: str
+    domain: str | None = Field(default=None, pattern=DOMAIN_PATTERN)
+    entity_type: str = "entity"
+    metadata: dict = Field(default_factory=dict)
+
+
 class UpgradedEvalRunRequest(BaseModel):
     domain: str | None = Field(default=None, pattern=DOMAIN_PATTERN)
-    gbrain_mode: str = Field(default="both", pattern="^(on|off|both)$")
+    gbrain_mode: Literal["on", "off", "both"] = "both"
+    pass_rate_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    citation_rate_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    p95_ms_threshold: float | None = Field(default=None, gt=0)
 
 
 class ReviewUpdateRequest(BaseModel):
@@ -152,11 +165,3 @@ class GapUpdateRequest(BaseModel):
     owner: str | None = None
     linked_page_path: str | None = None
     note: str | None = None
-
-
-class EntityAliasRequest(BaseModel):
-    canonical_name: str
-    alias: str
-    domain: str | None = Field(default=None, pattern=DOMAIN_PATTERN)
-    entity_type: str | None = None
-    metadata: dict = {}

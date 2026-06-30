@@ -27,6 +27,7 @@ def test_rag_chunks_are_indexed_and_retrieval_prefers_matching_source(tmp_path, 
     monkeypatch.setattr(settings, "database_backend", "sqlite")
     monkeypatch.setattr(settings, "rag_store_backend", "sqlite")
     monkeypatch.setattr(settings, "database_path", data_dir / "test.db")
+    monkeypatch.setattr(settings, "postgres_port", 54322)
     monkeypatch.setattr(settings, "vault_path", vault_dir)
     monkeypatch.setattr(settings, "upload_path", tmp_path / "uploads")
     monkeypatch.setattr(settings, "deepseek_api_key", None)
@@ -65,7 +66,7 @@ def test_rag_chunks_are_indexed_and_retrieval_prefers_matching_source(tmp_path, 
     assert status.json()["embedding_count"] >= 3
     assert status.json()["embedding_model"] == "local-hash-v1"
     assert status.json()["external_system_apis"]["feishu"] == "not_connected"
-    assert status.json()["postgres"]["port"] == 5432
+    assert status.json()["postgres"]["port"] == 54322
 
     with connect(settings.database_path) as conn:
         embedding_rows = conn.execute("SELECT metadata_json FROM document_chunks").fetchall()
@@ -167,3 +168,95 @@ def test_answer_modes_change_local_answer_and_use_query_memory(tmp_path, monkeyp
     assert draft_body["retrieval_strategy"]["context_limit"] == 5
     assert "您好" in draft_body["answer"]
     assert draft_body["answer"] != short_body["answer"]
+
+
+def test_configured_bge_m3_embedding_provider_is_used(monkeypatch):
+    import app.rag as rag
+
+    class FakeSentenceTransformer:
+        def encode(self, texts, normalize_embeddings=True):
+            assert texts == ["测试文本"]
+            assert normalize_embeddings is True
+            return [[0.1, 0.2, 0.3, 0.4]]
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "rag_embedding_provider", "sentence-transformers", raising=False)
+    monkeypatch.setattr(settings, "rag_embedding_model", "BAAI/bge-m3", raising=False)
+    monkeypatch.setattr(settings, "rag_embedding_dimension", 4, raising=False)
+    monkeypatch.setattr(rag, "_load_sentence_transformer", lambda model_name: FakeSentenceTransformer(), raising=False)
+
+    vector, model_name = rag.embed_text_with_model("测试文本", settings=settings)
+
+    assert vector == [0.1, 0.2, 0.3, 0.4]
+    assert model_name == "BAAI/bge-m3"
+
+
+def test_upsert_document_chunks_records_configured_embedding_model(tmp_path, monkeypatch):
+    import json
+    import app.rag as rag
+
+    class FakeSentenceTransformer:
+        def encode(self, texts, normalize_embeddings=True):
+            return [[0.25, 0.25, 0.25, 0.25]]
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "database_backend", "sqlite")
+    monkeypatch.setattr(settings, "rag_store_backend", "sqlite")
+    monkeypatch.setattr(settings, "database_path", tmp_path / "test.db")
+    monkeypatch.setattr(settings, "rag_embedding_provider", "sentence-transformers", raising=False)
+    monkeypatch.setattr(settings, "rag_embedding_model", "BAAI/bge-m3", raising=False)
+    monkeypatch.setattr(settings, "rag_embedding_dimension", 4, raising=False)
+    monkeypatch.setattr(rag, "_load_sentence_transformer", lambda model_name: FakeSentenceTransformer(), raising=False)
+
+    rag.upsert_document_chunks(
+        settings,
+        [
+            {
+                "id": "chunk_1",
+                "source_id": "src_1",
+                "chunk_index": 0,
+                "text": "部门负责人审批采购。",
+                "metadata": {"domain": "customer_service", "title": "采购制度"},
+            }
+        ],
+    )
+
+    with connect(settings.database_path) as conn:
+        row = conn.execute("SELECT metadata_json FROM document_chunks WHERE id = ?", ("chunk_1",)).fetchone()
+
+    metadata = json.loads(row["metadata_json"])
+    assert metadata["embedding"] == [0.25, 0.25, 0.25, 0.25]
+    assert metadata["embedding_model"] == "BAAI/bge-m3"
+
+
+def test_rag_status_reports_configured_embedding_model(tmp_path, monkeypatch):
+    import app.rag as rag
+    from app.catalog import rag_status
+
+    class FakeSentenceTransformer:
+        def encode(self, texts, normalize_embeddings=True):
+            return [[0.25, 0.25, 0.25, 0.25]]
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "database_backend", "sqlite")
+    monkeypatch.setattr(settings, "rag_store_backend", "sqlite")
+    monkeypatch.setattr(settings, "database_path", tmp_path / "test.db")
+    monkeypatch.setattr(settings, "rag_embedding_provider", "sentence-transformers")
+    monkeypatch.setattr(settings, "rag_embedding_model", "BAAI/bge-m3")
+    monkeypatch.setattr(settings, "rag_embedding_dimension", 4)
+    monkeypatch.setattr(rag, "_load_sentence_transformer", lambda model_name: FakeSentenceTransformer())
+
+    rag.upsert_document_chunks(
+        settings,
+        [
+            {
+                "id": "chunk_1",
+                "source_id": "src_1",
+                "chunk_index": 0,
+                "text": "部门负责人审批采购。",
+                "metadata": {"domain": "customer_service", "title": "采购制度"},
+            }
+        ],
+    )
+
+    assert rag_status(settings)["embedding_model"] == "BAAI/bge-m3"
