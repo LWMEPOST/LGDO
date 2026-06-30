@@ -81,6 +81,8 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
         with conn.cursor() as cur:
             for table in [
                 "audit_logs",
+                "auth_sessions",
+                "accounts",
                 "feedback",
                 "knowledge_gaps",
                 "query_logs",
@@ -144,6 +146,8 @@ def test_migration_endpoint_returns_table_counts(tmp_path, monkeypatch):
         with conn.cursor() as cur:
             for table in [
                 "audit_logs",
+                "auth_sessions",
+                "accounts",
                 "feedback",
                 "knowledge_gaps",
                 "query_logs",

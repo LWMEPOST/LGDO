@@ -132,6 +132,32 @@ export interface AskResponse {
   }>;
 }
 
+export interface AuthUser {
+  user_id: string;
+  username?: string | null;
+  role: string;
+  acl_tags: string[];
+  auth_provider?: string;
+}
+
+export interface AuthSession {
+  token: string;
+  user: AccountRecord;
+}
+
+export interface AccountRecord {
+  user_id: string;
+  username?: string | null;
+  role: string;
+  acl_tags: string[];
+  status: "active" | "disabled" | string;
+  auth_provider: string;
+  password_configured: boolean;
+  created_at: string;
+  updated_at: string;
+  last_login_at?: string | null;
+}
+
 export interface EditorState {
   path: string;
   content: string;
@@ -147,7 +173,7 @@ export interface SpaceFilter {
   desc: string;
   kind: SpaceFilterKind;
   value?: string;
-  targetSection?: "overview" | "sources" | "wiki" | "qa" | "gaps" | "reviews";
+  targetSection?: "overview" | "sources" | "wiki" | "qa" | "gaps" | "reviews" | "accounts";
   count: number;
 }
 

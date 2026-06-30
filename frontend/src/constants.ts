@@ -4,6 +4,7 @@ export const APP_RAIL_ITEMS = [
   { id: "wiki", label: "知识", icon: "◇" },
   { id: "qa", label: "问答", icon: "?" },
   { id: "gaps", label: "缺口", icon: "!" },
+  { id: "accounts", label: "账户", icon: "◎" },
 ] as const;
 
 export const NAV_ITEMS = [
@@ -14,6 +15,7 @@ export const NAV_ITEMS = [
   { id: "qa", label: "智能问答", desc: "引用回答与反馈", icon: "?" },
   { id: "gaps", label: "缺口队列", desc: "补充、解决、关闭", icon: "!" },
   { id: "reviews", label: "审阅队列", desc: "人工确认后发布", icon: "✓" },
+  { id: "accounts", label: "账户权限", desc: "登录账户与 ACL 标签", icon: "◎" },
 ] as const;
 
 export type SectionId = (typeof NAV_ITEMS)[number]["id"];

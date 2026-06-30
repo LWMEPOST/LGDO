@@ -90,6 +90,46 @@ class AskResponse(BaseModel):
     user_context: dict = Field(default_factory=dict)
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthSessionResponse(BaseModel):
+    token: str
+    user: dict
+
+
+class AccountCreateRequest(BaseModel):
+    user_id: str
+    username: str | None = None
+    password: str | None = None
+    role: Literal["admin", "editor", "viewer"] = "viewer"
+    acl_tags: list[str] = Field(default_factory=list)
+    status: Literal["active", "disabled"] = "active"
+
+
+class AccountUpdateRequest(BaseModel):
+    username: str | None = None
+    password: str | None = None
+    role: Literal["admin", "editor", "viewer"] | None = None
+    acl_tags: list[str] | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+class AccountResponse(BaseModel):
+    user_id: str
+    username: str | None = None
+    role: str
+    acl_tags: list[str] = Field(default_factory=list)
+    status: str
+    auth_provider: str = "local"
+    password_configured: bool = False
+    created_at: str
+    updated_at: str
+    last_login_at: str | None = None
+
+
 class FeedbackRequest(BaseModel):
     query_id: str
     rating: str = Field(pattern="^(good|bad|partial)$")

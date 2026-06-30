@@ -50,6 +50,8 @@ def test_postgres_metadata_backend_runs_internal_flow(tmp_path, monkeypatch):
         with conn.cursor() as cur:
             for table in [
                 "audit_logs",
+                "auth_sessions",
+                "accounts",
                 "feedback",
                 "knowledge_gaps",
                 "query_logs",

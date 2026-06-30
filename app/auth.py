@@ -40,6 +40,9 @@ def resolve_user_context(settings: Settings, request: Request) -> UserContext:
     authorization = request.headers.get("authorization") or ""
     bearer = _extract_bearer_token(authorization)
     if bearer:
+        local_user = _session_user(settings, bearer)
+        if local_user:
+            return local_user
         if not settings.oidc_enabled:
             if not settings.auth_dev_fallback_enabled:
                 raise HTTPException(
@@ -60,10 +63,10 @@ def resolve_user_context(settings: Settings, request: Request) -> UserContext:
             auth_provider="trusted-header",
         )
 
-    if settings.oidc_enabled and not settings.auth_dev_fallback_enabled:
+    if not settings.auth_dev_fallback_enabled:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="缺少 OIDC Bearer token",
+            detail="缺少认证凭据",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -74,6 +77,15 @@ def resolve_user_context(settings: Settings, request: Request) -> UserContext:
         acl_tags=("*",),
         auth_provider="development",
     )
+
+
+def _session_user(settings: Settings, token: str) -> UserContext | None:
+    try:
+        from app.accounts import account_from_session
+
+        return account_from_session(settings, token)
+    except Exception:
+        return None
 
 
 def apply_request_user_override(settings: Settings, user: UserContext, request_model: Any) -> UserContext:

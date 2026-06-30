@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { api } from "./api/client";
+import { api, getAuthToken, setAuthToken } from "./api/client";
 import { Layout } from "./components/Layout";
 import type { SectionId } from "./constants";
+import { AccountsTask, type AccountPayload } from "./features/AccountsTask";
 import { GapsTask } from "./features/GapsTask";
 import { IngestTask } from "./features/IngestTask";
+import { LoginView } from "./features/LoginView";
 import { Overview } from "./features/Overview";
 import { QaTask } from "./features/QaTask";
 import { ReviewsTask } from "./features/ReviewsTask";
@@ -12,6 +14,9 @@ import { SourcesTask } from "./features/SourcesTask";
 import { WikiTask } from "./features/WikiTask";
 import type {
   AskResponse,
+  AccountRecord,
+  AuthSession,
+  AuthUser,
   EditorState,
   IngestReport,
   KnowledgeGap,
@@ -42,6 +47,10 @@ export function App() {
   const [reviews, setReviews] = useState<ReviewItem[]>([]);
   const [gaps, setGaps] = useState<KnowledgeGap[]>([]);
   const [ragStatus, setRagStatus] = useState<RagStatus | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [accounts, setAccounts] = useState<AccountRecord[]>([]);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
   const [toast, setToast] = useState("");
   const [scanForm, setScanForm] = useState({
     root_path: "samples/product_service",
@@ -55,9 +64,9 @@ export function App() {
     question: "用户如何处理退款问题？",
     domain: "product",
     answer_mode: "detail",
-    user_id: "admin",
-    role: "admin",
-    acl_tags: "内部,产品",
+    user_id: "",
+    role: "",
+    acl_tags: "",
   });
   const [lastQueryId, setLastQueryId] = useState<string | null>(null);
   const [answer, setAnswer] = useState<AskResponse | null>(null);
@@ -73,8 +82,21 @@ export function App() {
   const [sourcePreviewLoading, setSourcePreviewLoading] = useState(false);
 
   useEffect(() => {
-    refresh().catch((error) => showToast(error.message));
+    bootstrapAuth().catch((error) => {
+      setAuthError(error.message);
+      setAuthLoading(false);
+    });
   }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    setAskForm((form) => ({
+      ...form,
+      user_id: currentUser.user_id,
+      role: currentUser.role,
+      acl_tags: currentUser.acl_tags.join(", "),
+    }));
+  }, [currentUser]);
 
   useEffect(() => {
     if (!selectedSourceId && sources.length) setSelectedSourceId(sources[0].id);
@@ -90,7 +112,52 @@ export function App() {
     window.setTimeout(() => setToast(""), 3200);
   }
 
-  async function refresh() {
+  async function bootstrapAuth() {
+    if (!getAuthToken()) {
+      setAuthLoading(false);
+      return;
+    }
+    try {
+      const user = await api<AuthUser>("/api/internal/auth/me");
+      setCurrentUser(user);
+      setAuthLoading(false);
+      await refresh(user);
+    } catch (error) {
+      setAuthToken("");
+      setCurrentUser(null);
+      setAuthLoading(false);
+    }
+  }
+
+  async function login(username: string, password: string) {
+    setAuthError("");
+    try {
+      const session = await api<AuthSession>("/api/internal/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ username, password }),
+      });
+      setAuthToken(session.token);
+      setCurrentUser(session.user);
+      await refresh(session.user);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "登录失败");
+    }
+  }
+
+  async function logout() {
+    await api("/api/internal/auth/logout", { method: "POST" }).catch(() => undefined);
+    setAuthToken("");
+    setCurrentUser(null);
+    setAccounts([]);
+    setSources([]);
+    setReports([]);
+    setPages([]);
+    setReviews([]);
+    setGaps([]);
+    setRagStatus(null);
+  }
+
+  async function refresh(user = currentUser) {
     const [nextSources, nextReports, nextPages, nextReviews, nextGaps, nextRagStatus] = await Promise.all([
       api<SourceRecord[]>("/api/internal/sources"),
       api<IngestReport[]>("/api/internal/ingest/reports"),
@@ -105,6 +172,9 @@ export function App() {
     setReviews(nextReviews);
     setGaps(nextGaps);
     setRagStatus(nextRagStatus);
+    if (user?.role === "admin" || user?.acl_tags?.includes("*")) {
+      setAccounts(await api<AccountRecord[]>("/api/internal/accounts"));
+    }
   }
 
   async function loadSourcePreview(sourceId: string) {
@@ -147,7 +217,12 @@ export function App() {
     form.append("owner", scanForm.owner || "");
     form.append("acl_tags", scanForm.acl_tags || "internal");
     form.append("metadata_defaults", scanForm.metadata_defaults || "{}");
-    const response = await fetch("/api/internal/sources/upload", { method: "POST", body: form });
+    const token = getAuthToken();
+    const response = await fetch("/api/internal/sources/upload", {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: form,
+    });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.detail || response.statusText);
     showToast(`上传完成：${body.saved_files.length} 个文件`);
@@ -179,14 +254,29 @@ export function App() {
       method: "POST",
       body: JSON.stringify({
         ...askForm,
-        user_id: askForm.user_id || null,
-        role: askForm.role || null,
-        acl_tags: splitTags(askForm.acl_tags),
         require_citations: true,
       }),
     });
     setAnswer(result);
     setLastQueryId(result.query_id);
+  }
+
+  async function createAccount(payload: AccountPayload) {
+    await api<AccountRecord>("/api/internal/accounts", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    showToast("账户已创建");
+    await refresh();
+  }
+
+  async function updateAccount(userId: string, payload: Partial<AccountPayload>) {
+    await api<AccountRecord>(`/api/internal/accounts/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+    showToast("账户权限已更新");
+    await refresh();
   }
 
   async function createGap() {
@@ -374,10 +464,27 @@ export function App() {
       />
     ),
     wiki: <WikiTask pages={scopedPages} activeSpaceFilter={activeSpaceFilter} clearSpaceFilter={clearSpaceFilter} editor={editor} setEditor={setEditor} loadPage={loadPage} savePage={savePage} markPageStale={markPageStale} showToast={showToast} />,
-    qa: <QaTask askForm={askForm} setAskForm={setAskForm} ask={ask} answer={answer} feedback={feedback} setFeedback={setFeedback} createGap={createGap} showToast={showToast} />,
+    qa: <QaTask askForm={askForm} setAskForm={setAskForm} ask={ask} answer={answer} feedback={feedback} setFeedback={setFeedback} createGap={createGap} showToast={showToast} currentUser={currentUser} />,
     gaps: <GapsTask gaps={scopedGaps} updateGap={updateGap} showToast={showToast} />,
     reviews: <ReviewsTask reviews={reviews} loadPage={loadPage} updateReview={updateReview} showToast={showToast} />,
+    accounts: (
+      <AccountsTask
+        accounts={accounts}
+        currentUser={currentUser}
+        createAccount={createAccount}
+        updateAccount={updateAccount}
+        showToast={showToast}
+      />
+    ),
   }[activeSection];
+
+  if (authLoading) {
+    return <div className="login-shell"><section className="login-panel"><h1>正在检查登录状态</h1></section></div>;
+  }
+
+  if (!currentUser) {
+    return <LoginView login={login} error={authError} />;
+  }
 
   return (
     <Layout
@@ -403,6 +510,8 @@ export function App() {
       refresh={refresh}
       syncPostgresRag={syncPostgresRag}
       showToast={showToast}
+      currentUser={currentUser}
+      logout={logout}
     >
       {content}
       {toast && <div className="toast">{toast}</div>}

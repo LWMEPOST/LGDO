@@ -8,6 +8,7 @@ from fastapi import Depends, Request
 from fastapi.responses import StreamingResponse
 
 from app.aliases import delete_entity_alias, list_entity_aliases, seed_default_entity_aliases, upsert_entity_alias
+from app.accounts import authenticate_account, create_account, list_accounts, revoke_session, update_account
 from app.auth import UserContext, resolve_user_context
 from app.catalog import (
     delete_source,
@@ -30,8 +31,12 @@ from app.feedback import submit_feedback
 from app.ingest import scan_sources
 from app.migration import migrate_sqlite_to_postgres
 from app.models import (
+    AccountCreateRequest,
+    AccountResponse,
+    AccountUpdateRequest,
     AskRequest,
     AskResponse,
+    AuthSessionResponse,
     CompileRequest,
     CompileResponse,
     EvalQuestionRequest,
@@ -40,6 +45,7 @@ from app.models import (
     FeedbackRequest,
     FeedbackResponse,
     GapUpdateRequest,
+    LoginRequest,
     ReviewUpdateRequest,
     ScanRequest,
     ScanResponse,
@@ -62,6 +68,72 @@ def current_user(request: Request) -> UserContext:
     return resolve_user_context(get_settings(), request)
 
 
+def require_account_admin(user: UserContext) -> None:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="需要 admin 权限管理账户 ACL")
+
+
+def require_editor(user: UserContext) -> None:
+    if not user.is_admin and user.role != "editor":
+        raise HTTPException(status_code=403, detail="需要 admin/editor 权限执行内部管理操作")
+
+
+def bearer_from_request(request: Request) -> str | None:
+    authorization = request.headers.get("authorization") or ""
+    if not authorization.lower().startswith("bearer "):
+        return None
+    return authorization.split(" ", 1)[1].strip()
+
+
+@router.post("/auth/login", response_model=AuthSessionResponse)
+def login_endpoint(request: LoginRequest) -> AuthSessionResponse:
+    try:
+        token, user = authenticate_account(get_settings(), request.username, request.password)
+        return AuthSessionResponse(token=token, user=user)
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/auth/me")
+def me_endpoint(user: UserContext = Depends(current_user)) -> dict:
+    return user.to_public_dict()
+
+
+@router.post("/auth/logout")
+def logout_endpoint(request: Request, user: UserContext = Depends(current_user)) -> dict:
+    revoke_session(get_settings(), bearer_from_request(request) or "", actor=user.user_id)
+    return {"ok": True}
+
+
+@router.get("/accounts", response_model=list[AccountResponse])
+def list_accounts_endpoint(user: UserContext = Depends(current_user)) -> list[dict]:
+    require_account_admin(user)
+    try:
+        return list_accounts(get_settings())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/accounts", response_model=AccountResponse)
+def create_account_endpoint(request: AccountCreateRequest, user: UserContext = Depends(current_user)) -> dict:
+    require_account_admin(user)
+    try:
+        return create_account(get_settings(), request, actor=user.user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/accounts/{user_id}", response_model=AccountResponse)
+def update_account_endpoint(user_id: str, request: AccountUpdateRequest, user: UserContext = Depends(current_user)) -> dict:
+    require_account_admin(user)
+    try:
+        return update_account(get_settings(), user_id, request, actor=user.user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/sources")
 def list_sources_endpoint(
     domain: str | None = Query(default=None),
@@ -75,7 +147,12 @@ def list_sources_endpoint(
 
 
 @router.delete("/sources/{source_id}")
-def delete_source_endpoint(source_id: str, note: str | None = Query(default=None)) -> dict:
+def delete_source_endpoint(
+    source_id: str,
+    note: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_editor(user)
     try:
         return delete_source(get_settings(), source_id, note)
     except Exception as exc:
@@ -97,7 +174,10 @@ def source_preview_endpoint(
 
 
 @router.get("/ingest/reports")
-def list_ingest_reports_endpoint(source_id: str | None = Query(default=None)) -> list[dict]:
+def list_ingest_reports_endpoint(
+    source_id: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> list[dict]:
     try:
         return list_ingest_reports(get_settings(), source_id)
     except Exception as exc:
@@ -105,7 +185,7 @@ def list_ingest_reports_endpoint(source_id: str | None = Query(default=None)) ->
 
 
 @router.get("/rag/status")
-def rag_status_endpoint() -> dict:
+def rag_status_endpoint(user: UserContext = Depends(current_user)) -> dict:
     try:
         return rag_status(get_settings())
     except Exception as exc:
@@ -113,7 +193,8 @@ def rag_status_endpoint() -> dict:
 
 
 @router.post("/rag/sync-postgres")
-def sync_rag_to_postgres_endpoint() -> dict:
+def sync_rag_to_postgres_endpoint(user: UserContext = Depends(current_user)) -> dict:
+    require_editor(user)
     try:
         from app.pg_rag import sync_sqlite_chunks_to_pg
 
@@ -124,7 +205,11 @@ def sync_rag_to_postgres_endpoint() -> dict:
 
 
 @router.post("/database/migrate-sqlite-to-postgres")
-def migrate_sqlite_to_postgres_endpoint(sqlite_path: str | None = Query(default=None)) -> dict:
+def migrate_sqlite_to_postgres_endpoint(
+    sqlite_path: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_account_admin(user)
     try:
         return migrate_sqlite_to_postgres(get_settings(), Path(sqlite_path) if sqlite_path else None)
     except Exception as exc:
@@ -132,7 +217,10 @@ def migrate_sqlite_to_postgres_endpoint(sqlite_path: str | None = Query(default=
 
 
 @router.get("/wiki/pages")
-def list_wiki_pages_endpoint(domain: str | None = Query(default=None)) -> list[dict]:
+def list_wiki_pages_endpoint(
+    domain: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> list[dict]:
     try:
         return list_wiki_pages(get_settings(), domain)
     except Exception as exc:
@@ -140,7 +228,12 @@ def list_wiki_pages_endpoint(domain: str | None = Query(default=None)) -> list[d
 
 
 @router.patch("/wiki/pages/{page_path:path}/status")
-def update_wiki_status_endpoint(page_path: str, request: WikiStatusUpdateRequest) -> dict:
+def update_wiki_status_endpoint(
+    page_path: str,
+    request: WikiStatusUpdateRequest,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_editor(user)
     try:
         return update_wiki_page_status(get_settings(), page_path, request)
     except Exception as exc:
@@ -148,7 +241,10 @@ def update_wiki_status_endpoint(page_path: str, request: WikiStatusUpdateRequest
 
 
 @router.get("/wiki/pages/{page_path:path}", response_model=WikiPageContentResponse)
-def read_wiki_page_endpoint(page_path: str) -> WikiPageContentResponse:
+def read_wiki_page_endpoint(
+    page_path: str,
+    user: UserContext = Depends(current_user),
+) -> WikiPageContentResponse:
     try:
         return WikiPageContentResponse(**read_wiki_page(get_settings(), page_path))
     except Exception as exc:
@@ -156,7 +252,12 @@ def read_wiki_page_endpoint(page_path: str) -> WikiPageContentResponse:
 
 
 @router.put("/wiki/pages/{page_path:path}")
-def save_wiki_page_endpoint(page_path: str, request: WikiPageSaveRequest) -> dict:
+def save_wiki_page_endpoint(
+    page_path: str,
+    request: WikiPageSaveRequest,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_editor(user)
     try:
         return save_wiki_page(get_settings(), page_path, request)
     except Exception as exc:
@@ -164,7 +265,10 @@ def save_wiki_page_endpoint(page_path: str, request: WikiPageSaveRequest) -> dic
 
 
 @router.get("/gaps")
-def list_gaps_endpoint(status: str | None = Query(default=None)) -> list[dict]:
+def list_gaps_endpoint(
+    status: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> list[dict]:
     try:
         return list_knowledge_gaps(get_settings(), status)
     except Exception as exc:
@@ -172,7 +276,12 @@ def list_gaps_endpoint(status: str | None = Query(default=None)) -> list[dict]:
 
 
 @router.patch("/gaps/{gap_id}")
-def update_gap_endpoint(gap_id: str, request: GapUpdateRequest) -> dict:
+def update_gap_endpoint(
+    gap_id: str,
+    request: GapUpdateRequest,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_editor(user)
     try:
         return update_knowledge_gap(get_settings(), gap_id, request)
     except Exception as exc:
@@ -180,7 +289,10 @@ def update_gap_endpoint(gap_id: str, request: GapUpdateRequest) -> dict:
 
 
 @router.get("/reviews")
-def list_reviews_endpoint(status: str | None = Query(default=None)) -> list[dict]:
+def list_reviews_endpoint(
+    status: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> list[dict]:
     try:
         return list_review_items(get_settings(), status)
     except Exception as exc:
@@ -188,7 +300,12 @@ def list_reviews_endpoint(status: str | None = Query(default=None)) -> list[dict
 
 
 @router.patch("/reviews/{review_id}")
-def update_review_endpoint(review_id: str, request: ReviewUpdateRequest) -> dict:
+def update_review_endpoint(
+    review_id: str,
+    request: ReviewUpdateRequest,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_editor(user)
     try:
         return update_review_item(get_settings(), review_id, request)
     except Exception as exc:
@@ -196,7 +313,8 @@ def update_review_endpoint(review_id: str, request: ReviewUpdateRequest) -> dict
 
 
 @router.post("/sources/scan", response_model=ScanResponse)
-def scan_endpoint(request: ScanRequest) -> ScanResponse:
+def scan_endpoint(request: ScanRequest, user: UserContext = Depends(current_user)) -> ScanResponse:
+    require_editor(user)
     try:
         return scan_sources(get_settings(), request)
     except Exception as exc:
@@ -210,7 +328,9 @@ def upload_endpoint(
     owner: str | None = Form(None),
     acl_tags: str = Form("internal"),
     metadata_defaults: str = Form("{}"),
+    user: UserContext = Depends(current_user),
 ) -> UploadResponse:
+    require_editor(user)
     try:
         settings = get_settings()
         import json
@@ -247,7 +367,8 @@ def upload_endpoint(
 
 
 @router.post("/wiki/compile", response_model=CompileResponse)
-def compile_endpoint(request: CompileRequest) -> CompileResponse:
+def compile_endpoint(request: CompileRequest, user: UserContext = Depends(current_user)) -> CompileResponse:
+    require_editor(user)
     try:
         return compile_wiki(get_settings(), request)
     except Exception as exc:
@@ -274,7 +395,7 @@ def ask_stream_endpoint(request: AskRequest, user: UserContext = Depends(current
 
 
 @router.post("/feedback", response_model=FeedbackResponse)
-def feedback_endpoint(request: FeedbackRequest) -> FeedbackResponse:
+def feedback_endpoint(request: FeedbackRequest, user: UserContext = Depends(current_user)) -> FeedbackResponse:
     try:
         return submit_feedback(get_settings(), request)
     except Exception as exc:
@@ -282,7 +403,8 @@ def feedback_endpoint(request: FeedbackRequest) -> FeedbackResponse:
 
 
 @router.post("/eval/questions")
-def eval_question_endpoint(request: EvalQuestionRequest) -> dict[str, str]:
+def eval_question_endpoint(request: EvalQuestionRequest, user: UserContext = Depends(current_user)) -> dict[str, str]:
+    require_editor(user)
     try:
         return add_eval_question(get_settings(), request)
     except Exception as exc:
@@ -290,7 +412,11 @@ def eval_question_endpoint(request: EvalQuestionRequest) -> dict[str, str]:
 
 
 @router.post("/eval/run", response_model=EvalRunResponse)
-def eval_run_endpoint(domain: str | None = Query(default=None)) -> EvalRunResponse:
+def eval_run_endpoint(
+    domain: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> EvalRunResponse:
+    require_editor(user)
     try:
         return run_eval(get_settings(), domain)
     except Exception as exc:
@@ -298,7 +424,8 @@ def eval_run_endpoint(domain: str | None = Query(default=None)) -> EvalRunRespon
 
 
 @router.post("/eval/upgraded")
-def upgraded_eval_endpoint(request: UpgradedEvalRunRequest) -> dict:
+def upgraded_eval_endpoint(request: UpgradedEvalRunRequest, user: UserContext = Depends(current_user)) -> dict:
+    require_editor(user)
     try:
         return compare_upgraded_eval(
             get_settings(),
@@ -313,7 +440,10 @@ def upgraded_eval_endpoint(request: UpgradedEvalRunRequest) -> dict:
 
 
 @router.get("/aliases")
-def list_aliases_endpoint(domain: str | None = Query(default=None)) -> list[dict]:
+def list_aliases_endpoint(
+    domain: str | None = Query(default=None),
+    user: UserContext = Depends(current_user),
+) -> list[dict]:
     try:
         return list_entity_aliases(get_settings(), domain)
     except Exception as exc:

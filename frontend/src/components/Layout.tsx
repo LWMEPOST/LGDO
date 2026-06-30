@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import { APP_RAIL_ITEMS, NAV_ITEMS, type SectionId } from "../constants";
-import type { KnowledgeGap, RagStatus, SourcePreview, SourceRecord, SpaceDirectoryGroup, SpaceFilter, WikiPage } from "../types";
+import type { AuthUser, KnowledgeGap, RagStatus, SourcePreview, SourceRecord, SpaceDirectoryGroup, SpaceFilter, WikiPage } from "../types";
 import { translateSourceType } from "../utils/format";
 
 interface LayoutProps {
@@ -27,6 +27,8 @@ interface LayoutProps {
   refresh: () => Promise<void>;
   syncPostgresRag: () => Promise<void>;
   showToast: (message: string) => void;
+  currentUser: AuthUser | null;
+  logout: () => Promise<void>;
   children: ReactNode;
 }
 
@@ -53,9 +55,14 @@ export function Layout({
   refresh,
   syncPostgresRag,
   showToast,
+  currentUser,
+  logout,
   children,
 }: LayoutProps) {
   const active = NAV_ITEMS.find((item) => item.id === activeSection) || NAV_ITEMS[0];
+  const canManageAccounts = currentUser?.role === "admin" || currentUser?.acl_tags?.includes("*");
+  const visibleRailItems = APP_RAIL_ITEMS.filter((item) => item.id !== "accounts" || canManageAccounts);
+  const visibleNavItems = NAV_ITEMS.filter((item) => item.id !== "accounts" || canManageAccounts);
   const sectionCounts = {
     overview: sources.length + pages.length + gaps.length,
     ingest: reportCount,
@@ -64,6 +71,7 @@ export function Layout({
     qa: gaps.length,
     gaps: gaps.length,
     reviews: reviewCount,
+    accounts: canManageAccounts ? 1 : 0,
   };
   const spaceFilters = directory.flatMap((group) => group.items);
   const activeDomain = activeSpaceFilter.kind === "domain" ? activeSpaceFilter.value : "";
@@ -97,16 +105,17 @@ export function Layout({
           />
         </div>
         <div className="topbar-actions">
-          <span className="sync-state"><span className="status-dot"></span><span>核心功能稳定</span></span>
+          <span className="sync-state"><span className="status-dot"></span><span>{currentUser?.username || currentUser?.user_id || "未登录"} · {currentUser?.role || "viewer"}</span></span>
           <button className="primary-action" onClick={() => setActiveSection("ingest")}>导入</button>
           <button className="secondary" onClick={() => refresh().catch((error) => showToast(error.message))}>刷新</button>
+          <button className="secondary" onClick={() => logout().catch((error) => showToast(error.message))}>退出</button>
         </div>
       </header>
 
       <div className="wiki-layout">
         <aside className="app-rail" aria-label="知识库快捷入口">
           <div className="rail-logo">L</div>
-          {APP_RAIL_ITEMS.map((item) => (
+          {visibleRailItems.map((item) => (
             <button
               key={item.id}
               className={`rail-button ${activeSection === item.id ? "active" : ""}`}
@@ -133,7 +142,7 @@ export function Layout({
           </button>
 
           <nav className="nav-list">
-            {NAV_ITEMS.map((item) => (
+            {visibleNavItems.map((item) => (
               <button
                 key={item.id}
                 className={`nav-item ${activeSection === item.id ? "active" : ""}`}

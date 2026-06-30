@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     auth_dev_user_id: str = "admin"
     auth_dev_username: str = "管理员"
     auth_trust_request_user_context: bool = False
+    auth_bootstrap_admin_password: str = "admin"
+    auth_session_ttl_hours: int = 12
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

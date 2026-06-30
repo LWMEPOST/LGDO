@@ -1,5 +1,5 @@
 import { Field, Panel } from "../components/common";
-import type { AskResponse } from "../types";
+import type { AskResponse, AuthUser } from "../types";
 import { formatAnswer, translateConfidence } from "../utils/format";
 
 export function QaTask({
@@ -11,6 +11,7 @@ export function QaTask({
   setFeedback,
   createGap,
   showToast,
+  currentUser,
 }: {
   askForm: Record<string, string>;
   setAskForm: (form: Record<string, string>) => void;
@@ -20,6 +21,7 @@ export function QaTask({
   setFeedback: (feedback: Record<string, string>) => void;
   createGap: () => Promise<void>;
   showToast: (message: string) => void;
+  currentUser: AuthUser | null;
 }) {
   return (
     <section className="qa-workspace">
@@ -45,20 +47,10 @@ export function QaTask({
                 </select>
               </Field>
             </div>
-            <div className="grid-3">
-              <Field label="用户 ID">
-                <input value={askForm.user_id || ""} onChange={(e) => setAskForm({ ...askForm, user_id: e.target.value })} />
-              </Field>
-              <Field label="角色">
-                <select value={askForm.role || "viewer"} onChange={(e) => setAskForm({ ...askForm, role: e.target.value })}>
-                  <option value="admin">管理员</option>
-                  <option value="editor">编辑者</option>
-                  <option value="viewer">查看者</option>
-                </select>
-              </Field>
-              <Field label="权限标签">
-                <input value={askForm.acl_tags || ""} onChange={(e) => setAskForm({ ...askForm, acl_tags: e.target.value })} />
-              </Field>
+            <div className="identity-strip">
+              <span className="pill strong-pill">{currentUser?.username || currentUser?.user_id}</span>
+              <span className="pill">{currentUser?.role || "viewer"}</span>
+              {(currentUser?.acl_tags || []).map((tag) => <span className="pill" key={tag}>{tag}</span>)}
             </div>
             <button className="qa-submit" onClick={() => ask().catch((error) => showToast(error.message))}>提问</button>
           </div>

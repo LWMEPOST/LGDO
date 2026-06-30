@@ -18,6 +18,8 @@ MAIN_TABLES = [
     "feedback",
     "knowledge_gaps",
     "eval_questions",
+    "accounts",
+    "auth_sessions",
     "entity_aliases",
     "ingest_reports",
     "document_chunks",
@@ -32,6 +34,8 @@ TABLE_PRIMARY_KEYS = {
     "feedback": "id",
     "knowledge_gaps": "id",
     "eval_questions": "id",
+    "accounts": "user_id",
+    "auth_sessions": "token",
     "entity_aliases": "id",
     "ingest_reports": "id",
     "document_chunks": "id",
@@ -144,6 +148,33 @@ CREATE TABLE IF NOT EXISTS eval_questions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS accounts (
+  user_id TEXT PRIMARY KEY,
+  username TEXT,
+  role TEXT NOT NULL DEFAULT 'viewer',
+  acl_tags_json TEXT NOT NULL DEFAULT '[]',
+  password_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  auth_provider TEXT NOT NULL DEFAULT 'local',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_login_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_status
+ON accounts(status);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
+ON auth_sessions(user_id);
 
 CREATE TABLE IF NOT EXISTS entity_aliases (
   id TEXT PRIMARY KEY,
@@ -317,6 +348,33 @@ CREATE TABLE IF NOT EXISTS eval_questions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS accounts (
+  user_id TEXT PRIMARY KEY,
+  username TEXT,
+  role TEXT NOT NULL DEFAULT 'viewer',
+  acl_tags_json TEXT NOT NULL DEFAULT '[]',
+  password_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  auth_provider TEXT NOT NULL DEFAULT 'local',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_login_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_status
+ON accounts(status);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
+ON auth_sessions(user_id);
 
 CREATE TABLE IF NOT EXISTS entity_aliases (
   id TEXT PRIMARY KEY,
