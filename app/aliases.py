@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from threading import Lock
 from typing import Any
 
 from app.config import Settings
@@ -87,6 +88,7 @@ def expand_query_with_aliases(
     question: str,
     domain: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
+    ensure_default_entity_aliases(settings)
     aliases = list_entity_aliases(settings, domain)
     context = build_alias_context(question, aliases)
     additions = context["expansion_terms"]
@@ -119,6 +121,20 @@ DEFAULT_ENTITY_ALIASES: list[dict[str, Any]] = [
         "metadata": {"terms": ["审批", "报销", "采购", "招待"]},
     },
 ]
+
+_DEFAULT_ALIAS_SEED_LOCK = Lock()
+_DEFAULT_ALIAS_SEEDED: set[str] = set()
+
+
+def ensure_default_entity_aliases(settings: Settings) -> None:
+    key = _settings_seed_key(settings)
+    if key in _DEFAULT_ALIAS_SEEDED:
+        return
+    with _DEFAULT_ALIAS_SEED_LOCK:
+        if key in _DEFAULT_ALIAS_SEEDED:
+            return
+        seed_default_entity_aliases(settings)
+        _DEFAULT_ALIAS_SEEDED.add(key)
 
 
 def seed_default_entity_aliases(settings: Settings, actor: str | None = "system") -> int:
@@ -213,3 +229,17 @@ def _alias_id(domain: str | None, canonical_key: str, alias_key: str, entity_typ
     raw = f"{domain or '*'}|{entity_type}|{canonical_key}|{alias_key}"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     return f"alias_{digest}"
+
+
+def _settings_seed_key(settings: Settings) -> str:
+    if settings.database_backend == "postgres":
+        return "|".join(
+            [
+                "postgres",
+                str(settings.postgres_host),
+                str(settings.postgres_port),
+                str(settings.postgres_database),
+                str(settings.postgres_user),
+            ]
+        )
+    return f"sqlite|{settings.database_path}"

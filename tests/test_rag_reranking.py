@@ -375,3 +375,31 @@ def test_reranker_uses_alias_context_without_benchmark_intent_rules(monkeypatch)
     ]
     for name in removed_helper_names:
         assert not hasattr(rag, name)
+
+
+def test_reranker_does_not_keep_benchmark_phrase_boost_branches():
+    import inspect
+    import app.rag as rag
+
+    source = "\n".join(
+        [
+            inspect.getsource(rag.contextual_boost),
+            inspect.getsource(rag.document_code_boost),
+        ]
+    )
+
+    forbidden_literals = [
+        "内容安全审核引擎",
+        "透明通道",
+        "积分获取方式",
+        "退款窗口期",
+        "隐私白皮书",
+        "数据保留",
+        "不用于模型训练",
+        "aes256",
+        "生成失败请重试",
+        "错误类型速查表",
+        "常见生成失败原因",
+    ]
+    for literal in forbidden_literals:
+        assert literal not in source

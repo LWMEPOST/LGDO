@@ -1,4 +1,11 @@
-from app.eval import UpgradedEvalQuestion, compare_upgraded_eval, run_upgraded_eval, run_upgraded_question, summarize_upgraded_rows
+from app.eval import (
+    UpgradedEvalQuestion,
+    compare_upgraded_eval,
+    failure_diff,
+    run_upgraded_eval,
+    run_upgraded_question,
+    summarize_upgraded_rows,
+)
 from app.config import Settings
 from app.models import AskResponse
 
@@ -87,6 +94,51 @@ def test_compare_upgraded_eval_runs_gbrain_off_and_on(monkeypatch):
     assert result["off"]["summary"]["passed"] == 1
     assert result["on"]["summary"]["passed"] == 1
     assert result["delta"]["passed"] == 0
+    assert result["failure_diff"]["off_pass_on_fail"] == []
+
+
+def test_run_upgraded_eval_calls_progress_callback(monkeypatch):
+    question = UpgradedEvalQuestion("QX", "T1", "cat", "question", None, [], [], "green")
+    events = []
+
+    monkeypatch.setattr(
+        "app.eval.run_upgraded_question",
+        lambda settings, item: {"id": item.id, "passed": True, "elapsed_ms": 1, "citations": []},
+    )
+
+    run_upgraded_eval(
+        Settings(deepseek_api_key="", deepseek_model=""),
+        questions=[question],
+        progress_callback=lambda mode, index, total, item, row: events.append((mode, index, total, item.id, row["id"])),
+        mode_label="off",
+    )
+
+    assert events == [("off", 1, 1, "QX", "QX")]
+
+
+def test_failure_diff_reports_on_off_regressions_and_improvements():
+    result = failure_diff(
+        {
+            "off": {
+                "rows": [
+                    {"id": "Q1", "passed": True, "matched_sources": ["A"], "matched_terms": ["x"]},
+                    {"id": "Q2", "passed": False, "matched_sources": [], "matched_terms": []},
+                    {"id": "Q3", "passed": False, "matched_sources": ["C"], "matched_terms": []},
+                ]
+            },
+            "on": {
+                "rows": [
+                    {"id": "Q1", "passed": False, "matched_sources": [], "matched_terms": ["x"]},
+                    {"id": "Q2", "passed": True, "matched_sources": ["B"], "matched_terms": ["y"]},
+                    {"id": "Q3", "passed": False, "matched_sources": [], "matched_terms": []},
+                ]
+            },
+        }
+    )
+
+    assert result["off_pass_on_fail"][0]["id"] == "Q1"
+    assert result["off_fail_on_pass"][0]["id"] == "Q2"
+    assert result["both_fail"][0]["id"] == "Q3"
 
 
 def test_run_upgraded_eval_respects_explicit_empty_question_list(monkeypatch):

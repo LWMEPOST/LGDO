@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     ocr_enabled: bool = False
     rag_chunk_size: int = 1400
     rag_chunk_overlap: int = 250
+    rag_embedding_provider: str = "local-hash"
+    rag_embedding_model: str = "local-hash-v1"
+    rag_embedding_dimension: int = 96
     gbrain_enabled: bool = False
     gbrain_endpoint: str | None = None
     gbrain_api_key: str | None = None

@@ -53,6 +53,31 @@ def test_seed_role_aliases_is_idempotent(tmp_path, monkeypatch):
     assert len({item["alias_key"] for item in role_aliases}) == 1
 
 
+def test_seed_role_aliases_drops_legacy_domain_alias_unique_index(tmp_path, monkeypatch):
+    from app.aliases import list_entity_aliases, seed_default_entity_aliases
+    from app.db import connect, init_app_db
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "database_backend", "sqlite")
+    monkeypatch.setattr(settings, "database_path", tmp_path / "test.db")
+
+    init_app_db(settings)
+    with connect(settings.database_path) as conn:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_domain_alias "
+            "ON entity_aliases(domain, alias_key)"
+        )
+
+    seed_default_entity_aliases(settings)
+    aliases = [
+        item
+        for item in list_entity_aliases(settings, "customer_service")
+        if item["alias"] == "部门总监"
+    ]
+
+    assert {item["canonical_name"] for item in aliases} == {"部门负责人", "直属上级", "审批人"}
+
+
 def test_ask_reports_alias_boost_in_top_hits(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     vault_dir = tmp_path / "vault"
@@ -98,3 +123,40 @@ def test_ask_reports_alias_boost_in_top_hits(tmp_path, monkeypatch):
     top_hits = answer.json()["retrieval_strategy"]["top_hits"]
     assert top_hits
     assert top_hits[0]["alias_boost"] > 0
+
+
+def test_ask_seeds_default_role_aliases_before_retrieval(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    vault_dir = tmp_path / "vault"
+    sample_dir = tmp_path / "samples"
+    sample_dir.mkdir()
+    (sample_dir / "role_policy.md").write_text(
+        "# 权限规则\n\n部门负责人审批报销、采购、请假和远程办公申请。",
+        encoding="utf-8",
+    )
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "database_backend", "sqlite")
+    monkeypatch.setattr(settings, "rag_store_backend", "sqlite")
+    monkeypatch.setattr(settings, "database_path", data_dir / "test.db")
+    monkeypatch.setattr(settings, "vault_path", vault_dir)
+    monkeypatch.setattr(settings, "upload_path", tmp_path / "uploads")
+    monkeypatch.setattr(settings, "deepseek_api_key", None)
+    monkeypatch.setattr(settings, "deepseek_model", None)
+
+    client = TestClient(app)
+    assert client.post(
+        "/api/internal/sources/scan",
+        json={"root_path": str(sample_dir), "domain": "customer_service", "owner": "tester", "acl_tags": ["internal"]},
+    ).status_code == 200
+    assert client.post("/api/internal/wiki/compile", json={"domain": "customer_service"}).status_code == 200
+
+    answer = client.post(
+        "/api/internal/ask",
+        json={"question": "部门总监有哪些审批权限？", "domain": "customer_service"},
+    )
+
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["retrieval_strategy"]["matched_aliases"]
+    assert body["retrieval_strategy"]["top_hits"][0]["alias_boost"] > 0

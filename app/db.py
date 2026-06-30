@@ -158,6 +158,8 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
   updated_at TEXT NOT NULL
 );
 
+DROP INDEX IF EXISTS idx_entity_aliases_domain_alias;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_unique
 ON entity_aliases(COALESCE(domain, ''), entity_type, canonical_key, alias_key);
 
@@ -328,6 +330,8 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+DROP INDEX IF EXISTS idx_entity_aliases_domain_alias;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_unique
 ON entity_aliases(COALESCE(domain, ''), entity_type, canonical_key, alias_key);

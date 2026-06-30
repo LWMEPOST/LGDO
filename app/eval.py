@@ -5,7 +5,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 from app.config import Settings
 from app.db import audit, connect_app, init_app_db, json_dump
@@ -240,11 +240,19 @@ def run_upgraded_eval(
     pass_rate_threshold: float | None = None,
     citation_rate_threshold: float | None = None,
     p95_ms_threshold: float | None = None,
+    progress_callback: Callable[[str, int, int, UpgradedEvalQuestion, dict[str, Any]], None] | None = None,
+    mode_label: str = "eval",
 ) -> dict[str, Any]:
     selected = list(UPGRADED_QUESTIONS if questions is None else questions)
     if domain:
         selected = [question for question in selected if question.domain == domain]
-    rows = [run_upgraded_question(settings, question) for question in selected]
+    rows = []
+    total = len(selected)
+    for index, question in enumerate(selected, start=1):
+        row = run_upgraded_question(settings, question)
+        rows.append(row)
+        if progress_callback:
+            progress_callback(mode_label, index, total, question, row)
     return {
         "summary": summarize_upgraded_rows(
             rows,
@@ -270,6 +278,7 @@ def compare_upgraded_eval(
     pass_rate_threshold: float | None = None,
     citation_rate_threshold: float | None = None,
     p95_ms_threshold: float | None = None,
+    progress_callback: Callable[[str, int, int, UpgradedEvalQuestion, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if mode not in {"off", "on", "both"}:
         raise ValueError("mode must be one of: off, on, both")
@@ -282,6 +291,8 @@ def compare_upgraded_eval(
             pass_rate_threshold=pass_rate_threshold,
             citation_rate_threshold=citation_rate_threshold,
             p95_ms_threshold=p95_ms_threshold,
+            progress_callback=progress_callback,
+            mode_label="off",
         )
     if mode in {"on", "both"}:
         result["on"] = run_upgraded_eval(
@@ -291,6 +302,8 @@ def compare_upgraded_eval(
             pass_rate_threshold=pass_rate_threshold,
             citation_rate_threshold=citation_rate_threshold,
             p95_ms_threshold=p95_ms_threshold,
+            progress_callback=progress_callback,
+            mode_label="on",
         )
     if "off" in result and "on" in result:
         result["delta"] = {
@@ -298,7 +311,53 @@ def compare_upgraded_eval(
             "pass_rate": round(result["on"]["summary"]["pass_rate"] - result["off"]["summary"]["pass_rate"], 4),
             "p95_ms": round(result["on"]["summary"]["p95_ms"] - result["off"]["summary"]["p95_ms"], 2),
         }
+        result["failure_diff"] = failure_diff(result)
     return result
+
+
+def failure_diff(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    off_rows = {row.get("id"): row for row in result.get("off", {}).get("rows", [])}
+    on_rows = {row.get("id"): row for row in result.get("on", {}).get("rows", [])}
+    ids = [row_id for row_id in off_rows if row_id in on_rows]
+    diff = {
+        "off_pass_on_fail": [],
+        "off_fail_on_pass": [],
+        "both_fail": [],
+    }
+    for row_id in ids:
+        off = off_rows[row_id]
+        on = on_rows[row_id]
+        off_passed = bool(off.get("passed"))
+        on_passed = bool(on.get("passed"))
+        item = {
+            "id": row_id,
+            "question": off.get("question") or on.get("question"),
+            "domain": off.get("domain") or on.get("domain"),
+            "off": _diff_row_summary(off),
+            "on": _diff_row_summary(on),
+        }
+        if off_passed and not on_passed:
+            diff["off_pass_on_fail"].append(item)
+        elif not off_passed and on_passed:
+            diff["off_fail_on_pass"].append(item)
+        elif not off_passed and not on_passed:
+            diff["both_fail"].append(item)
+    return diff
+
+
+def _diff_row_summary(row: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = row.get("gbrain_diagnostics") or {}
+    retrieval = row.get("retrieval_strategy") or {}
+    return {
+        "passed": bool(row.get("passed")),
+        "confidence": row.get("confidence"),
+        "elapsed_ms": row.get("elapsed_ms"),
+        "matched_sources": row.get("matched_sources") or [],
+        "matched_terms": row.get("matched_terms") or [],
+        "gbrain_candidate_count": diagnostics.get("candidate_count"),
+        "gbrain_candidates": diagnostics.get("candidates") or [],
+        "gbrain_hits": retrieval.get("gbrain_hits"),
+    }
 
 
 def _quality_gate(
