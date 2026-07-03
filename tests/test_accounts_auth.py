@@ -185,3 +185,33 @@ def test_admin_cannot_remove_own_last_admin_access(tmp_path, monkeypatch):
     demoted = client.patch("/api/internal/accounts/admin", headers=auth, json={"role": "viewer"})
     assert demoted.status_code == 400
     assert "当前登录管理员" in demoted.json()["detail"]
+
+
+def test_ask_accepts_legacy_string_acl_tags_from_console(tmp_path, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "database_backend", "sqlite")
+    monkeypatch.setattr(settings, "database_path", tmp_path / "data" / "test.db")
+    monkeypatch.setattr(settings, "auth_dev_fallback_enabled", False)
+    monkeypatch.setattr(settings, "auth_bootstrap_admin_password", "admin")
+
+    client = TestClient(app)
+    token = client.post("/api/internal/auth/login", json={"username": "admin", "password": "admin"}).json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+
+    response = client.post(
+        "/api/internal/ask",
+        headers=auth,
+        json={
+            "question": "用户如何处理退款问题？",
+            "domain": "product",
+            "answer_mode": "detail",
+            "require_citations": True,
+            "user_id": "admin",
+            "role": "admin",
+            "acl_tags": "*",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user_context"]["user_id"] == "admin"
+    assert response.json()["user_context"]["acl_tags"] == ["*"]

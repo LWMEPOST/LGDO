@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Literal
+import re
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 DOMAIN_PATTERN = "^(product|customer_service|administration)$"
 
@@ -62,6 +63,15 @@ class AskRequest(BaseModel):
     username: str | None = None
     role: str | None = None
     acl_tags: list[str] | None = None
+
+    @field_validator("acl_tags", mode="before")
+    @classmethod
+    def normalize_acl_tags(cls, value: Any) -> Any:
+        if value is None or isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return [tag.strip() for tag in re.split(r"[,，;；\s]+", value) if tag.strip()]
+        return value
 
 
 class Citation(BaseModel):

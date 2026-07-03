@@ -64,9 +64,6 @@ export function App() {
     question: "用户如何处理退款问题？",
     domain: "product",
     answer_mode: "detail",
-    user_id: "",
-    role: "",
-    acl_tags: "",
   });
   const [lastQueryId, setLastQueryId] = useState<string | null>(null);
   const [answer, setAnswer] = useState<AskResponse | null>(null);
@@ -87,16 +84,6 @@ export function App() {
       setAuthLoading(false);
     });
   }, []);
-
-  useEffect(() => {
-    if (!currentUser) return;
-    setAskForm((form) => ({
-      ...form,
-      user_id: currentUser.user_id,
-      role: currentUser.role,
-      acl_tags: currentUser.acl_tags.join(", "),
-    }));
-  }, [currentUser]);
 
   useEffect(() => {
     if (!selectedSourceId && sources.length) setSelectedSourceId(sources[0].id);
@@ -253,7 +240,9 @@ export function App() {
     const result = await api<AskResponse>("/api/internal/ask", {
       method: "POST",
       body: JSON.stringify({
-        ...askForm,
+        question: askForm.question,
+        domain: askForm.domain,
+        answer_mode: askForm.answer_mode,
         require_citations: true,
       }),
     });
