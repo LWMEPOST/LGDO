@@ -12,6 +12,7 @@
   <a href="#-architecture"><b>🛠️ Architecture</b></a> |
   <a href="#-capabilities"><b>🧩 Capabilities</b></a> |
   <a href="#-evaluation"><b>📊 Evaluation</b></a> |
+  <a href="更新说明.md"><b>📝 Updates</b></a> |
   <a href="#-limitations"><b>🚧 Limitations</b></a>
 </p>
 
@@ -51,6 +52,7 @@ It is not an end-customer chatbot. It is an internal RAG platform for **knowledg
 | 🧠 | **GBrain knowledge graph** | Entity traversal, cross-document dependency analysis, and role/permission aggregation beyond plain vector search. |
 | 🔄 | **Knowledge gap loop** | Feedback can create gaps with priority, ownership, related pages, and status tracking. |
 | ✅ | **Human review queue** | New and updated wiki pages enter review workflows instead of becoming unmanaged generated content. |
+| 🔐 | **Local login and account ACL** | Built-in admin login, session tokens, account roles, ACL tags, and protected internal console APIs. |
 | 🗄️ | **Dual storage backends** | SQLite for local trials; PostgreSQL + pgvector for production-oriented vector retrieval. |
 | 🎛️ | **React admin console** | Dense internal console for sources, uploads, wiki pages, QA, reviews, and system status. |
 
@@ -78,6 +80,8 @@ npm run dev
 ```
 
 Open `http://127.0.0.1:8000/docs` for API documentation, or `/console` for the admin console.
+
+The admin console uses local account login by default. The bootstrap administrator is `admin / admin`; change the password from the account ACL page after first login.
 
 ### Run the first cited answer in three calls
 
@@ -208,7 +212,7 @@ LGDO Knowledge Core was tested on **31 upgraded evaluation questions** covering 
 LGDO Knowledge Core is an internal knowledge platform, not an end-customer auto-reply product.
 
 - **No direct customer auto-replies.** The current version is intended for internal pilots; external responses should be confirmed by humans.
-- **ACL filtering still needs hardening.** `acl_tags` exist in source metadata, but multi-user permission filtering and unified login (OIDC) remain future work.
+- **Enterprise SSO still needs production hardening.** Local login, account roles, ACL tags, and internal API auth gates are available; OIDC mapping, password policy, login throttling, and token-hash storage remain future work.
 - **OCR is reserved but not fully integrated.** Scanned documents and image-only PDFs produce warnings until PaddleOCR or Tesseract is connected.
 - **Enterprise IM integrations are phase-two work.** WeCom, DingTalk, Lark, and customer-service writeback are not implemented yet.
 - **Cross-document entity alignment has blind spots.** For example, "department director" and "department owner" may need explicit alias mapping.
@@ -314,6 +318,12 @@ GBrain is disabled by default. When enabled, it provides entity traversal, cross
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | `GET` | `/health` | Health check |
+| `POST` | `/api/internal/auth/login` | Create a local session token |
+| `GET` | `/api/internal/auth/me` | Read the current authenticated user |
+| `POST` | `/api/internal/auth/logout` | Revoke the current local session |
+| `GET` | `/api/internal/accounts` | List local accounts and ACL tags, admin only |
+| `POST` | `/api/internal/accounts` | Create a local account, admin only |
+| `PATCH` | `/api/internal/accounts/{user_id}` | Update account role, status, password, and ACL tags, admin only |
 | `POST` | `/api/internal/sources/scan` | Scan local material directories |
 | `POST` | `/api/internal/sources/upload` | Upload and normalize materials |
 | `GET` | `/api/internal/sources` | List source metadata |
@@ -341,8 +351,10 @@ GBrain is disabled by default. When enabled, it provides entity traversal, cross
 - [x] PostgreSQL + pgvector retrieval
 - [x] GBrain knowledge graph integration and contribution measurement
 - [x] BGE-M3 embedding + hybrid search
-- [ ] **ACL retrieval filtering and unified login**: multi-user permissions and OIDC
-- [ ] **Entity alias alignment**: unify names for the same concept across documents
+- [x] **Local login and account ACL management**: bootstrap admin, session token auth, roles, ACL tags, and account management UI
+- [x] **ACL-aware internal console protection**: authenticated internal APIs, admin/editor write gates, and QA identity display from the active session
+- [x] **Entity alias alignment**: entity alias table and alias management APIs for cross-document canonical names
+- [ ] **Enterprise SSO hardening**: OIDC role/ACL mapping, token-hash storage, password policy, login throttling, and account audit filters
 - [ ] **OCR integration**: PaddleOCR or Tesseract for scanned documents
 - [ ] **Enterprise IM integration**: WeCom, DingTalk, and Lark
 - [ ] **Latency optimization**: parallel calls, query cache, and lighter reranking
