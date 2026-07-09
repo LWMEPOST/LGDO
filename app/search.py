@@ -13,12 +13,22 @@ from app.answer_modes import AnswerModeConfig, get_answer_mode_config
 from app.auth import UserContext, apply_request_user_override, can_read_metadata
 from app.config import Settings
 from app.db import audit, connect_app, init_app_db, json_dump
-from app.gbrain import GBrainHit, query_gbrain
+from app.external_embedding import ExternalEmbeddingError, rerank_rows_with_dashscope
+from app.gbrain import GBrainHit, GBrainQueryResult, query_gbrain as _query_gbrain, query_gbrain_with_diagnostics
 from app.llm import generate_answer, stream_generate_answer
 from app.models import AskRequest, AskResponse, Citation, MemoryHit
 from app.rag import clip_snippet, score_text, search_chunks, tokenize
 from app.timeutil import now_iso
 from app.vault import append_log
+
+query_gbrain = _query_gbrain
+
+
+def _query_gbrain_for_search(settings: Settings, question: str, limit: int) -> GBrainQueryResult:
+    if query_gbrain is not _query_gbrain:
+        return GBrainQueryResult(query_gbrain(settings, question, limit))
+    return query_gbrain_with_diagnostics(settings, question, limit)
+
 
 
 def load_page_text(vault_path: Path, rel_path: str) -> str:
@@ -97,12 +107,17 @@ def build_ask_assembly(
             user_context=resolved_user,
             alias_context=alias_context,
         )
-        gbrain_future = executor.submit(query_gbrain, settings, expanded_question, settings.gbrain_query_limit)
+        gbrain_future = executor.submit(
+            _query_gbrain_for_search, settings, expanded_question, settings.gbrain_query_limit
+        )
         chunk_hits = chunk_future.result()
         try:
-            gbrain_hits = gbrain_future.result()
+            gbrain_result = gbrain_future.result()
         except Exception:
-            gbrain_hits = []
+            gbrain_result = GBrainQueryResult([], reason="exception")
+
+    gbrain_hits = gbrain_result.hits
+    external_diagnostics: dict[str, Any] | None = None
 
     with connect_app(settings) as conn:
         citations: list[Citation] = []
@@ -110,6 +125,19 @@ def build_ask_assembly(
         context_blocks: list[str] = []
         memory_hits = search_query_memory(conn, request, tokens, mode_config, resolved_user)
         gbrain_hits = filter_authorized_gbrain_hits(conn, gbrain_hits, resolved_user)
+        if not gbrain_hits and settings.dashscope_embedding_enabled and chunk_hits:
+            try:
+                chunk_hits, external_diagnostics = rerank_rows_with_dashscope(
+                    settings,
+                    expanded_question,
+                    chunk_hits,
+                )
+            except ExternalEmbeddingError as exc:
+                external_diagnostics = {
+                    "channel": "bm25_keyword",
+                    "degraded_from": "dashscope_embedding",
+                    "reason": str(exc),
+                }
         for item in chunk_hits[: mode_config.context_limit]:
             source_id = item["source_id"]
             if not can_read_source_id(conn, source_id, resolved_user):
@@ -177,6 +205,11 @@ def build_ask_assembly(
             "memory_hits": len(memory_hits),
             "gbrain_hits": len(gbrain_hits),
             "gbrain_enabled": settings.gbrain_enabled,
+            "gbrain_reason": gbrain_result.reason if gbrain_result else "exception",
+            "gbrain_circuit_open": gbrain_result.circuit_open if gbrain_result else False,
+            "gbrain_cache_hit": gbrain_result.cache_hit if gbrain_result else False,
+            "gbrain_latency_ms": gbrain_result.latency_ms if gbrain_result else 0,
+            "fallback_retrieval": external_diagnostics,
             "keyword_weight": mode_config.keyword_weight,
             "vector_weight": mode_config.vector_weight,
             "alias_expanded": expanded_question != request.question,
@@ -203,6 +236,8 @@ def build_ask_assembly(
                     "doc_code_boost": item.get("doc_code_boost"),
                     "alias_boost": item.get("alias_boost"),
                     "rrf_score": item.get("rrf_score"),
+                    "external_vector_score": item.get("external_vector_score"),
+                    "external_rrf_score": item.get("external_rrf_score"),
                 }
                 for item in chunk_hits[: mode_config.context_limit]
                 if can_read_source_id(conn, item.get("source_id"), resolved_user)

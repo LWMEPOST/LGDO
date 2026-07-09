@@ -313,6 +313,27 @@ GBrain 默认关闭。开启后提供实体关系遍历、跨文档依赖分析�
 
 ---
 
+
+
+### 常驻 GBrain HTTP MCP 与阿里云语义兜底
+
+```powershell
+# 首次创建 LGDO 专属 token（只显示一次，请写入根目录 .env）
+$env:GBRAIN_HOME = "$PWD\data\gbrain"
+Set-Location gbrain
+bun run src/cli.ts auth create lgdo
+Set-Location ..
+
+# 启动或复用常驻 GBrain，然后启动 LGDO
+powershell -ExecutionPolicy Bypass -File scripts/start-lgdo.ps1
+
+# 只检查/启动 GBrain，不启动 FastAPI
+powershell -ExecutionPolicy Bypass -File scripts/start-lgdo.ps1 -SkipApp
+powershell -ExecutionPolicy Bypass -File scripts/status-gbrain.ps1
+```
+
+根目录 `.env` 使用 `GBRAIN_ENDPOINT=http://127.0.0.1:8787/mcp`。GBrain 异常、超时或无授权结果时，LGDO 可通过 `DASHSCOPE_EMBEDDING_ENABLED=true` 使用阿里云 `text-embedding-v3` 对本地候选块进行语义重排；阿里云也不可用时自动保留 BM25/关键词结果。百炼专属端点单批最多 10 条，代码会自动拆批。
+
 ## 🔌 常用接口
 
 | 方法 | 路径 | 说明 |

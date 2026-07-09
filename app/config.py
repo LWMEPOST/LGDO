@@ -26,6 +26,16 @@ class Settings(BaseSettings):
     rag_embedding_provider: str = "local-hash"
     rag_embedding_model: str = "local-hash-v1"
     rag_embedding_dimension: int = 96
+    dashscope_embedding_enabled: bool = False
+    dashscope_api_key: str | None = None
+    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    dashscope_embedding_model: str = "text-embedding-v3"
+    dashscope_embedding_dimension: int = 1024
+    dashscope_embedding_timeout_seconds: float = 3.0
+    dashscope_embedding_batch_size: int = 10
+    dashscope_embedding_cache_ttl_seconds: int = 600
+    dashscope_embedding_cache_max_entries: int = 256
+    dashscope_rerank_candidate_limit: int = 20
     gbrain_enabled: bool = False
     gbrain_endpoint: str | None = None
     gbrain_api_key: str | None = None
@@ -39,6 +49,8 @@ class Settings(BaseSettings):
     gbrain_query_expand: bool = False
     gbrain_query_timeout_seconds: int = 45
     gbrain_query_cache_ttl_seconds: int = 300
+    gbrain_circuit_failure_threshold: int = 3
+    gbrain_circuit_cooldown_seconds: int = 30
     gbrain_import_timeout_seconds: int = 600
     gbrain_import_on_compile: bool = False
     gbrain_import_no_embed: bool = False

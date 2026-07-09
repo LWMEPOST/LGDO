@@ -20,6 +20,9 @@ from app.vault import ensure_vault
 
 _QUERY_CACHE_LOCK = threading.Lock()
 _QUERY_CACHE: dict[tuple[Any, ...], tuple[float, list["GBrainHit"]]] = {}
+_CIRCUIT_LOCK = threading.Lock()
+_CIRCUIT_FAILURES = 0
+_CIRCUIT_OPENED_AT = 0.0
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,15 @@ class GBrainHit:
     chunk_id: int | None = None
     relational_path: list[str] | None = None
     relational_via_link_types: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class GBrainQueryResult:
+    hits: list[GBrainHit]
+    reason: str | None = None
+    circuit_open: bool = False
+    cache_hit: bool = False
+    latency_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -177,16 +189,26 @@ def import_vault_to_gbrain(settings: Settings, source_id: str | None = None) -> 
 
 
 def query_gbrain(settings: Settings, question: str, limit: int | None = None) -> list[GBrainHit]:
+    return query_gbrain_with_diagnostics(settings, question, limit).hits
+
+
+def query_gbrain_with_diagnostics(
+    settings: Settings,
+    question: str,
+    limit: int | None = None,
+) -> GBrainQueryResult:
     if not settings.gbrain_enabled:
-        return []
+        return GBrainQueryResult([], reason="disabled")
+    if _gbrain_circuit_is_open(settings):
+        return GBrainQueryResult([], reason="circuit_open", circuit_open=True)
     status = get_gbrain_status(settings)
     if not status.available:
-        return []
+        return GBrainQueryResult([], reason="unavailable")
     resolved_limit = limit or settings.gbrain_query_limit
     cache_key = _query_cache_key(settings, question, resolved_limit)
     cached_hits = _get_cached_query(cache_key, settings.gbrain_query_cache_ttl_seconds)
     if cached_hits is not None:
-        return cached_hits
+        return GBrainQueryResult(cached_hits, cache_hit=True)
 
     params: dict[str, Any] = {
         "query": question,
@@ -198,41 +220,99 @@ def query_gbrain(settings: Settings, question: str, limit: int | None = None) ->
     if settings.gbrain_source_id:
         params["source_id"] = settings.gbrain_source_id
 
-    if settings.gbrain_endpoint:
-        def http_call(tool_name: str, args: dict[str, Any]) -> Any:
-            return call_gbrain_tool(settings, tool_name, args, timeout=settings.gbrain_query_timeout_seconds)
-
-        hits = _query_gbrain_with_caller(http_call, params, question, resolved_limit, settings.gbrain_candidate_limit)
-        if hits:
-            _set_cached_query(cache_key, hits)
-        return hits
-
+    started = time.monotonic()
     try:
-        with LocalMcpClient(settings, settings.gbrain_query_timeout_seconds) as client:
-            hits = _query_gbrain_with_caller(client.call_tool, params, question, resolved_limit, settings.gbrain_candidate_limit)
-            if hits:
-                _set_cached_query(cache_key, hits)
-            return hits
+        if settings.gbrain_endpoint:
+            def http_call(tool_name: str, args: dict[str, Any]) -> Any:
+                return call_gbrain_tool(settings, tool_name, args, timeout=settings.gbrain_query_timeout_seconds)
+
+            hits = _query_gbrain_with_caller(
+                http_call,
+                params,
+                question,
+                resolved_limit,
+                settings.gbrain_candidate_limit,
+                suppress_errors=False,
+            )
+        else:
+            with LocalMcpClient(settings, settings.gbrain_query_timeout_seconds) as client:
+                hits = _query_gbrain_with_caller(
+                    client.call_tool,
+                    params,
+                    question,
+                    resolved_limit,
+                    settings.gbrain_candidate_limit,
+                    suppress_errors=False,
+                )
     except GBrainError:
-        return []
+        _record_gbrain_failure(settings)
+        return GBrainQueryResult(
+            [],
+            reason="request_failed",
+            circuit_open=_gbrain_circuit_is_open(settings),
+            latency_ms=round((time.monotonic() - started) * 1000),
+        )
+
+    _record_gbrain_success()
+    if hits:
+        _set_cached_query(cache_key, hits)
+    return GBrainQueryResult(
+        hits,
+        reason=None if hits else "empty",
+        latency_ms=round((time.monotonic() - started) * 1000),
+    )
 
 
+def _gbrain_circuit_is_open(settings: Settings) -> bool:
+    global _CIRCUIT_FAILURES, _CIRCUIT_OPENED_AT
+    with _CIRCUIT_LOCK:
+        if _CIRCUIT_FAILURES < max(1, settings.gbrain_circuit_failure_threshold):
+            return False
+        if time.monotonic() - _CIRCUIT_OPENED_AT >= max(1, settings.gbrain_circuit_cooldown_seconds):
+            _CIRCUIT_FAILURES = 0
+            _CIRCUIT_OPENED_AT = 0.0
+            return False
+        return True
+
+
+def _record_gbrain_failure(settings: Settings) -> None:
+    global _CIRCUIT_FAILURES, _CIRCUIT_OPENED_AT
+    with _CIRCUIT_LOCK:
+        _CIRCUIT_FAILURES += 1
+        if _CIRCUIT_FAILURES >= max(1, settings.gbrain_circuit_failure_threshold):
+            _CIRCUIT_OPENED_AT = time.monotonic()
+
+
+def _record_gbrain_success() -> None:
+    global _CIRCUIT_FAILURES, _CIRCUIT_OPENED_AT
+    with _CIRCUIT_LOCK:
+        _CIRCUIT_FAILURES = 0
+        _CIRCUIT_OPENED_AT = 0.0
+
+
+def _reset_gbrain_circuit() -> None:
+    _record_gbrain_success()
 def _query_gbrain_with_caller(
     caller,
     params: dict[str, Any],
     question: str,
     limit: int,
     candidate_limit: int = 8,
+    *,
+    suppress_errors: bool = True,
 ) -> list[GBrainHit]:
     collected: list[GBrainHit] = []
     try:
         collected.extend(normalize_gbrain_hits(caller("query", params)))
     except GBrainError:
-        pass
+        if not suppress_errors:
+            raise
     for candidate in gbrain_query_candidates(question, candidate_limit):
         try:
             collected.extend(normalize_gbrain_hits(caller("search", {"query": candidate, "limit": limit})))
         except GBrainError:
+            if not suppress_errors:
+                raise
             continue
     return rank_gbrain_hits(dedupe_gbrain_hits(collected), question, limit)
 

@@ -331,3 +331,107 @@ def test_gbrain_candidates_trim_low_information_cjk_windows():
 
 def test_gbrain_candidates_respect_zero_candidate_limit():
     assert gbrain_query_candidates("时间窗口和期限", candidate_limit=0) == []
+
+
+def test_gbrain_circuit_opens_after_three_failures(monkeypatch):
+    from app.gbrain import _reset_gbrain_circuit, query_gbrain_with_diagnostics
+
+    _reset_gbrain_circuit()
+    settings = Settings(
+        gbrain_enabled=True,
+        gbrain_endpoint="http://gbrain.example/mcp",
+        gbrain_circuit_failure_threshold=3,
+        gbrain_circuit_cooldown_seconds=30,
+    )
+    monkeypatch.setattr("app.gbrain.get_gbrain_status", lambda _settings: type("Status", (), {"available": True})())
+    calls = 0
+
+    def failing_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise GBrainError("offline")
+
+    monkeypatch.setattr("app.gbrain.call_gbrain_tool", failing_call)
+
+    results = [query_gbrain_with_diagnostics(settings, f"question-{index}") for index in range(4)]
+
+    assert calls == 3
+    assert results[2].reason == "request_failed"
+    assert results[3].circuit_open is True
+    assert results[3].reason == "circuit_open"
+
+
+def test_gbrain_success_resets_circuit(monkeypatch):
+    from app.gbrain import _reset_gbrain_circuit, query_gbrain_with_diagnostics
+
+    _reset_gbrain_circuit()
+    settings = Settings(gbrain_enabled=True, gbrain_endpoint="http://gbrain.example/mcp")
+    monkeypatch.setattr("app.gbrain.get_gbrain_status", lambda _settings: type("Status", (), {"available": True})())
+    monkeypatch.setattr(
+        "app.gbrain.call_gbrain_tool",
+        lambda *args, **kwargs: [{"slug": "refund", "title": "退款", "chunk_text": "七天退款", "score": 1.0}],
+    )
+
+    result = query_gbrain_with_diagnostics(settings, "退款")
+
+    assert result.hits
+    assert result.reason is None
+    assert result.circuit_open is False
+
+
+def test_ask_uses_dashscope_rerank_when_gbrain_has_no_hits(tmp_path, monkeypatch):
+    from app.external_embedding import EmbeddingBatch
+    from app.gbrain import GBrainQueryResult
+
+    settings = Settings(
+        database_backend="sqlite",
+        rag_store_backend="sqlite",
+        database_path=tmp_path / "data" / "test.db",
+        vault_path=tmp_path / "vault",
+        upload_path=tmp_path / "uploads",
+        gbrain_enabled=True,
+        dashscope_embedding_enabled=True,
+        dashscope_api_key="secret",
+        dashscope_embedding_dimension=3,
+    )
+    rows = [
+        {
+            "id": "invoice",
+            "source_id": "source-invoice",
+            "title": "发票规则",
+            "text": "企业客户填写税号后开票",
+            "snippet": "企业客户填写税号后开票",
+            "score": 100.0,
+        },
+        {
+            "id": "refund",
+            "source_id": "source-refund",
+            "title": "退款政策",
+            "text": "七天内可撤销订单并原路退回款项",
+            "snippet": "七天内可撤销订单并原路退回款项",
+            "score": 10.0,
+        },
+    ]
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(
+        "app.search._query_gbrain_for_search",
+        lambda *args, **kwargs: GBrainQueryResult([], reason="empty"),
+    )
+
+    vectors = {
+        "怎么取消已经购买的服务": [1.0, 0.0, 0.0],
+        "发票规则\n企业客户填写税号后开票": [0.0, 1.0, 0.0],
+        "退款政策\n七天内可撤销订单并原路退回款项": [0.95, 0.05, 0.0],
+    }
+
+    def fake_embed(_settings, texts, cache_key=None):
+        return EmbeddingBatch([vectors[text] for text in texts], "text-embedding-v3", False, 8)
+
+    monkeypatch.setattr("app.external_embedding.embed_texts", fake_embed)
+    monkeypatch.setattr("app.search.find_wiki_page_by_source", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.search.can_read_source_id", lambda *args, **kwargs: True)
+
+    result = ask(settings, AskRequest(question="怎么取消已经购买的服务"))
+
+    assert result.retrieval_strategy["fallback_retrieval"]["channel"] == "dashscope_embedding"
+    assert result.retrieval_strategy["top_hits"][0]["source_id"] == "source-refund"

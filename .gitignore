@@ -14,3 +14,4 @@ vault/
 uploads/
 frontend/node_modules/
 frontend/dist/
+.codex-runtime/
