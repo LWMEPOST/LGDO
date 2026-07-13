@@ -876,6 +876,28 @@ def connect_app(settings: Settings) -> Iterable[Any]:
         yield conn
 
 
+@contextmanager
+def connect_app_write(settings: Settings) -> Iterable[Any]:
+    if settings.database_backend == "postgres":
+        with connect_postgres(settings) as conn:
+            yield PgCompatConnection(conn)
+        return
+
+    path = settings.database_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
