@@ -13,6 +13,7 @@ from app.db import audit, connect_app, connect_app_write, json_dump
 from app.projection_jobs import ProjectionOutbox
 from app.timeutil import now_iso
 from app.wiki_markdown import (
+    FileObservationInput,
     MarkdownParseError,
     compute_file_hash,
     compute_semantic_hash,
@@ -417,7 +418,10 @@ class WikiRevisionService:
             page = dict(row) if row is not None else None
         if page is None or page["page_id"] is None or page["current_revision_id"] is None:
             raise WikiRevisionError(f"page has no current revision: {page_path}")
-        if page["pending_write_intent_id"] is not None:
+        if (
+            page["pending_write_intent_id"] is not None
+            or page["lifecycle_status"] == "invalid"
+        ):
             with connect_app(self.settings) as conn:
                 revision = conn.execute(
                     "SELECT content FROM wiki_page_revisions WHERE id=?",
@@ -515,6 +519,845 @@ class WikiRevisionService:
                 pending_intent_id=intent_id,
             )
         return self.get_page(page_path)
+
+    @staticmethod
+    def _observation_matches_input(
+        stored: Any,
+        observation: FileObservationInput,
+    ) -> bool:
+        def blob(value: Any) -> bytes | None:
+            return None if value is None else bytes(value)
+
+        return (
+            stored["file_hash"] == observation.file_hash
+            and int(stored["size_bytes"]) == observation.size_bytes
+            and int(stored["mtime_ns"]) == observation.mtime_ns
+            and blob(stored["content_bytes"]) == observation.content_bytes
+            and blob(stored["content_prefix"]) == observation.content_prefix
+            and bool(stored["content_truncated"])
+            == bool(observation.content_truncated)
+        )
+
+    def _persist_external_occurrence(
+        self,
+        event_id: str,
+        page_path: str,
+        observation: FileObservationInput,
+    ) -> tuple[dict[str, Any], bool]:
+        timestamp = now_iso()
+        with connect_app_write(self.settings) as conn:
+            existing_event = conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            if existing_event is not None:
+                event = dict(existing_event)
+                if event["page_path"] != page_path:
+                    raise RevisionConflict(
+                        "external event belongs to another page",
+                        current_revision_id=event["result_revision_id"],
+                    )
+                stored_observation = conn.execute(
+                    "SELECT * FROM wiki_file_observations WHERE id=?",
+                    (event["observation_id"],),
+                ).fetchone()
+                if (
+                    stored_observation is None
+                    or stored_observation["page_path"] != page_path
+                    or not self._observation_matches_input(
+                        stored_observation,
+                        observation,
+                    )
+                ):
+                    raise RevisionConflict(
+                        "external event observation payload changed",
+                        current_revision_id=event["result_revision_id"],
+                    )
+                return event, False
+
+            suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+            page_row = conn.execute(
+                "SELECT * FROM wiki_pages WHERE path=?" + suffix,
+                (page_path,),
+            ).fetchone()
+            if page_row is None or page_row["page_id"] is None:
+                raise PageNotFound(page_path)
+            page = dict(page_row)
+            observed = conn.execute(
+                """
+                SELECT * FROM wiki_file_observations
+                WHERE page_path=? AND file_hash=?
+                """,
+                (page_path, observation.file_hash),
+            ).fetchone()
+            if observed is None:
+                observation_id = f"wobs_{uuid.uuid4().hex}"
+                truncated = bool(observation.content_truncated)
+                conn.execute(
+                    """
+                    INSERT INTO wiki_file_observations(
+                      id,page_id,page_path,file_hash,size_bytes,mtime_ns,content_bytes,
+                      content_prefix,content_truncated,parse_status,error_code,
+                      error_message,observed_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(page_path,file_hash) DO NOTHING
+                    """,
+                    (
+                        observation_id,
+                        page["page_id"],
+                        page_path,
+                        observation.file_hash,
+                        observation.size_bytes,
+                        observation.mtime_ns,
+                        observation.content_bytes,
+                        observation.content_prefix,
+                        truncated,
+                        "invalid" if truncated else "pending",
+                        "file_too_large" if truncated else None,
+                        "file exceeds the observation capture limit" if truncated else None,
+                        timestamp,
+                    ),
+                )
+            observed = conn.execute(
+                """
+                SELECT * FROM wiki_file_observations
+                WHERE page_path=? AND file_hash=?
+                """,
+                (page_path, observation.file_hash),
+            ).fetchone()
+            if observed is None:
+                raise WikiRevisionError(
+                    "observation insert did not produce a natural-key row"
+                )
+            if (
+                observed["page_id"] != page["page_id"]
+                or observed["page_path"] != page_path
+                or observed["file_hash"] != observation.file_hash
+            ):
+                raise RevisionConflict(
+                    "observation belongs to another page identity",
+                    current_revision_id=page["current_revision_id"],
+                )
+            observation_id = str(observed["id"])
+            expected_state_json = canonical_state_json(
+                self._canonical_state_locked(conn, page)
+            )
+
+            inserted = conn.execute(
+                """
+                INSERT INTO vault_change_events(
+                  id,kind,page_path,observation_id,expected_state_json,status,
+                  detected_at,updated_at
+                ) VALUES (?,'modify',?,?,?,'pending',?,?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    event_id,
+                    page_path,
+                    observation_id,
+                    expected_state_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            event = conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            if event is None:
+                raise WikiRevisionError(
+                    f"external event insert did not produce a row: {event_id}"
+                )
+            event_data = dict(event)
+            if (
+                event_data["page_path"] != page_path
+                or event_data["observation_id"] != observation_id
+            ):
+                raise RevisionConflict(
+                    "external event observation payload changed",
+                    current_revision_id=page["current_revision_id"],
+                )
+            return event_data, inserted.rowcount == 1
+
+    def _replay_external_event(
+        self,
+        event: dict[str, Any],
+    ) -> MutationResult:
+        with connect_app(self.settings) as conn:
+            stored_observation = conn.execute(
+                "SELECT * FROM wiki_file_observations WHERE id=?",
+                (event["observation_id"],),
+            ).fetchone()
+            if (
+                stored_observation is None
+                or stored_observation["page_id"] is None
+                or stored_observation["page_path"] != event["page_path"]
+            ):
+                raise RevisionConflict(
+                    "external event has no stable observation page identity",
+                    current_revision_id=event.get("result_revision_id"),
+                )
+            stable_page_id = str(stored_observation["page_id"])
+            page_row = conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (stable_page_id,),
+            ).fetchone()
+            if page_row is None:
+                raise PageNotFound(stable_page_id)
+            page = dict(page_row)
+            if event["status"] not in {"applied", "invalid", "failed", "ignored"}:
+                raise RevisionConflict(
+                    "external change event has no replayable result",
+                    current_revision_id=event["result_revision_id"]
+                    or page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            try:
+                expected_state = json.loads(event["expected_state_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                expected_state = None
+            if not isinstance(expected_state, dict) or "current" not in expected_state:
+                raise RevisionConflict(
+                    "external event has no replayable expected state",
+                    current_revision_id=event.get("result_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            revision = None
+            if event["result_revision_id"] is not None:
+                revision = conn.execute(
+                    "SELECT * FROM wiki_page_revisions WHERE id=?",
+                    (event["result_revision_id"],),
+                ).fetchone()
+                if revision is None or revision["page_id"] != stable_page_id:
+                    raise RevisionConflict(
+                        "external event result revision belongs to another page",
+                        current_revision_id=event.get("result_revision_id"),
+                        pending_intent_id=page.get("pending_write_intent_id"),
+                    )
+            intent = None
+            if event["status"] == "applied":
+                intent = conn.execute(
+                    """
+                    SELECT * FROM vault_write_intents
+                    WHERE revision_id=? ORDER BY created_at,id LIMIT 1
+                    """,
+                    (event["result_revision_id"],),
+                ).fetchone()
+                try:
+                    metadata = (
+                        json.loads(revision["metadata_json"] or "{}")
+                        if revision is not None
+                        else None
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    metadata = None
+                expected_key = (
+                    f"external:{event['id']}:"
+                    f"{hashlib.sha256(event['expected_state_json'].encode('utf-8')).hexdigest()}"
+                )
+                if (
+                    revision is None
+                    or stored_observation is None
+                    or intent is None
+                    or not isinstance(metadata, dict)
+                    or revision["page_id"] != stable_page_id
+                    or revision["page_path"] != event["page_path"]
+                    or revision["origin"] != "external"
+                    or revision["base_revision_id"] != expected_state["current"]
+                    or revision["idempotency_key"] != expected_key
+                    or metadata.get("vault_change_event_id") != event["id"]
+                    or metadata.get("observation_id") != event["observation_id"]
+                    or metadata.get("observed_file_hash")
+                    != stored_observation["file_hash"]
+                    or intent["page_id"] != stable_page_id
+                    or intent["revision_id"] != revision["id"]
+                    or intent["expected_revision_id"] != expected_state["current"]
+                    or intent["expected_file_hash"]
+                    != stored_observation["file_hash"]
+                    or intent["target_path"] != event["page_path"]
+                    or intent["status"] != "applied"
+                ):
+                    raise RevisionConflict(
+                        "applied external event does not match its revision intent",
+                        current_revision_id=page.get("current_revision_id"),
+                        pending_intent_id=page.get("pending_write_intent_id"),
+                    )
+            review = None
+            if event["status"] == "invalid":
+                review = conn.execute(
+                    """
+                    SELECT id FROM review_items
+                    WHERE page_id=? AND issue_type='invalid_frontmatter'
+                      AND base_revision_id=?
+                    ORDER BY created_at DESC,id DESC LIMIT 1
+                    """,
+                    (stable_page_id, event["result_revision_id"]),
+                ).fetchone()
+        return MutationResult(
+            page_id=stable_page_id,
+            page_path=event["page_path"],
+            status=event["status"],
+            revision_id=event["result_revision_id"],
+            current_revision_id=event["result_revision_id"],
+            generated_revision_id=expected_state.get("generated"),
+            write_intent_id=str(intent["id"]) if intent is not None else None,
+            conflict_review_id=str(review["id"]) if review is not None else None,
+            observation_id=event["observation_id"],
+            replayed=True,
+        )
+
+    def _prepared_external_intent_locked(
+        self,
+        locked: LockedPage,
+        *,
+        event: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> MutationResult | None:
+        revision_id = event.get("result_revision_id")
+        if revision_id is None:
+            return None
+        revision_row = locked.conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (revision_id,),
+        ).fetchone()
+        intent_row = locked.conn.execute(
+            """
+            SELECT * FROM vault_write_intents
+            WHERE revision_id=? ORDER BY created_at,id LIMIT 1
+            """,
+            (revision_id,),
+        ).fetchone()
+        try:
+            expected_state = json.loads(event["expected_state_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            expected_state = None
+        metadata = None
+        if revision_row is not None:
+            try:
+                metadata = json.loads(revision_row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = None
+        expected_state_json = event["expected_state_json"] or "{}"
+        expected_key = (
+            f"external:{event['id']}:"
+            f"{hashlib.sha256(expected_state_json.encode('utf-8')).hexdigest()}"
+        )
+        if (
+            not isinstance(expected_state, dict)
+            or "current" not in expected_state
+            or revision_row is None
+            or intent_row is None
+            or not isinstance(metadata, dict)
+            or revision_row["page_id"] != locked.page["page_id"]
+            or revision_row["page_path"] != event["page_path"]
+            or revision_row["origin"] != "external"
+            or revision_row["base_revision_id"] != expected_state["current"]
+            or revision_row["idempotency_key"] != expected_key
+            or metadata.get("vault_change_event_id") != event["id"]
+            or metadata.get("observation_id") != event["observation_id"]
+            or metadata.get("observed_file_hash") != observation["file_hash"]
+            or intent_row["page_id"] != locked.page["page_id"]
+            or intent_row["revision_id"] != revision_row["id"]
+            or intent_row["expected_revision_id"] != expected_state["current"]
+            or intent_row["expected_file_hash"] != observation["file_hash"]
+            or intent_row["target_path"] != event["page_path"]
+            or intent_row["status"]
+            not in {"pending", "captured", "installed", "recovery_required"}
+            or locked.page.get("pending_write_intent_id") != intent_row["id"]
+        ):
+            raise RevisionConflict(
+                "pending external event does not match its prepared intent",
+                current_revision_id=locked.page.get("current_revision_id"),
+                pending_intent_id=locked.page.get("pending_write_intent_id"),
+            )
+        return MutationResult(
+            page_id=locked.page["page_id"],
+            page_path=event["page_path"],
+            status="prepared",
+            revision_id=revision_row["id"],
+            current_revision_id=expected_state["current"],
+            generated_revision_id=locked.page.get("generated_revision_id"),
+            write_intent_id=intent_row["id"],
+            observation_id=event["observation_id"],
+            replayed=True,
+        )
+
+    def _invalid_external_change_locked(
+        self,
+        locked: LockedPage,
+        *,
+        event_id: str,
+        observation: dict[str, Any],
+        expected_state_json: str,
+        error_code: str,
+        error_message: str,
+    ) -> MutationResult:
+        page = locked.page
+        timestamp = now_iso()
+        locked.conn.execute(
+            """
+            UPDATE wiki_file_observations
+            SET parse_status='invalid',error_code=?,error_message=?
+            WHERE id=?
+            """,
+            (error_code, error_message, observation["id"]),
+        )
+        next_epoch = int(page["projection_epoch"] or 0) + 1
+        file_sql = "file_hash IS NULL" if page.get("file_hash") is None else "file_hash=?"
+        params: list[Any] = [
+            error_code,
+            observation["file_hash"],
+            next_epoch,
+            timestamp,
+            page["page_id"],
+            page.get("current_revision_id"),
+            int(page["projection_epoch"] or 0),
+        ]
+        if page.get("file_hash") is not None:
+            params.append(page["file_hash"])
+        invalidated = locked.conn.execute(
+            f"""
+            UPDATE wiki_pages
+            SET lifecycle_status='invalid',sync_error=?,observed_file_hash=?,
+                projection_epoch=?,rag_visible_revision_id=NULL,rag_visible_epoch=NULL,
+                updated_at=?
+            WHERE page_id=? AND current_revision_id=? AND projection_epoch=?
+              AND pending_write_intent_id IS NULL AND {file_sql}
+            """,
+            tuple(params),
+        )
+        if invalidated.rowcount != 1:
+            raise RevisionConflict(
+                "page changed while recording invalid external bytes",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        page.update(
+            lifecycle_status="invalid",
+            sync_error=error_code,
+            observed_file_hash=observation["file_hash"],
+            projection_epoch=next_epoch,
+            rag_visible_revision_id=None,
+            rag_visible_epoch=None,
+        )
+
+        pending = list(
+            locked.conn.execute(
+                """
+                SELECT * FROM review_items
+                WHERE page_id=? AND issue_type='invalid_frontmatter' AND status='pending'
+                ORDER BY created_at,id
+                """,
+                (page["page_id"],),
+            ).fetchall()
+        )
+        matching = [
+            row
+            for row in pending
+            if row["base_revision_id"] == page.get("current_revision_id")
+            and row["candidate_revision_id"] is None
+        ]
+        keep = matching[0] if len(matching) == 1 else None
+        for row in pending:
+            if keep is not None and row["id"] == keep["id"]:
+                continue
+            locked.conn.execute(
+                """
+                UPDATE review_items
+                SET status='superseded',resolved_at=?,updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (timestamp, timestamp, row["id"]),
+            )
+        review_id = str(keep["id"]) if keep is not None else f"review_{uuid.uuid4().hex}"
+        review_state = canonical_state_json(self._canonical_state_locked(locked.conn, page))
+        if keep is None:
+            locked.conn.execute(
+                """
+                INSERT INTO review_items(
+                  id,page_path,page_id,issue_type,status,owner,source_ids_json,
+                  created_at,updated_at,base_revision_id,candidate_revision_id,
+                  expected_state_json
+                ) VALUES (?,?,?,'invalid_frontmatter','pending',?,?,?,?,?,NULL,?)
+                """,
+                (
+                    review_id,
+                    page["path"],
+                    page["page_id"],
+                    page.get("owner"),
+                    page["source_ids_json"],
+                    timestamp,
+                    timestamp,
+                    page.get("current_revision_id"),
+                    review_state,
+                ),
+            )
+        else:
+            locked.conn.execute(
+                """
+                UPDATE review_items
+                SET page_path=?,owner=?,source_ids_json=?,expected_state_json=?,updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (
+                    page["path"],
+                    page.get("owner"),
+                    page["source_ids_json"],
+                    review_state,
+                    timestamp,
+                    review_id,
+                ),
+            )
+        self.outbox.supersede_stale(
+            locked.conn,
+            page["page_id"],
+            next_epoch,
+        )
+        jobs = self.outbox.enqueue_pair_for_state(
+            locked.conn,
+            {
+                **page,
+                "current_revision_id": None,
+                "projection_epoch": next_epoch,
+            },
+            "delete",
+            {"path": page["path"], "reason": error_code},
+        )
+        completed = locked.conn.execute(
+            """
+            UPDATE vault_change_events
+            SET expected_state_json=?,status='invalid',result_revision_id=?,updated_at=?
+            WHERE id=? AND observation_id=? AND status='pending'
+            """,
+            (
+                expected_state_json,
+                page.get("current_revision_id"),
+                timestamp,
+                event_id,
+                observation["id"],
+            ),
+        )
+        if completed.rowcount != 1:
+            raise RevisionConflict(
+                "external event changed while recording invalid bytes",
+                current_revision_id=page.get("current_revision_id"),
+            )
+        audit(
+            locked.conn,
+            "wiki_external_change_invalid",
+            {
+                "event_id": event_id,
+                "observation_id": observation["id"],
+                "error_code": error_code,
+            },
+            timestamp,
+        )
+        return MutationResult(
+            page_id=page["page_id"],
+            page_path=page["path"],
+            status="invalid",
+            revision_id=page.get("current_revision_id"),
+            current_revision_id=page.get("current_revision_id"),
+            generated_revision_id=page.get("generated_revision_id"),
+            conflict_review_id=review_id,
+            observation_id=observation["id"],
+            projection_job_ids=tuple(jobs),
+        )
+
+    def ingest_external_change(
+        self,
+        event_id: str,
+        page_path: str,
+        observation: FileObservationInput,
+    ) -> MutationResult:
+        self._target(page_path)
+        event, created = self._persist_external_occurrence(
+            event_id,
+            page_path,
+            observation,
+        )
+        if not created and event["status"] not in {"pending", "prepared"}:
+            return self._replay_external_event(event)
+
+        pending_conflict: RevisionConflict | None = None
+        prepared: MutationResult | None = None
+        stable_page_id: str | None = None
+        if not created:
+            with connect_app(self.settings) as conn:
+                event_observation = conn.execute(
+                    "SELECT * FROM wiki_file_observations WHERE id=?",
+                    (event["observation_id"],),
+                ).fetchone()
+            if (
+                event_observation is None
+                or event_observation["page_id"] is None
+                or event_observation["page_path"] != event["page_path"]
+            ):
+                raise RevisionConflict(
+                    "pending external event has no stable page identity",
+                    current_revision_id=event.get("result_revision_id"),
+                )
+            stable_page_id = str(event_observation["page_id"])
+        lock_context = (
+            self.coordinator.lock_page(page_id=stable_page_id)
+            if stable_page_id is not None
+            else self.coordinator.lock_page(page_path)
+        )
+        with lock_context as locked:
+            expected_state_json = canonical_state_json(
+                self._canonical_state_locked(locked.conn, locked.page)
+            )
+            stored_event = locked.conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            stored_observation = locked.conn.execute(
+                "SELECT * FROM wiki_file_observations WHERE id=?",
+                (event["observation_id"],),
+            ).fetchone()
+            if (
+                stored_event is None
+                or stored_event["page_path"] != page_path
+                or stored_event["observation_id"] != event["observation_id"]
+                or stored_observation is None
+                or stored_observation["page_path"] != page_path
+            ):
+                raise RevisionConflict(
+                    "external event observation identity changed",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+            observed = dict(stored_observation)
+            stored_event_data = dict(stored_event)
+            if stored_event_data["status"] not in {"pending", "prepared"}:
+                return self._replay_external_event(stored_event_data)
+            recorded_state_json = stored_event_data["expected_state_json"] or "{}"
+            if recorded_state_json == "{}":
+                locked.conn.execute(
+                    """
+                    UPDATE vault_change_events SET status='superseded',updated_at=?
+                    WHERE id=? AND observation_id=?
+                      AND status IN ('pending','prepared')
+                    """,
+                    (
+                        now_iso(),
+                        event_id,
+                        observed["id"],
+                    ),
+                )
+                pending_conflict = RevisionConflict(
+                    "external event has no persisted expected state",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+            elif recorded_state_json != expected_state_json:
+                locked.conn.execute(
+                    """
+                    UPDATE vault_change_events
+                    SET status='superseded',updated_at=?
+                    WHERE id=? AND observation_id=?
+                      AND status IN ('pending','prepared')
+                    """,
+                    (now_iso(), event_id, observed["id"]),
+                )
+                pending_conflict = RevisionConflict(
+                    "external event expected state changed before resume",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+
+            if pending_conflict is None and stored_event_data.get(
+                "result_revision_id"
+            ) is not None:
+                try:
+                    prepared = self._prepared_external_intent_locked(
+                        locked,
+                        event=stored_event_data,
+                        observation=observed,
+                    )
+                except RevisionConflict as exc:
+                    locked.conn.execute(
+                        """
+                        UPDATE vault_change_events
+                        SET status='superseded',updated_at=?
+                        WHERE id=? AND observation_id=?
+                          AND status IN ('pending','prepared')
+                        """,
+                        (now_iso(), event_id, observed["id"]),
+                    )
+                    pending_conflict = exc
+            elif (
+                pending_conflict is None
+                and locked.page.get("pending_write_intent_id") is not None
+            ):
+                pending_conflict = RevisionConflict(
+                    "page already has an unrelated pending write",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+
+            if pending_conflict is None and prepared is None:
+                error_code: str | None = None
+                error_message = ""
+                content: bytes | None = None
+                document = None
+                rendered: bytes | None = None
+                revision_id: str | None = None
+                write_token: str | None = None
+                source_ids: list[str] | None = None
+                metadata: dict[str, Any] | None = None
+                if bool(observed["content_truncated"]):
+                    error_code = "file_too_large"
+                    error_message = "file exceeds the observation capture limit"
+                elif observed["content_bytes"] is None:
+                    error_code = "missing_content_bytes"
+                    error_message = "full observation bytes are required"
+                else:
+                    content = bytes(observed["content_bytes"])
+                    if len(content) != int(observed["size_bytes"]):
+                        error_code = "observation_size_mismatch"
+                        error_message = "observation size does not match captured bytes"
+                    elif compute_file_hash(content) != observed["file_hash"]:
+                        error_code = "observation_hash_mismatch"
+                        error_message = "observation hash does not match captured bytes"
+                    else:
+                        try:
+                            document = parse_wiki_bytes(content)
+                            source_ids = _source_ids(_plain(document.frontmatter))
+                            status_value = document.frontmatter.get(
+                                "review_status",
+                                locked.page.get("review_status"),
+                            )
+                            review_status = _review_status(status_value)
+                            revision_id = f"wrev_{uuid.uuid4().hex}"
+                            write_token = f"write_{uuid.uuid4().hex}"
+                            rendered = render_managed_frontmatter(
+                                document,
+                                page_id=locked.page["page_id"],
+                                revision_id=revision_id,
+                                write_token=write_token,
+                                review_status=review_status,
+                            )
+                            final_document = parse_wiki_bytes(rendered)
+                            metadata = _plain(final_document.frontmatter)
+                        except MarkdownParseError as exc:
+                            error_code = exc.code
+                            error_message = str(exc)
+                if error_code is not None:
+                    prepared = self._invalid_external_change_locked(
+                        locked,
+                        event_id=event_id,
+                        observation=observed,
+                        expected_state_json=expected_state_json,
+                        error_code=error_code,
+                        error_message=error_message,
+                    )
+                else:
+                    if (
+                        content is None
+                        or document is None
+                        or rendered is None
+                        or revision_id is None
+                        or write_token is None
+                        or source_ids is None
+                        or metadata is None
+                    ):
+                        raise WikiRevisionError("valid observation has no parsed content")
+                    locked.conn.execute(
+                        """
+                        UPDATE wiki_file_observations
+                        SET parse_status='valid',error_code=NULL,error_message=NULL
+                        WHERE id=?
+                        """,
+                        (observed["id"],),
+                    )
+                    metadata.update(
+                        {
+                            "vault_change_event_id": event_id,
+                            "observation_id": observed["id"],
+                            "observed_file_hash": observed["file_hash"],
+                        }
+                    )
+                    state_digest = hashlib.sha256(
+                        expected_state_json.encode("utf-8")
+                    ).hexdigest()
+                    revision = self._create_revision_locked(
+                        locked.conn,
+                        locked.page,
+                        content=rendered,
+                        origin="external",
+                        base_revision_id=locked.page.get("current_revision_id"),
+                        source_ids=source_ids,
+                        actor="vault-observer",
+                        note=None,
+                        idempotency_key=f"external:{event_id}:{state_digest}",
+                        metadata=metadata,
+                        revision_id=revision_id,
+                    )
+                    intent_page = {
+                        **locked.page,
+                        "file_hash": observed["file_hash"],
+                    }
+                    intent_id = self.prepare_write_intent_locked(
+                        locked.conn,
+                        intent_page,
+                        revision=revision,
+                        expected_revision_id=locked.page.get("current_revision_id"),
+                        expected_file_hash=observed["file_hash"],
+                        write_token=write_token,
+                    )
+                    transitioned = locked.conn.execute(
+                        """
+                        UPDATE vault_change_events
+                        SET expected_state_json=?,result_revision_id=?,updated_at=?
+                        WHERE id=? AND observation_id=?
+                          AND status IN ('pending','prepared')
+                        """,
+                        (
+                            expected_state_json,
+                            revision.id,
+                            now_iso(),
+                            event_id,
+                            observed["id"],
+                        ),
+                    )
+                    if transitioned.rowcount != 1:
+                        raise RevisionConflict(
+                            "external event changed while preparing revision",
+                            current_revision_id=locked.page.get("current_revision_id"),
+                            pending_intent_id=intent_id,
+                        )
+                    prepared = MutationResult(
+                        page_id=locked.page["page_id"],
+                        page_path=page_path,
+                        status="prepared",
+                        revision_id=revision.id,
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        generated_revision_id=locked.page.get("generated_revision_id"),
+                        write_intent_id=intent_id,
+                        observation_id=observed["id"],
+                    )
+        if pending_conflict is not None:
+            raise pending_conflict
+        if prepared is None:
+            raise WikiRevisionError("external change did not produce a result")
+        if prepared.status == "invalid":
+            return prepared
+
+        from app.vault_writer import IntentExecutor
+
+        execution = IntentExecutor(self.settings).execute(prepared.write_intent_id)
+        if execution is None or execution.intent_status != "applied":
+            raise RevisionConflict(
+                "external change requires write recovery",
+                current_revision_id=prepared.current_revision_id,
+                pending_intent_id=prepared.write_intent_id,
+            )
+        return replace(
+            self._mutation_for_intent(prepared.write_intent_id),
+            observation_id=prepared.observation_id,
+            replayed=prepared.replayed,
+        )
 
     def _create_revision_locked(
         self,
@@ -2058,6 +2901,11 @@ class WikiRevisionService:
             )
             next_epoch = int(locked.page["projection_epoch"] or 0) + 1
             metadata = json.loads(revision["metadata_json"] or "{}")
+            observed_file_hash = (
+                metadata.get("observed_file_hash")
+                if revision["origin"] == "external"
+                else None
+            ) or revision["file_hash"]
             advanced = locked.conn.execute(
                 f"""
                 UPDATE wiki_pages
@@ -2073,7 +2921,7 @@ class WikiRevisionService:
                     revision["semantic_hash"],
                     intent["write_token"],
                     next_epoch,
-                    revision["file_hash"],
+                    observed_file_hash,
                     metadata.get("review_status") or locked.page["review_status"],
                     metadata.get("owner"),
                     now_iso(),
@@ -2109,6 +2957,40 @@ class WikiRevisionService:
             )
             if applied.rowcount != 1:
                 raise WikiRevisionError("intent owner/status CAS failed during finalize")
+            if revision["origin"] == "external":
+                external_event_id = metadata.get("vault_change_event_id")
+                if not isinstance(external_event_id, str) or not external_event_id:
+                    raise WikiRevisionError(
+                        "external revision has no vault change event identity"
+                    )
+                event_applied = locked.conn.execute(
+                    """
+                    UPDATE vault_change_events
+                    SET status='applied',result_revision_id=?,updated_at=?
+                    WHERE id=? AND observation_id=?
+                      AND status IN ('pending','prepared')
+                    """,
+                    (
+                        revision["id"],
+                        now_iso(),
+                        external_event_id,
+                        metadata.get("observation_id"),
+                    ),
+                )
+                if event_applied.rowcount != 1:
+                    raise WikiRevisionError(
+                        "external event status CAS failed during finalize"
+                    )
+                timestamp = now_iso()
+                locked.conn.execute(
+                    """
+                    UPDATE review_items
+                    SET status='superseded',resolved_at=?,updated_at=?
+                    WHERE page_id=? AND issue_type='invalid_frontmatter'
+                      AND status='pending'
+                    """,
+                    (timestamp, timestamp, intent["page_id"]),
+                )
             locked.page.update(
                 {
                     "current_revision_id": revision["id"],
@@ -2117,6 +2999,8 @@ class WikiRevisionService:
                     "projection_epoch": next_epoch,
                     "pending_write_intent_id": None,
                     "lifecycle_status": "active",
+                    "sync_error": None,
+                    "observed_file_hash": observed_file_hash,
                 }
             )
             if resolution_payload is not None and resolution_review is not None:

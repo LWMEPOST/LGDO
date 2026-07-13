@@ -12,7 +12,7 @@ from app.db import connect_app, connect_app_write, init_app_db
 from app.ingest import scan_sources
 from app.models import CompileRequest, ScanRequest
 from app.wiki import compile_wiki
-from app.wiki_markdown import MarkdownParseError
+from app.wiki_markdown import MarkdownParseError, capture_file_observation
 from app.wiki_revisions import (
     CompileCandidateCommand,
     ManualSaveCommand,
@@ -506,6 +506,1108 @@ def page_with_generated(compiled_source_fixture):
     settings, _, page_path = compiled_source_fixture
     service = WikiRevisionService(settings)
     return service, service.get_page(page_path)
+
+
+def test_external_edit_is_immutable_revision_and_same_event_replays(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    external_bytes = before.raw_bytes + b"\nObsidian edit.\n"
+    target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+
+    first = service.ingest_external_change(
+        "external-valid-1",
+        before.page_path,
+        observation,
+    )
+    replay = service.ingest_external_change(
+        "external-valid-1",
+        before.page_path,
+        observation,
+    )
+    current = service.get_page(before.page_path)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (first.revision_id,),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT * FROM vault_write_intents WHERE id=?",
+            (first.write_intent_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            ("external-valid-1",),
+        ).fetchone()
+        observed = conn.execute(
+            "SELECT * FROM wiki_file_observations WHERE id=?",
+            (first.observation_id,),
+        ).fetchone()
+        jobs = conn.execute(
+            """
+            SELECT target,operation,revision_id,projection_epoch
+            FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch=?
+            ORDER BY target
+            """,
+            (before.page_id, page["projection_epoch"]),
+        ).fetchall()
+
+    assert first.replayed is False
+    assert replay.replayed is True
+    assert replay.revision_id == first.revision_id == current.current_revision_id
+    assert "Obsidian edit." in current.content
+    assert current.generated_revision_id == before.generated_revision_id
+    assert current.accepted_generated_revision_id == before.accepted_generated_revision_id
+    assert revision["origin"] == "external"
+    assert revision["base_revision_id"] == before.current_revision_id
+    assert intent["status"] == "applied"
+    assert intent["expected_file_hash"] == observation.file_hash
+    assert event["status"] == "applied"
+    assert event["result_revision_id"] == first.revision_id
+    assert json.loads(event["expected_state_json"])["current"] == before.current_revision_id
+    assert observed["page_path"] == before.page_path
+    assert observed["file_hash"] == observation.file_hash
+    assert observed["size_bytes"] == observation.size_bytes
+    assert observed["mtime_ns"] == observation.mtime_ns
+    assert observed["content_bytes"] == external_bytes
+    assert observed["content_prefix"] is None
+    assert observed["content_truncated"] == 0
+    assert observed["parse_status"] == "valid"
+    assert observed["error_code"] is None
+    assert page["projection_epoch"] == before.projection_epoch + 1
+    assert [(row["target"], row["operation"]) for row in jobs] == [
+        ("gbrain", "upsert"),
+        ("rag", "upsert"),
+    ]
+    assert all(row["revision_id"] == first.revision_id for row in jobs)
+
+
+@pytest.mark.parametrize(
+    ("error_code", "invalid_bytes"),
+    [
+        ("invalid_utf8", b"---\ntitle: Demo\nsource_ids: [src_1]\n---\n\xff"),
+        ("invalid_yaml", b"---\ntitle: [unterminated\n---\n# Invalid\n"),
+        (
+            "page_identity_conflict",
+            b"---\ntitle: Demo\nsource_ids: [src_1]\nlgdo_page_id: page_elsewhere\n---\n# Invalid\n",
+        ),
+    ],
+)
+def test_invalid_external_bytes_fail_closed_without_changing_vault_or_current(
+    page_with_generated,
+    error_code,
+    invalid_bytes,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    with connect_app(service.settings) as conn:
+        revision_count_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+    target.write_bytes(invalid_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = f"external-{error_code}"
+
+    first = service.ingest_external_change(event_id, before.page_path, observation)
+    replay = service.ingest_external_change(event_id, before.page_path, observation)
+    historical = service.get_page(before.page_path)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        revisions = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE page_id=? ORDER BY revision_number",
+            (before.page_id,),
+        ).fetchall()
+        observed = conn.execute(
+            "SELECT * FROM wiki_file_observations WHERE id=?",
+            (first.observation_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        reviews = conn.execute(
+            """
+            SELECT * FROM review_items
+            WHERE page_id=? AND issue_type='invalid_frontmatter' AND status='pending'
+            """,
+            (before.page_id,),
+        ).fetchall()
+        jobs = conn.execute(
+            """
+            SELECT target,operation,revision_id,projection_epoch
+            FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch=?
+            ORDER BY target
+            """,
+            (before.page_id, page["projection_epoch"]),
+        ).fetchall()
+        stale_jobs = conn.execute(
+            """
+            SELECT status FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch<?
+            ORDER BY id
+            """,
+            (before.page_id, page["projection_epoch"]),
+        ).fetchall()
+
+    assert first.status == "invalid"
+    assert first.revision_id == before.current_revision_id
+    assert first.replayed is False
+    assert replay.replayed is True
+    assert replay.revision_id == before.current_revision_id
+    assert first.write_intent_id is None
+    assert replay.write_intent_id == first.write_intent_id
+    assert target.read_bytes() == invalid_bytes
+    assert historical.current_revision_id == before.current_revision_id
+    assert historical.raw_bytes == before.raw_bytes
+    assert historical.content == before.content
+    assert len(revisions) == revision_count_before
+    assert page["current_revision_id"] == before.current_revision_id
+    assert page["generated_revision_id"] == before.generated_revision_id
+    assert page["accepted_generated_revision_id"] == before.accepted_generated_revision_id
+    assert page["lifecycle_status"] == "invalid"
+    assert page["sync_error"] == error_code
+    assert page["observed_file_hash"] == observation.file_hash
+    assert page["projection_epoch"] == before.projection_epoch + 1
+    assert page["rag_visible_revision_id"] is None
+    assert page["rag_visible_epoch"] is None
+    assert observed["content_bytes"] == invalid_bytes
+    assert observed["content_prefix"] is None
+    assert observed["content_truncated"] == 0
+    assert observed["parse_status"] == "invalid"
+    assert observed["error_code"] == error_code
+    assert event["status"] == "invalid"
+    assert event["result_revision_id"] == before.current_revision_id
+    assert len(reviews) == 1
+    assert first.conflict_review_id == reviews[0]["id"]
+    assert [(row["target"], row["operation"]) for row in jobs] == [
+        ("gbrain", "delete"),
+        ("rag", "delete"),
+    ]
+    assert all(row["revision_id"] is None for row in jobs)
+    assert stale_jobs
+    assert {row["status"] for row in stale_jobs} == {"superseded"}
+
+
+def test_valid_external_change_repairs_invalid_page_and_closes_review(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    invalid_bytes = b"---\ntitle: [invalid\n---\n# Broken\n"
+    target.write_bytes(invalid_bytes)
+    invalid_observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    invalid = service.ingest_external_change(
+        "external-invalid-before-repair",
+        before.page_path,
+        invalid_observation,
+    )
+    valid_bytes = before.raw_bytes + b"\nRepaired in Obsidian.\n"
+    target.write_bytes(valid_bytes)
+    valid_observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+
+    repaired = service.ingest_external_change(
+        "external-valid-repair",
+        before.page_path,
+        valid_observation,
+    )
+    current = service.get_page(before.page_path)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (repaired.revision_id,),
+        ).fetchone()
+        reviews = conn.execute(
+            """
+            SELECT * FROM review_items
+            WHERE page_id=? AND issue_type='invalid_frontmatter'
+            """,
+            (before.page_id,),
+        ).fetchall()
+        jobs = conn.execute(
+            """
+            SELECT target,operation,revision_id
+            FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch=?
+            ORDER BY target
+            """,
+            (before.page_id, page["projection_epoch"]),
+        ).fetchall()
+
+    assert invalid.status == "invalid"
+    assert repaired.status == "applied"
+    assert current.current_revision_id == repaired.revision_id
+    assert "Repaired in Obsidian." in current.content
+    assert current.lifecycle_status == "active"
+    assert current.sync_error is None
+    assert page["observed_file_hash"] == valid_observation.file_hash
+    assert page["projection_epoch"] == before.projection_epoch + 2
+    assert page["generated_revision_id"] == before.generated_revision_id
+    assert page["accepted_generated_revision_id"] == before.accepted_generated_revision_id
+    assert revision["origin"] == "external"
+    assert revision["base_revision_id"] == before.current_revision_id
+    assert len(reviews) == 1
+    assert reviews[0]["id"] == invalid.conflict_review_id
+    assert reviews[0]["status"] == "superseded"
+    assert reviews[0]["resolved_at"] is not None
+    assert [(row["target"], row["operation"]) for row in jobs] == [
+        ("gbrain", "upsert"),
+        ("rag", "upsert"),
+    ]
+    assert all(row["revision_id"] == repaired.revision_id for row in jobs)
+
+
+def test_truncated_large_external_observation_never_reloads_or_writes_vault(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    with connect_app(service.settings) as conn:
+        revision_count_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+    large_bytes = before.raw_bytes + (b"x" * 4096)
+    target.write_bytes(large_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024,
+        prefix_bytes=64,
+    )
+
+    def fail_read_bytes(path):
+        raise AssertionError(f"unexpected full-file read: {path}")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", fail_read_bytes)
+        first = service.ingest_external_change(
+            "external-truncated-large",
+            before.page_path,
+            observation,
+        )
+        replay = service.ingest_external_change(
+            "external-truncated-large",
+            before.page_path,
+            observation,
+        )
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        observed = conn.execute(
+            "SELECT * FROM wiki_file_observations WHERE id=?",
+            (first.observation_id,),
+        ).fetchone()
+        revisions = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        jobs = conn.execute(
+            """
+            SELECT target,operation FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch=?
+            ORDER BY target
+            """,
+            (before.page_id, page["projection_epoch"]),
+        ).fetchall()
+
+    assert observation.content_bytes is None
+    assert observation.content_prefix == large_bytes[:64]
+    assert observation.content_truncated is True
+    assert first.status == "invalid"
+    assert replay.replayed is True
+    assert target.read_bytes() == large_bytes
+    assert revisions == revision_count_before
+    assert page["current_revision_id"] == before.current_revision_id
+    assert page["lifecycle_status"] == "invalid"
+    assert page["sync_error"] == "file_too_large"
+    assert page["observed_file_hash"] == observation.file_hash
+    assert page["projection_epoch"] == before.projection_epoch + 1
+    assert observed["size_bytes"] == len(large_bytes)
+    assert observed["mtime_ns"] == observation.mtime_ns
+    assert observed["file_hash"] == observation.file_hash
+    assert observed["content_bytes"] is None
+    assert observed["content_prefix"] == large_bytes[:64]
+    assert observed["content_truncated"] == 1
+    assert observed["parse_status"] == "invalid"
+    assert observed["error_code"] == "file_too_large"
+    assert [(row["target"], row["operation"]) for row in jobs] == [
+        ("gbrain", "delete"),
+        ("rag", "delete"),
+    ]
+
+
+def test_pending_external_event_retries_after_transition_transaction_rollback(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    external_bytes = before.raw_bytes + b"\nRetry after transition rollback.\n"
+    target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-retry-after-transition-rollback"
+    original_canonical_state = service._canonical_state_locked
+    calls = 0
+
+    def fail_first_canonical_state(conn, page):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated transition crash")
+        return original_canonical_state(conn, page)
+
+    monkeypatch.setattr(
+        service,
+        "_canonical_state_locked",
+        fail_first_canonical_state,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated transition crash"):
+        service.ingest_external_change(event_id, before.page_path, observation)
+
+    with connect_app(service.settings) as conn:
+        pending_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        observation_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_file_observations
+            WHERE page_path=? AND file_hash=?
+            """,
+            (before.page_path, observation.file_hash),
+        ).fetchone()[0]
+        external_revisions = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE page_id=? AND origin='external'
+            """,
+            (before.page_id,),
+        ).fetchone()[0]
+        external_intents = conn.execute(
+            """
+            SELECT COUNT(*) FROM vault_write_intents AS intent
+            JOIN wiki_page_revisions AS revision ON revision.id=intent.revision_id
+            WHERE revision.page_id=? AND revision.origin='external'
+            """,
+            (before.page_id,),
+        ).fetchone()[0]
+
+    assert pending_event["status"] == "pending"
+    pending_expected_state = json.loads(pending_event["expected_state_json"])
+    assert pending_expected_state["current"] == before.current_revision_id
+    assert pending_expected_state["file_hash"] == hashlib.sha256(
+        before.raw_bytes
+    ).hexdigest()
+    assert observation_count == 1
+    assert external_revisions == 0
+    assert external_intents == 0
+
+    applied = service.ingest_external_change(
+        event_id,
+        before.page_path,
+        observation,
+    )
+
+    with connect_app(service.settings) as conn:
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()[0]
+        final_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        observation_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_file_observations
+            WHERE page_path=? AND file_hash=?
+            """,
+            (before.page_path, observation.file_hash),
+        ).fetchone()[0]
+        revisions = conn.execute(
+            """
+            SELECT * FROM wiki_page_revisions
+            WHERE page_id=? AND origin='external'
+            """,
+            (before.page_id,),
+        ).fetchall()
+        jobs = conn.execute(
+            """
+            SELECT * FROM knowledge_projection_jobs
+            WHERE page_id=? AND revision_id=? AND operation='upsert'
+            """,
+            (before.page_id, applied.revision_id),
+        ).fetchall()
+
+    assert applied.status == "applied"
+    assert applied.replayed is False
+    assert event_count == 1
+    assert final_event["status"] == "applied"
+    assert final_event["result_revision_id"] == applied.revision_id
+    assert observation_count == 1
+    assert [row["id"] for row in revisions] == [applied.revision_id]
+    assert len(jobs) == 2
+
+
+def test_pending_invalid_event_keeps_original_expected_state_after_crash(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    invalid_bytes = b"---\ntitle: [crashed-invalid\n---\n# Broken\n"
+    target.write_bytes(invalid_bytes)
+    invalid_observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    invalid_event_id = "external-invalid-crash-before-transition"
+    original_invalid_transition = service._invalid_external_change_locked
+    calls = 0
+
+    def fail_first_invalid_transition(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated invalid transition crash")
+        return original_invalid_transition(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service,
+        "_invalid_external_change_locked",
+        fail_first_invalid_transition,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated invalid transition crash"):
+        service.ingest_external_change(
+            invalid_event_id,
+            before.page_path,
+            invalid_observation,
+        )
+
+    with connect_app(service.settings) as conn:
+        pending_invalid = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (invalid_event_id,),
+        ).fetchone()
+    original_expected_state = json.loads(pending_invalid["expected_state_json"])
+    assert pending_invalid["status"] == "pending"
+    assert original_expected_state["current"] == before.current_revision_id
+    assert original_expected_state["file_hash"] == hashlib.sha256(
+        before.raw_bytes
+    ).hexdigest()
+
+    valid_bytes = before.raw_bytes + b"\nNewer valid event B.\n"
+    target.write_bytes(valid_bytes)
+    valid_observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    applied_b = service.ingest_external_change(
+        "external-valid-after-invalid-crash",
+        before.page_path,
+        valid_observation,
+    )
+    with connect_app(service.settings) as conn:
+        page_before_retry = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        jobs_before_retry = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+
+    with pytest.raises(RevisionConflict, match="expected state changed"):
+        service.ingest_external_change(
+            invalid_event_id,
+            before.page_path,
+            invalid_observation,
+        )
+
+    with connect_app(service.settings) as conn:
+        final_invalid_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (invalid_event_id,),
+        ).fetchone()
+        page_after_retry = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        jobs_after_retry = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        invalid_revisions = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE page_id=? AND idempotency_key LIKE ?
+            """,
+            (before.page_id, f"external:{invalid_event_id}:%"),
+        ).fetchone()[0]
+
+    assert final_invalid_event["status"] == "superseded"
+    assert json.loads(final_invalid_event["expected_state_json"]) == (
+        original_expected_state
+    )
+    assert page_after_retry["lifecycle_status"] == "active"
+    assert page_after_retry["current_revision_id"] == applied_b.revision_id
+    assert page_after_retry["current_revision_id"] == page_before_retry["current_revision_id"]
+    assert page_after_retry["projection_epoch"] == page_before_retry["projection_epoch"]
+    assert jobs_after_retry == jobs_before_retry
+    assert invalid_revisions == 0
+
+
+def test_pending_external_event_resumes_matching_prepared_intent(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    external_bytes = before.raw_bytes + b"\nResume prepared external intent.\n"
+    target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-resume-prepared-intent"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(IntentExecutor, "execute", lambda self, intent_id: None)
+        with pytest.raises(RevisionConflict):
+            service.ingest_external_change(event_id, before.page_path, observation)
+
+    with connect_app(service.settings) as conn:
+        pending_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (pending_event["result_revision_id"],),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT * FROM vault_write_intents WHERE id=?",
+            (page["pending_write_intent_id"],),
+        ).fetchone()
+        jobs_before = conn.execute(
+            """
+            SELECT COUNT(*) FROM knowledge_projection_jobs
+            WHERE page_id=? AND revision_id=?
+            """,
+            (before.page_id, revision["id"]),
+        ).fetchone()[0]
+    revision_metadata = json.loads(revision["metadata_json"])
+
+    assert pending_event["status"] == "pending"
+    assert pending_event["observation_id"] == revision_metadata["observation_id"]
+    assert revision_metadata["vault_change_event_id"] == event_id
+    assert revision["origin"] == "external"
+    assert revision["base_revision_id"] == before.current_revision_id
+    assert intent["revision_id"] == revision["id"]
+    assert intent["expected_revision_id"] == before.current_revision_id
+    assert intent["expected_file_hash"] == observation.file_hash
+    assert intent["target_path"] == before.page_path
+    assert jobs_before == 0
+
+    resumed = service.ingest_external_change(
+        event_id,
+        before.page_path,
+        observation,
+    )
+
+    with connect_app(service.settings) as conn:
+        final_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        external_revisions = conn.execute(
+            """
+            SELECT * FROM wiki_page_revisions
+            WHERE page_id=? AND origin='external'
+            """,
+            (before.page_id,),
+        ).fetchall()
+        external_intents = conn.execute(
+            """
+            SELECT intent.* FROM vault_write_intents AS intent
+            JOIN wiki_page_revisions AS revision ON revision.id=intent.revision_id
+            WHERE revision.page_id=? AND revision.origin='external'
+            """,
+            (before.page_id,),
+        ).fetchall()
+        jobs = conn.execute(
+            """
+            SELECT * FROM knowledge_projection_jobs
+            WHERE page_id=? AND revision_id=? AND operation='upsert'
+            """,
+            (before.page_id, resumed.revision_id),
+        ).fetchall()
+
+    assert resumed.status == "applied"
+    assert resumed.replayed is True
+    assert resumed.revision_id == revision["id"]
+    assert final_event["status"] == "applied"
+    assert len(external_revisions) == 1
+    assert len(external_intents) == 1
+    assert external_intents[0]["id"] == intent["id"]
+    assert len(jobs) == 2
+
+
+def test_pending_external_event_resumes_after_unrelated_intent_is_cleared(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    unrelated = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=before.page_path,
+            content=before.content + "\nUnrelated pending manual edit.\n",
+            expected_revision_id=before.current_revision_id,
+            request_id="unrelated-pending-before-external",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        ),
+        execute_intent=False,
+    )
+    target = service.settings.vault_path / before.page_path
+    external_bytes = before.raw_bytes + b"\nExternal after unrelated pending.\n"
+    target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-after-unrelated-pending"
+
+    with pytest.raises(RevisionConflict) as exc_info:
+        service.ingest_external_change(event_id, before.page_path, observation)
+
+    with connect_app(service.settings) as conn:
+        pending_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+    assert exc_info.value.pending_intent_id == unrelated.write_intent_id
+    assert pending_event["status"] == "pending"
+    assert json.loads(pending_event["expected_state_json"])["current"] == (
+        before.current_revision_id
+    )
+
+    with connect_app_write(service.settings) as conn:
+        conn.execute(
+            """
+            UPDATE vault_write_intents SET status='superseded',updated_at=?
+            WHERE id=? AND status='pending'
+            """,
+            ("t-clear", unrelated.write_intent_id),
+        )
+        cleared = conn.execute(
+            """
+            UPDATE wiki_pages SET pending_write_intent_id=NULL
+            WHERE page_id=? AND pending_write_intent_id=?
+            """,
+            (before.page_id, unrelated.write_intent_id),
+        )
+        assert cleared.rowcount == 1
+
+    resumed = service.ingest_external_change(
+        event_id,
+        before.page_path,
+        observation,
+    )
+
+    with connect_app(service.settings) as conn:
+        events = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchall()
+        observations = conn.execute(
+            """
+            SELECT * FROM wiki_file_observations
+            WHERE page_path=? AND file_hash=?
+            """,
+            (before.page_path, observation.file_hash),
+        ).fetchall()
+        external_revisions = conn.execute(
+            """
+            SELECT * FROM wiki_page_revisions
+            WHERE page_id=? AND origin='external'
+            """,
+            (before.page_id,),
+        ).fetchall()
+
+    assert resumed.status == "applied"
+    assert resumed.replayed is False
+    assert len(events) == 1
+    assert events[0]["status"] == "applied"
+    assert len(observations) == 1
+    assert [row["id"] for row in external_revisions] == [resumed.revision_id]
+
+
+def test_external_event_id_rejects_a_different_observation_payload(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    first_bytes = b"---\ntitle: [first-invalid\n---\n# Broken\n"
+    target.write_bytes(first_bytes)
+    first_observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-payload-identity"
+    first = service.ingest_external_change(
+        event_id,
+        before.page_path,
+        first_observation,
+    )
+
+    second_bytes = b"---\ntitle: [different-invalid\n---\n# Broken\n"
+    target.write_bytes(second_bytes)
+    second_observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+
+    with pytest.raises(RevisionConflict, match="payload"):
+        service.ingest_external_change(
+            event_id,
+            before.page_path,
+            second_observation,
+        )
+
+    with connect_app(service.settings) as conn:
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        observations = conn.execute(
+            "SELECT * FROM wiki_file_observations WHERE page_path=?",
+            (before.page_path,),
+        ).fetchall()
+
+    assert event["observation_id"] == first.observation_id
+    assert len(observations) == 1
+    assert observations[0]["file_hash"] == first_observation.file_hash
+
+
+def test_external_event_rechecks_terminal_status_after_occurrence_lookup(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    external_bytes = before.raw_bytes + b"\nTerminal replay race.\n"
+    target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-terminal-reread"
+    applied = service.ingest_external_change(
+        event_id,
+        before.page_path,
+        observation,
+    )
+    original_persist = service._persist_external_occurrence
+
+    def stale_pending_occurrence(*args, **kwargs):
+        event, created = original_persist(*args, **kwargs)
+        assert event["status"] == "applied"
+        assert created is False
+        return {**event, "status": "pending"}, False
+
+    monkeypatch.setattr(
+        service,
+        "_persist_external_occurrence",
+        stale_pending_occurrence,
+    )
+
+    replay = service.ingest_external_change(
+        event_id,
+        before.page_path,
+        observation,
+    )
+
+    assert replay.replayed is True
+    assert replay.status == "applied"
+    assert replay.revision_id == applied.revision_id
+
+
+def move_page_and_reuse_old_path(
+    service: WikiRevisionService,
+    *,
+    page_id: str,
+    old_path: str,
+    new_path: str,
+) -> str:
+    old_target = service.settings.vault_path / old_path
+    new_target = service.settings.vault_path / new_path
+    new_target.parent.mkdir(parents=True, exist_ok=True)
+    old_target.replace(new_target)
+    reused_page_id = f"page_reused_{uuid.uuid4().hex}"
+    reused_suffix = uuid.uuid4().hex
+    with connect_app_write(service.settings) as conn:
+        moved = conn.execute(
+            "UPDATE wiki_pages SET path=?,updated_at=? WHERE page_id=? AND path=?",
+            (new_path, "t-moved", page_id, old_path),
+        )
+        assert moved.rowcount == 1
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              owner,created_at,updated_at,current_revision_id,generated_revision_id,
+              revision_number,file_hash,semantic_hash,lifecycle_status,projection_epoch
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                old_path,
+                reused_page_id,
+                "product",
+                "faq",
+                "Reused old path",
+                "[]",
+                "draft",
+                None,
+                "t-reused",
+                "t-reused",
+                f"wrev_reused_current_{reused_suffix}",
+                f"wrev_reused_generated_{reused_suffix}",
+                1,
+                f"file_reused_{reused_suffix}",
+                f"semantic_reused_{reused_suffix}",
+                "active",
+                99,
+            ),
+        )
+    return reused_page_id
+
+
+def test_applied_external_event_replay_keeps_identity_after_path_reuse(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    old_path = before.page_path
+    target = service.settings.vault_path / old_path
+    external_bytes = before.raw_bytes + b"\nApplied event before rename.\n"
+    target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-applied-before-path-reuse"
+    first = service.ingest_external_change(event_id, old_path, observation)
+    current = service.get_page(old_path)
+    newer = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=old_path,
+            content=current.content + "\nNewer current before rename.\n",
+            expected_revision_id=current.current_revision_id,
+            request_id="manual-before-path-reuse",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        )
+    )
+    new_path = old_path.removesuffix(".md") + "-renamed.md"
+    reused_page_id = move_page_and_reuse_old_path(
+        service,
+        page_id=before.page_id,
+        old_path=old_path,
+        new_path=new_path,
+    )
+
+    replay = service.ingest_external_change(
+        event_id,
+        old_path,
+        observation,
+    )
+
+    assert newer.current_revision_id != first.current_revision_id
+    assert replay.replayed is True
+    assert replay.status == first.status == "applied"
+    assert replay.page_id == first.page_id == before.page_id
+    assert replay.page_id != reused_page_id
+    assert replay.page_path == first.page_path == old_path
+    assert replay.revision_id == first.revision_id
+    assert replay.current_revision_id == first.current_revision_id
+    assert replay.generated_revision_id == first.generated_revision_id
+    assert replay.write_intent_id == first.write_intent_id
+
+
+def test_invalid_external_event_replay_keeps_identity_after_path_reuse(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    old_path = before.page_path
+    target = service.settings.vault_path / old_path
+    invalid_bytes = b"---\ntitle: [invalid-before-rename\n---\n# Broken\n"
+    target.write_bytes(invalid_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-invalid-before-path-reuse"
+    first = service.ingest_external_change(event_id, old_path, observation)
+    new_path = old_path.removesuffix(".md") + "-invalid-renamed.md"
+    reused_page_id = move_page_and_reuse_old_path(
+        service,
+        page_id=before.page_id,
+        old_path=old_path,
+        new_path=new_path,
+    )
+
+    replay = service.ingest_external_change(
+        event_id,
+        old_path,
+        observation,
+    )
+
+    assert replay.replayed is True
+    assert replay.status == first.status == "invalid"
+    assert replay.page_id == first.page_id == before.page_id
+    assert replay.page_id != reused_page_id
+    assert replay.page_path == first.page_path == old_path
+    assert replay.revision_id == first.revision_id
+    assert replay.current_revision_id == first.current_revision_id
+    assert replay.generated_revision_id == first.generated_revision_id
+    assert replay.write_intent_id == first.write_intent_id is None
+
+
+def test_pending_external_event_uses_stable_page_identity_after_rename(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    old_path = before.page_path
+    old_target = service.settings.vault_path / old_path
+    external_bytes = before.raw_bytes + b"\nPending event before rename.\n"
+    old_target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        old_target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-pending-before-rename"
+    original_canonical_state = service._canonical_state_locked
+    calls = 0
+
+    def fail_transition_canonical_state(conn, page):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated transition crash before rename")
+        return original_canonical_state(conn, page)
+
+    monkeypatch.setattr(
+        service,
+        "_canonical_state_locked",
+        fail_transition_canonical_state,
+    )
+    with pytest.raises(RuntimeError, match="transition crash before rename"):
+        service.ingest_external_change(event_id, old_path, observation)
+
+    new_path = old_path.removesuffix(".md") + "-pending-renamed.md"
+    new_target = service.settings.vault_path / new_path
+    new_target.parent.mkdir(parents=True, exist_ok=True)
+    old_target.replace(new_target)
+    with connect_app_write(service.settings) as conn:
+        moved = conn.execute(
+            "UPDATE wiki_pages SET path=?,updated_at=? WHERE page_id=? AND path=?",
+            (new_path, "t-pending-moved", before.page_id, old_path),
+        )
+        assert moved.rowcount == 1
+        page_before_retry = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        jobs_before_retry = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        pending_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+
+    assert pending_event["status"] == "pending"
+    assert json.loads(pending_event["expected_state_json"])["path"] == old_path
+
+    with pytest.raises(RevisionConflict, match="expected state changed"):
+        service.ingest_external_change(event_id, old_path, observation)
+
+    with connect_app(service.settings) as conn:
+        final_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        page_after_retry = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        jobs_after_retry = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        external_revisions = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE page_id=? AND idempotency_key LIKE ?
+            """,
+            (before.page_id, f"external:{event_id}:%"),
+        ).fetchone()[0]
+
+    assert final_event["status"] == "superseded"
+    assert page_after_retry["path"] == new_path
+    assert page_after_retry["current_revision_id"] == page_before_retry["current_revision_id"]
+    assert page_after_retry["lifecycle_status"] == page_before_retry["lifecycle_status"]
+    assert page_after_retry["projection_epoch"] == page_before_retry["projection_epoch"]
+    assert jobs_after_retry == jobs_before_retry
+    assert external_revisions == 0
 
 
 def test_recompile_after_manual_edit_preserves_human_file_and_creates_one_conflict(

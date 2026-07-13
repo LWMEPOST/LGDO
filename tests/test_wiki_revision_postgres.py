@@ -15,7 +15,8 @@ from app.db import (
 from app.ingest import scan_sources
 from app.models import CompileRequest, ScanRequest
 from app.wiki import compile_wiki
-from app.wiki_revisions import RevisionConflict
+from app.wiki_markdown import capture_file_observation
+from app.wiki_revisions import RevisionConflict, WikiRevisionService
 
 
 def pg_available() -> bool:
@@ -142,3 +143,107 @@ def test_concurrent_first_compile_replays_the_winning_postgres_page(
     assert len(pages) == 1
     assert generated_count == 1
     assert pages[0]["current_revision_id"] == pages[0]["generated_revision_id"]
+
+
+@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
+def test_concurrent_external_events_share_one_postgres_observation(
+    tmp_path,
+    monkeypatch,
+):
+    settings = get_settings().model_copy()
+    settings.database_backend = "postgres"
+    settings.postgres_database = f"lgdo_observation_{uuid.uuid4().hex[:10]}"
+    settings.vault_path = tmp_path / "vault"
+    settings.upload_path = tmp_path / "uploads"
+    settings.gbrain_import_on_compile = False
+    init_postgres_schema(settings)
+
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    (samples / "observed.md").write_text(
+        "# Observed\n\nGenerated body.\n",
+        encoding="utf-8",
+    )
+    scan_sources(
+        settings,
+        ScanRequest(
+            root_path=str(samples),
+            domain="product",
+            owner="postgres-test",
+        ),
+    )
+    compile_wiki(settings, CompileRequest(domain="product"))
+    with connect_app(settings) as conn:
+        page_path = conn.execute(
+            "SELECT path FROM wiki_pages WHERE title='observed'"
+        ).fetchone()["path"]
+
+    service = WikiRevisionService(settings)
+    target = settings.vault_path / page_path
+    invalid_bytes = b"---\ntitle: [invalid\n---\n# Broken\n"
+    target.write_bytes(invalid_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+
+    barrier = threading.Barrier(2)
+    thread_state = threading.local()
+    synchronized_threads: set[int] = set()
+    synchronized_threads_lock = threading.Lock()
+    original_execute = PgCompatConnection.execute
+
+    def synchronized_execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        if (
+            normalized
+            == "SELECT * FROM wiki_pages WHERE path=? FOR UPDATE"
+            and not getattr(thread_state, "occurrence_lock_synchronized", False)
+        ):
+            thread_state.occurrence_lock_synchronized = True
+            with synchronized_threads_lock:
+                synchronized_threads.add(threading.get_ident())
+            barrier.wait(timeout=10)
+        return original_execute(self, query, params)
+
+    monkeypatch.setattr(PgCompatConnection, "execute", synchronized_execute)
+
+    def ingest(event_id: str):
+        try:
+            return service.ingest_external_change(
+                event_id,
+                page_path,
+                observation,
+            )
+        except Exception as exc:
+            return exc
+
+    event_ids = ["postgres-observation-a", "postgres-observation-b"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(ingest, event_ids))
+
+    with connect_app(settings) as conn:
+        observations = conn.execute(
+            """
+            SELECT id FROM wiki_file_observations
+            WHERE page_path=? AND file_hash=?
+            """,
+            (page_path, observation.file_hash),
+        ).fetchall()
+        events = conn.execute(
+            """
+            SELECT id,observation_id FROM vault_change_events
+            WHERE id IN (?,?) ORDER BY id
+            """,
+            tuple(event_ids),
+        ).fetchall()
+
+    assert len(synchronized_threads) == 2
+    assert all(
+        not isinstance(result, Exception) or isinstance(result, RevisionConflict)
+        for result in results
+    ), results
+    assert any(not isinstance(result, Exception) for result in results)
+    assert len(observations) == 1
+    assert [row["id"] for row in events] == sorted(event_ids)
+    assert {row["observation_id"] for row in events} == {observations[0]["id"]}
