@@ -1,4 +1,5 @@
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -6,6 +7,9 @@ import pytest
 
 from app.config import get_settings
 from app.db import connect_app, init_app_db
+from app.ingest import scan_sources
+from app.models import CompileRequest, ScanRequest
+from app.wiki import compile_wiki
 from app.wiki_markdown import MarkdownParseError
 from app.wiki_revisions import (
     ManualSaveCommand,
@@ -15,6 +19,7 @@ from app.wiki_revisions import (
     WikiRevisionService,
     canonical_state_json,
 )
+from app.vault_writer import IntentExecutor
 
 
 def make_settings(tmp_path: Path):
@@ -451,3 +456,336 @@ def test_two_sqlite_writers_prepare_only_one_intent(legacy_page_fixture):
             (page.page_id, page.current_revision_id),
         ).fetchone()[0]
     assert prepared == 1
+
+
+@pytest.fixture
+def compiled_source_fixture(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.upload_path = tmp_path / "uploads"
+    settings.gbrain_import_on_compile = False
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    (samples / "demo.md").write_text(
+        "# Demo\n\nGenerated source body.\n",
+        encoding="utf-8",
+    )
+    scan_sources(
+        settings,
+        ScanRequest(
+            root_path=str(samples),
+            domain="product",
+            owner="compiler-test",
+        ),
+    )
+    with connect_app(settings) as conn:
+        source_id = conn.execute(
+            "SELECT id FROM sources WHERE title='demo'"
+        ).fetchone()[0]
+    compile_wiki(
+        settings,
+        CompileRequest(
+            domain="product",
+            source_ids=[source_id],
+            compile_job_id="compile-initial",
+        ),
+    )
+    with connect_app(settings) as conn:
+        page_path = conn.execute(
+            "SELECT path FROM wiki_pages WHERE title='demo'"
+        ).fetchone()[0]
+    return settings, source_id, page_path
+
+
+@pytest.fixture
+def page_with_generated(compiled_source_fixture):
+    settings, _, page_path = compiled_source_fixture
+    service = WikiRevisionService(settings)
+    return service, service.get_page(page_path)
+
+
+def test_recompile_after_manual_edit_preserves_human_file_and_creates_one_conflict(
+    compiled_source_fixture,
+):
+    settings, source_id, page_path = compiled_source_fixture
+    service = WikiRevisionService(settings)
+    page = service.get_page(page_path)
+    service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page_path,
+            content=page.content + "\nHuman text\n",
+            expected_revision_id=page.current_revision_id,
+            request_id="manual-before-compile",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        )
+    )
+    human_bytes = (settings.vault_path / page_path).read_bytes()
+
+    first = compile_wiki(
+        settings,
+        CompileRequest(domain="product", source_ids=[source_id]),
+    )
+    second = compile_wiki(
+        settings,
+        CompileRequest(
+            domain="product",
+            source_ids=[source_id],
+            compile_job_id=first.job_id,
+        ),
+    )
+
+    assert (settings.vault_path / page_path).read_bytes() == human_bytes
+    assert first.conflicted_pages == 1
+    assert second.conflicted_pages == 1
+    with connect_app(settings) as conn:
+        pending = conn.execute(
+            """
+            SELECT * FROM review_items
+            WHERE page_path=? AND issue_type='content_conflict' AND status='pending'
+            """,
+            (page_path,),
+        ).fetchall()
+        state = conn.execute(
+            "SELECT * FROM wiki_pages WHERE path=?",
+            (page_path,),
+        ).fetchone()
+    assert len(pending) == 1
+    assert pending[0]["base_revision_id"] == state["current_revision_id"]
+    assert pending[0]["candidate_revision_id"] == state["generated_revision_id"]
+    assert json.loads(pending[0]["expected_state_json"]) == {
+        "accepted_generated": state["accepted_generated_revision_id"],
+        "current": state["current_revision_id"],
+        "file_hash": state["file_hash"],
+        "generated": state["generated_revision_id"],
+        "lifecycle": state["lifecycle_status"],
+        "path": state["path"],
+        "pending_conflict": [pending[0]["id"]],
+    }
+
+
+def test_recompile_auto_advances_only_when_current_equals_previous_generated(
+    compiled_source_fixture,
+):
+    settings, source_id, page_path = compiled_source_fixture
+    service = WikiRevisionService(settings)
+    before = service.get_page(page_path)
+    assert before.current_revision_id == before.generated_revision_id
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            UPDATE sources
+            SET content_hash='source-v2', last_compiled_at=NULL
+            WHERE id=?
+            """,
+            (source_id,),
+        )
+
+    result = compile_wiki(
+        settings,
+        CompileRequest(
+            domain="product",
+            source_ids=[source_id],
+            compile_job_id="compile-v2",
+        ),
+    )
+    after = service.get_page(page_path)
+
+    assert result.updated_pages == 1
+    assert result.conflicted_pages == 0
+    assert after.current_revision_id == after.generated_revision_id
+    assert after.current_revision_id != before.current_revision_id
+
+
+def test_unchanged_generated_artifact_still_reconciles_new_manual_divergence(
+    compiled_source_fixture,
+):
+    settings, source_id, page_path = compiled_source_fixture
+    service = WikiRevisionService(settings)
+    before = service.get_page(page_path)
+    service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page_path,
+            content=before.content + "\nmanual\n",
+            expected_revision_id=before.current_revision_id,
+            request_id="manual-diverge",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        )
+    )
+    with connect_app(settings) as conn:
+        generated_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE page_id=? AND origin='generated'
+            """,
+            (before.page_id,),
+        ).fetchone()[0]
+
+    result = compile_wiki(
+        settings,
+        CompileRequest(
+            domain="product",
+            source_ids=[source_id],
+            compile_job_id="same-artifact",
+        ),
+    )
+    with connect_app(settings) as conn:
+        generated_after = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE page_id=? AND origin='generated'
+            """,
+            (before.page_id,),
+        ).fetchone()[0]
+
+    assert generated_after == generated_count
+    assert result.conflicted_pages == 1
+
+
+def test_applied_compile_job_replay_does_not_report_or_enqueue_an_update(
+    compiled_source_fixture,
+):
+    settings, source_id, _ = compiled_source_fixture
+    with connect_app(settings) as conn:
+        revisions_before = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE origin='generated'
+            """
+        ).fetchone()[0]
+        jobs_before = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs"
+        ).fetchone()[0]
+
+    result = compile_wiki(
+        settings,
+        CompileRequest(
+            domain="product",
+            source_ids=[source_id],
+            compile_job_id="compile-initial",
+        ),
+    )
+
+    with connect_app(settings) as conn:
+        revisions_after = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE origin='generated'
+            """
+        ).fetchone()[0]
+        jobs_after = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs"
+        ).fetchone()[0]
+
+    assert result.job_id == "compile-initial"
+    assert result.created_pages == 0
+    assert result.updated_pages == 0
+    assert result.conflicted_pages == 0
+    assert result.projection_jobs == 0
+    assert revisions_after == revisions_before
+    assert jobs_after == jobs_before
+
+
+def test_compile_replay_fails_closed_while_matching_intent_cannot_be_claimed(
+    tmp_path,
+    monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    settings.upload_path = tmp_path / "uploads"
+    settings.gbrain_import_on_compile = False
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    (samples / "pending.md").write_text(
+        "# Pending\n\nGenerated source body.\n",
+        encoding="utf-8",
+    )
+    scan_sources(
+        settings,
+        ScanRequest(
+            root_path=str(samples),
+            domain="product",
+            owner="compiler-test",
+        ),
+    )
+    with connect_app(settings) as conn:
+        source_id = conn.execute(
+            "SELECT id FROM sources WHERE title='pending'"
+        ).fetchone()[0]
+
+    original_execute = IntentExecutor.execute
+    monkeypatch.setattr(IntentExecutor, "execute", lambda self, intent_id: None)
+    request = CompileRequest(
+        domain="product",
+        source_ids=[source_id],
+        compile_job_id="compile-pending-owner",
+    )
+
+    with pytest.raises(RevisionConflict):
+        compile_wiki(settings, request)
+    with pytest.raises(RevisionConflict):
+        compile_wiki(settings, request)
+
+    with connect_app(settings) as conn:
+        source = conn.execute(
+            "SELECT last_compiled_at FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        page = conn.execute(
+            """
+            SELECT current_revision_id,generated_revision_id,pending_write_intent_id
+            FROM wiki_pages
+            """
+        ).fetchone()
+        jobs = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs"
+        ).fetchone()[0]
+        generated = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE origin='generated'
+            """
+        ).fetchone()[0]
+
+    assert source["last_compiled_at"] is None
+    assert page["current_revision_id"] is None
+    assert page["generated_revision_id"] is not None
+    assert page["pending_write_intent_id"] is not None
+    assert jobs == 0
+    assert generated == 1
+
+    def apply_elsewhere(self, intent_id):
+        other = IntentExecutor(self.settings, owner="other-compile-executor")
+        applied = original_execute(other, intent_id)
+        assert applied is not None
+        assert applied.intent_status == "applied"
+        return None
+
+    monkeypatch.setattr(IntentExecutor, "execute", apply_elsewhere)
+    replay = compile_wiki(settings, request)
+    with connect_app(settings) as conn:
+        completed_source = conn.execute(
+            "SELECT last_compiled_at FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        completed_page = conn.execute(
+            """
+            SELECT current_revision_id,generated_revision_id,pending_write_intent_id
+            FROM wiki_pages
+            """
+        ).fetchone()
+        completed_jobs = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs"
+        ).fetchone()[0]
+
+    assert replay.created_pages == 0
+    assert replay.updated_pages == 0
+    assert replay.conflicted_pages == 0
+    assert replay.projection_jobs == 0
+    assert completed_source["last_compiled_at"] is not None
+    assert completed_page["current_revision_id"] == completed_page["generated_revision_id"]
+    assert completed_page["pending_write_intent_id"] is None
+    assert completed_jobs == 2

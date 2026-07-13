@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -45,6 +46,7 @@ class CompileRequest(BaseModel):
     source_ids: list[str] | None = None
     domain: str = Field(pattern=DOMAIN_PATTERN)
     page_types: list[str] | None = None
+    compile_job_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
 
 class CompileResponse(BaseModel):
@@ -52,6 +54,8 @@ class CompileResponse(BaseModel):
     created_pages: int
     updated_pages: int
     review_items: int
+    conflicted_pages: int = 0
+    projection_jobs: int = 0
 
 
 class AskRequest(BaseModel):

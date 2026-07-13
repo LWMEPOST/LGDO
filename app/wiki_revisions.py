@@ -181,6 +181,12 @@ class WikiRevisionError(RuntimeError):
     pass
 
 
+class _PendingCompileReplay(RuntimeError):
+    def __init__(self, intent_id: str):
+        super().__init__(intent_id)
+        self.intent_id = intent_id
+
+
 class PreconditionRequired(WikiRevisionError):
     pass
 
@@ -298,6 +304,104 @@ class WikiRevisionService:
         except ValueError as exc:
             raise PageNotFound(page_path) from exc
         return target
+
+    @contextmanager
+    def _lock_generated_page(
+        self,
+        command: CompileCandidateCommand,
+    ) -> Iterator[tuple[LockedPage, bool]]:
+        suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+        with connect_app_write(self.settings) as conn:
+            row = conn.execute(
+                "SELECT * FROM wiki_pages WHERE path=?" + suffix,
+                (command.page_path,),
+            ).fetchone()
+            created = False
+            if row is None:
+                timestamp = now_iso()
+                inserted = conn.execute(
+                    """
+                    INSERT INTO wiki_pages(
+                      path,page_id,domain,page_type,title,source_ids_json,review_status,
+                      owner,created_at,updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(path) DO NOTHING
+                    """,
+                    (
+                        command.page_path,
+                        f"page_{uuid.uuid4().hex}",
+                        command.domain,
+                        command.page_type,
+                        command.title,
+                        json_dump(command.source_ids),
+                        "draft",
+                        command.owner,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                created = inserted.rowcount == 1
+                row = conn.execute(
+                    "SELECT * FROM wiki_pages WHERE path=?" + suffix,
+                    (command.page_path,),
+                ).fetchone()
+            elif row["page_id"] is None:
+                page_id = f"page_{uuid.uuid4().hex}"
+                assigned = conn.execute(
+                    """
+                    UPDATE wiki_pages SET page_id=?,updated_at=?
+                    WHERE path=? AND page_id IS NULL
+                    """,
+                    (page_id, now_iso(), command.page_path),
+                )
+                if assigned.rowcount != 1:
+                    raise RevisionConflict(
+                        "page identity changed during compile",
+                        current_revision_id=row["current_revision_id"],
+                        pending_intent_id=row["pending_write_intent_id"],
+                    )
+                row = conn.execute(
+                    "SELECT * FROM wiki_pages WHERE path=?" + suffix,
+                    (command.page_path,),
+                ).fetchone()
+            if row is None:
+                raise WikiRevisionError(
+                    f"generated page could not be locked: {command.page_path}"
+                )
+            page = dict(row)
+            pending_intent_id = page.get("pending_write_intent_id")
+            if pending_intent_id is not None:
+                pending = conn.execute(
+                    """
+                    SELECT intent.id,revision.origin,revision.semantic_hash,
+                           revision.metadata_json,revision.idempotency_key
+                    FROM vault_write_intents AS intent
+                    JOIN wiki_page_revisions AS revision
+                      ON revision.id=intent.revision_id
+                    WHERE intent.id=? AND intent.page_id=?
+                    """,
+                    (pending_intent_id, page["page_id"]),
+                ).fetchone()
+                prefix = (
+                    f"compile:{command.compile_job_id}:{page['page_id']}:"
+                    f"{command.source_hash}:{command.compiler_version}:"
+                )
+                if pending is not None:
+                    metadata = json.loads(pending["metadata_json"] or "{}")
+                    source_semantic_hash = compute_semantic_hash(
+                        parse_wiki_bytes(command.content.encode("utf-8"))
+                    )
+                    if (
+                        pending["origin"] == "generated"
+                        and pending["semantic_hash"] == source_semantic_hash
+                        and metadata.get("source_hash") == command.source_hash
+                        and metadata.get("compiler_version")
+                        == command.compiler_version
+                        and pending["idempotency_key"].startswith(prefix)
+                        and len(pending["idempotency_key"]) == len(prefix) + 64
+                    ):
+                        raise _PendingCompileReplay(str(pending_intent_id))
+            yield LockedPage(conn=conn, page=page), created
 
     def _read_result(
         self,
@@ -966,6 +1070,350 @@ class WikiRevisionService:
             locked_page=locked_page,
         )
 
+    def apply_generated_candidate(
+        self,
+        command: CompileCandidateCommand,
+    ) -> MutationResult:
+        try:
+            return self._apply_generated_candidate_once(command)
+        except _PendingCompileReplay as replay:
+            return self._execute_generated_intent(
+                replay.intent_id,
+                replayed=True,
+            )
+
+    def _apply_generated_candidate_once(
+        self,
+        command: CompileCandidateCommand,
+    ) -> MutationResult:
+        target = self._target(command.page_path)
+        with connect_app(self.settings) as conn:
+            existing = conn.execute(
+                """
+                SELECT current_revision_id,pending_write_intent_id
+                FROM wiki_pages WHERE path=?
+                """,
+                (command.page_path,),
+            ).fetchone()
+        if (
+            existing is not None
+            and existing["current_revision_id"] is None
+            and existing["pending_write_intent_id"] is None
+            and target.exists()
+        ):
+            self.get_page(command.page_path)
+
+        intent_id: str | None = None
+        prepared: MutationResult
+        with self._lock_generated_page(command) as (locked, created):
+            if locked.page.get("pending_write_intent_id") is not None:
+                raise RevisionConflict(
+                    "page already has a pending write",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+
+            old_current = locked.page.get("current_revision_id")
+            old_generated = locked.page.get("generated_revision_id")
+            current_revision = None
+            if old_current is not None:
+                current_revision = locked.conn.execute(
+                    "SELECT * FROM wiki_page_revisions WHERE id=?",
+                    (old_current,),
+                ).fetchone()
+                if current_revision is None:
+                    raise WikiRevisionError(
+                        f"current revision not found: {old_current}"
+                    )
+
+            if target.exists():
+                disk_hash = compute_file_hash(target.read_bytes())
+                if (
+                    current_revision is None
+                    or disk_hash != current_revision["file_hash"]
+                ):
+                    raise RevisionConflict(
+                        "vault file changed outside the revision state machine",
+                        current_revision_id=old_current,
+                    )
+            else:
+                disk_hash = None
+                if old_current is not None:
+                    raise RevisionConflict(
+                        "vault file is missing outside the revision state machine",
+                        current_revision_id=old_current,
+                    )
+
+            state_json = canonical_state_json(
+                self._canonical_state_locked(locked.conn, locked.page)
+            )
+            state_hash = hashlib.sha256(state_json.encode("utf-8")).hexdigest()
+            compile_prefix = (
+                f"compile:{command.compile_job_id}:{locked.page['page_id']}:"
+                f"{command.source_hash}:{command.compiler_version}:"
+            )
+            source_document = parse_wiki_bytes(command.content.encode("utf-8"))
+            candidate_semantic_hash = compute_semantic_hash(source_document)
+            latest_generated = locked.conn.execute(
+                """
+                SELECT * FROM wiki_page_revisions
+                WHERE page_id=? AND origin='generated'
+                ORDER BY revision_number DESC LIMIT 1
+                """,
+                (locked.page["page_id"],),
+            ).fetchone()
+            candidate: RevisionRecord | None = None
+            candidate_replayed = False
+            write_token: str | None = None
+            if latest_generated is not None:
+                latest_metadata = json.loads(
+                    latest_generated["metadata_json"] or "{}"
+                )
+                if (
+                    latest_generated["semantic_hash"] == candidate_semantic_hash
+                    and latest_metadata.get("source_hash") == command.source_hash
+                    and latest_metadata.get("compiler_version")
+                    == command.compiler_version
+                ):
+                    candidate = RevisionRecord.from_row(latest_generated)
+                    candidate_replayed = (
+                        candidate.idempotency_key.startswith(compile_prefix)
+                        and len(candidate.idempotency_key)
+                        == len(compile_prefix) + 64
+                    )
+
+            if candidate is None:
+                revision_id = f"wrev_{uuid.uuid4().hex}"
+                write_token = f"write_{uuid.uuid4().hex}"
+                rendered = render_managed_frontmatter(
+                    source_document,
+                    page_id=locked.page["page_id"],
+                    revision_id=revision_id,
+                    write_token=write_token,
+                    review_status="draft",
+                )
+                final_document = parse_wiki_bytes(rendered)
+                revision_metadata = _plain(final_document.frontmatter)
+                revision_metadata["source_hash"] = command.source_hash
+                revision_metadata["compiler_version"] = command.compiler_version
+                candidate = self._create_revision_locked(
+                    locked.conn,
+                    locked.page,
+                    content=rendered,
+                    origin="generated",
+                    base_revision_id=old_current,
+                    source_ids=command.source_ids,
+                    actor=command.actor,
+                    note=None,
+                    idempotency_key=f"{compile_prefix}{state_hash}",
+                    metadata=revision_metadata,
+                    revision_id=revision_id,
+                )
+                candidate_replayed = candidate.id != revision_id
+            candidate_document = parse_wiki_bytes(candidate.content.encode("utf-8"))
+            token = candidate_document.frontmatter.get("lgdo_write_token")
+            write_token = str(token) if token is not None else None
+
+            timestamp = now_iso()
+            locked.conn.execute(
+                """
+                UPDATE review_items
+                SET status='superseded',resolved_at=?,updated_at=?
+                WHERE page_id=? AND issue_type='content_conflict' AND status='pending'
+                  AND (candidate_revision_id IS NULL OR candidate_revision_id<>?)
+                """,
+                (
+                    timestamp,
+                    timestamp,
+                    locked.page["page_id"],
+                    candidate.id,
+                ),
+            )
+            expected_generated_sql = (
+                "generated_revision_id IS NULL"
+                if old_generated is None
+                else "generated_revision_id=?"
+            )
+            params: list[Any] = [
+                candidate.id,
+                command.domain,
+                command.page_type,
+                command.title,
+                json_dump(command.source_ids),
+                command.owner,
+                timestamp,
+                locked.page["page_id"],
+            ]
+            if old_generated is not None:
+                params.append(old_generated)
+            advanced = locked.conn.execute(
+                f"""
+                UPDATE wiki_pages
+                SET generated_revision_id=?,domain=?,page_type=?,title=?,
+                    source_ids_json=?,owner=COALESCE(?,owner),updated_at=?
+                WHERE page_id=? AND {expected_generated_sql}
+                """,
+                tuple(params),
+            )
+            if advanced.rowcount != 1:
+                raise RevisionConflict(
+                    "generated revision changed during compile",
+                    current_revision_id=old_current,
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+            locked.page["generated_revision_id"] = candidate.id
+            locked.page["domain"] = command.domain
+            locked.page["page_type"] = command.page_type
+            locked.page["title"] = command.title
+            locked.page["source_ids_json"] = json_dump(command.source_ids)
+            if command.owner is not None:
+                locked.page["owner"] = command.owner
+
+            should_write = (
+                old_current != candidate.id
+                and (
+                    created
+                    or (
+                        old_current is not None
+                        and old_current == old_generated
+                        and current_revision is not None
+                        and disk_hash == current_revision["file_hash"]
+                    )
+                )
+            )
+            if should_write:
+                if write_token is None:
+                    raise WikiRevisionError(
+                        f"generated revision has no write token: {candidate.id}"
+                    )
+                intent_id = self.prepare_write_intent_locked(
+                    locked.conn,
+                    locked.page,
+                    revision=candidate,
+                    expected_revision_id=old_current,
+                    expected_file_hash=disk_hash,
+                    write_token=write_token,
+                )
+                prepared = MutationResult(
+                    page_id=locked.page["page_id"],
+                    page_path=locked.page["path"],
+                    status="prepared",
+                    revision_id=candidate.id,
+                    current_revision_id=old_current,
+                    generated_revision_id=candidate.id,
+                    candidate_revision_id=candidate.id,
+                    write_intent_id=intent_id,
+                    replayed=candidate_replayed,
+                )
+            else:
+                conflict_id = self._reconcile_pending_reviews_locked(
+                    locked.conn,
+                    locked.page["page_id"],
+                )
+                prepared = MutationResult(
+                    page_id=locked.page["page_id"],
+                    page_path=locked.page["path"],
+                    status="conflicted" if conflict_id is not None else "ignored",
+                    revision_id=candidate.id,
+                    current_revision_id=old_current,
+                    generated_revision_id=candidate.id,
+                    candidate_revision_id=candidate.id,
+                    conflict_review_id=conflict_id,
+                    replayed=candidate_replayed,
+                )
+
+        if intent_id is None:
+            return prepared
+
+        return self._execute_generated_intent(
+            intent_id,
+            replayed=prepared.replayed,
+            prepared=prepared,
+        )
+
+    def _prepared_generated_mutation(
+        self,
+        intent_id: str,
+        *,
+        replayed: bool,
+    ) -> MutationResult:
+        with connect_app(self.settings) as conn:
+            intent = conn.execute(
+                "SELECT * FROM vault_write_intents WHERE id=?",
+                (intent_id,),
+            ).fetchone()
+            if intent is None:
+                raise WikiRevisionError(f"write intent not found: {intent_id}")
+            revision = conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (intent["revision_id"],),
+            ).fetchone()
+            if revision is None:
+                raise WikiRevisionError(
+                    f"write revision not found: {intent['revision_id']}"
+                )
+            page = conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (intent["page_id"],),
+            ).fetchone()
+            if page is None:
+                raise PageNotFound(str(intent["page_id"]))
+        return MutationResult(
+            page_id=page["page_id"],
+            page_path=page["path"],
+            status="prepared",
+            revision_id=revision["id"],
+            current_revision_id=page["current_revision_id"],
+            generated_revision_id=page["generated_revision_id"],
+            candidate_revision_id=revision["id"],
+            write_intent_id=intent_id,
+            replayed=replayed,
+        )
+
+    def _execute_generated_intent(
+        self,
+        intent_id: str,
+        *,
+        replayed: bool,
+        prepared: MutationResult | None = None,
+    ) -> MutationResult:
+        pending = prepared or self._prepared_generated_mutation(
+            intent_id,
+            replayed=replayed,
+        )
+        from app.vault_writer import IntentExecutor
+
+        result = IntentExecutor(self.settings).execute(intent_id)
+        if result is not None:
+            if result.intent_status != "applied":
+                raise RevisionConflict(
+                    "generated compile requires write recovery",
+                    current_revision_id=pending.current_revision_id,
+                    pending_intent_id=intent_id,
+                )
+            return replace(
+                self._mutation_for_intent(intent_id),
+                replayed=replayed,
+            )
+
+        with connect_app(self.settings) as conn:
+            intent = conn.execute(
+                "SELECT status FROM vault_write_intents WHERE id=?",
+                (intent_id,),
+            ).fetchone()
+        if intent is None:
+            raise WikiRevisionError(f"write intent not found: {intent_id}")
+        if intent["status"] == "applied":
+            return replace(
+                self._mutation_for_intent(intent_id),
+                replayed=replayed,
+            )
+        raise RevisionConflict(
+            "generated compile intent is owned by another executor",
+            current_revision_id=pending.current_revision_id,
+            pending_intent_id=intent_id,
+        )
+
     def _mutation_for_intent(self, intent_id: str) -> MutationResult:
         with connect_app(self.settings) as conn:
             intent = conn.execute(
@@ -1107,5 +1555,113 @@ class WikiRevisionService:
                 projection_job_ids=tuple(jobs),
             )
 
-    def _reconcile_pending_reviews_locked(self, conn: Any, page_id: str) -> None:
-        return None
+    def _reconcile_pending_reviews_locked(
+        self,
+        conn: Any,
+        page_id: str,
+    ) -> str | None:
+        page_row = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (page_id,),
+        ).fetchone()
+        if page_row is None:
+            raise PageNotFound(page_id)
+        page = dict(page_row)
+        pending = conn.execute(
+            """
+            SELECT * FROM review_items
+            WHERE page_id=? AND issue_type='content_conflict' AND status='pending'
+            ORDER BY created_at,id
+            """,
+            (page_id,),
+        ).fetchall()
+
+        generated = None
+        if page["generated_revision_id"] is not None:
+            generated = conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (page["generated_revision_id"],),
+            ).fetchone()
+            if generated is None:
+                raise WikiRevisionError(
+                    f"generated revision not found: {page['generated_revision_id']}"
+                )
+        accepted = None
+        if page["accepted_generated_revision_id"] is not None:
+            accepted = conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (page["accepted_generated_revision_id"],),
+            ).fetchone()
+            if accepted is None:
+                raise WikiRevisionError(
+                    "accepted generated revision not found: "
+                    f"{page['accepted_generated_revision_id']}"
+                )
+
+        has_conflict = (
+            page["current_revision_id"] is not None
+            and generated is not None
+            and page["current_revision_id"] != page["generated_revision_id"]
+            and (
+                accepted is None
+                or generated["semantic_hash"] != accepted["semantic_hash"]
+            )
+        )
+        current_state_json = canonical_state_json(
+            self._canonical_state_locked(conn, page)
+        )
+        matching = None
+        for review in pending:
+            if (
+                has_conflict
+                and review["base_revision_id"] == page["current_revision_id"]
+                and review["candidate_revision_id"]
+                == page["generated_revision_id"]
+                and review["expected_state_json"] == current_state_json
+            ):
+                matching = review
+                continue
+            timestamp = now_iso()
+            conn.execute(
+                """
+                UPDATE review_items
+                SET status='superseded',resolved_at=?,updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (timestamp, timestamp, review["id"]),
+            )
+
+        if not has_conflict:
+            return None
+        if matching is not None:
+            return str(matching["id"])
+
+        timestamp = now_iso()
+        review_id = f"review_{uuid.uuid4().hex}"
+        expected_state = self._canonical_state_locked(conn, page)
+        expected_state["pending_conflict"] = sorted(
+            [*expected_state["pending_conflict"], review_id]
+        )
+        expected_state_json = canonical_state_json(expected_state)
+        conn.execute(
+            """
+            INSERT INTO review_items(
+              id,page_path,page_id,issue_type,status,owner,source_ids_json,
+              created_at,updated_at,base_revision_id,candidate_revision_id,
+              expected_state_json
+            ) VALUES (?,?,?,'content_conflict','pending',?,?,?,?,?,?,?)
+            """,
+            (
+                review_id,
+                page["path"],
+                page_id,
+                page["owner"],
+                generated["source_ids_json"],
+                timestamp,
+                timestamp,
+                page["current_revision_id"],
+                page["generated_revision_id"],
+                expected_state_json,
+            ),
+        )
+        return review_id
