@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Literal
 
@@ -30,6 +31,8 @@ MutationStatus = Literal[
     "ignored",
     "failed",
 ]
+
+VALID_REVIEW_STATUSES = frozenset({"draft", "reviewed", "stale", "rejected"})
 
 
 @dataclass(frozen=True)
@@ -247,10 +250,28 @@ def _plain(value: Any) -> Any:
 
 
 def _source_ids(metadata: dict[str, Any]) -> list[str]:
-    value = metadata.get("source_ids") or []
+    value = metadata["source_ids"] if "source_ids" in metadata else []
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise MarkdownParseError("invalid_source_ids", "source_ids must be a string list")
     return list(value)
+
+
+def _review_status(value: Any) -> str:
+    if not isinstance(value, str) or value not in VALID_REVIEW_STATUSES:
+        raise MarkdownParseError(
+            "invalid_review_status",
+            "review_status must be draft, reviewed, stale, or rejected",
+        )
+    return value
+
+
+def canonical_state_json(value: dict[str, Any]) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class WikiRevisionService:
@@ -551,63 +572,313 @@ class WikiRevisionService:
         page["pending_write_intent_id"] = intent_id
         return intent_id
 
-    def prepare_manual_save(
+    def _canonical_state_locked(
         self,
-        command: ManualSaveCommand,
+        conn: Any,
+        page: dict[str, Any],
+    ) -> dict[str, Any]:
+        pending_conflicts = conn.execute(
+            """
+            SELECT id FROM review_items
+            WHERE page_id=? AND status='pending'
+              AND issue_type IN ('content_conflict','concurrent_write_conflict')
+            ORDER BY id
+            """,
+            (page["page_id"],),
+        ).fetchall()
+        return {
+            "current": page.get("current_revision_id"),
+            "generated": page.get("generated_revision_id"),
+            "accepted_generated": page.get("accepted_generated_revision_id"),
+            "lifecycle": page.get("lifecycle_status"),
+            "path": page.get("path"),
+            "file_hash": page.get("file_hash"),
+            "pending_conflict": [row["id"] for row in pending_conflicts],
+        }
+
+    def _transition_replay_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
         *,
-        execute_intent: bool = True,
-    ) -> MutationResult:
-        revision_id = f"wrev_{uuid.uuid4().hex}"
-        write_token = f"write_{uuid.uuid4().hex}"
-        source_document = parse_wiki_bytes(command.content.encode("utf-8"))
-        with self.coordinator.lock_page(command.page_path) as locked:
-            if locked.page.get("current_revision_id") != command.expected_revision_id:
-                raise RevisionConflict(
-                    "manual save precondition failed",
-                    current_revision_id=locked.page.get("current_revision_id"),
-                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+        transition_key: str,
+        transition_prefix: str,
+        request_id: str,
+        expected_revision_id: str,
+        allow_path_transition_replay: bool,
+    ) -> tuple[RevisionRecord, dict[str, Any]] | None:
+        row = conn.execute(
+            """
+            SELECT * FROM wiki_page_revisions
+            WHERE page_id=? AND idempotency_key=? AND base_revision_id=?
+            """,
+            (page["page_id"], transition_key, expected_revision_id),
+        ).fetchone()
+        if (
+            row is None
+            and allow_path_transition_replay
+            and page.get("pending_write_intent_id") is not None
+        ):
+            pending = conn.execute(
+                """
+                SELECT revision.*,base.page_path AS transition_base_path
+                FROM vault_write_intents AS intent
+                JOIN wiki_page_revisions AS revision
+                  ON revision.id=intent.revision_id
+                JOIN wiki_page_revisions AS base
+                  ON base.id=revision.base_revision_id
+                WHERE intent.id=? AND revision.page_id=?
+                  AND revision.base_revision_id=?
+                """,
+                (
+                    page["pending_write_intent_id"],
+                    page["page_id"],
+                    expected_revision_id,
+                ),
+            ).fetchone()
+            prefix = f"{transition_prefix}:{request_id}:"
+            replay_key = None
+            if pending is not None:
+                original_page = {
+                    **page,
+                    "path": pending["transition_base_path"],
+                }
+                original_state = canonical_state_json(
+                    self._canonical_state_locked(conn, original_page)
                 )
-            rendered = render_managed_frontmatter(
-                source_document,
-                page_id=locked.page["page_id"],
-                revision_id=revision_id,
-                write_token=write_token,
-                review_status=command.review_status,
+                original_digest = hashlib.sha256(
+                    original_state.encode("utf-8")
+                ).hexdigest()
+                replay_key = f"{prefix}{original_digest}"
+            if (
+                pending is not None
+                and pending["idempotency_key"] == replay_key
+            ):
+                row = pending
+        if (
+            row is None
+            and page.get("current_revision_id") != expected_revision_id
+        ):
+            prefix = f"{transition_prefix}:{request_id}:"
+            candidates = conn.execute(
+                """
+                SELECT * FROM wiki_page_revisions
+                WHERE page_id=? AND base_revision_id=?
+                ORDER BY revision_number DESC
+                """,
+                (page["page_id"], expected_revision_id),
+            ).fetchall()
+            row = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate["idempotency_key"].startswith(prefix)
+                    and len(candidate["idempotency_key"]) == len(prefix) + 64
+                ),
+                None,
             )
-            final_document = parse_wiki_bytes(rendered)
-            metadata = _plain(final_document.frontmatter)
-            if command.owner is not None:
-                metadata["owner"] = command.owner
-            revision = self._create_revision_locked(
+        if row is None:
+            return None
+        intent = conn.execute(
+            """
+            SELECT * FROM vault_write_intents
+            WHERE revision_id=? ORDER BY created_at,id LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        if intent is None:
+            raise WikiRevisionError(
+                f"manual revision has no write intent: {row['id']}"
+            )
+        return RevisionRecord.from_row(row), dict(intent)
+
+    def _prepare_human_mutation(
+        self,
+        *,
+        page_path: str,
+        expected_revision_id: str,
+        request_id: str,
+        transition_prefix: str,
+        actor: str,
+        note: str | None,
+        source_content: bytes | None,
+        metadata_changes: dict[str, Any],
+        review_status: str | None,
+        review_status_required: bool,
+        owner: str | None,
+        target_page_path: str | None,
+        page_domain: str | None,
+        execute_intent: bool,
+        locked_page: LockedPage | None = None,
+    ) -> MutationResult:
+        if target_page_path is not None:
+            self._target(target_page_path)
+        if locked_page is not None and execute_intent:
+            raise ValueError("locked mutation preparation cannot execute its intent")
+        replayed = False
+        replay_applied = False
+        intent_id: str
+        lock_context = (
+            nullcontext(locked_page)
+            if locked_page is not None
+            else self.coordinator.lock_page(page_path)
+        )
+        with lock_context as locked:
+            state_json = canonical_state_json(
+                self._canonical_state_locked(locked.conn, locked.page)
+            )
+            state_digest = hashlib.sha256(state_json.encode("utf-8")).hexdigest()
+            transition_key = (
+                f"{transition_prefix}:{request_id}:{state_digest}"
+            )
+            replay = self._transition_replay_locked(
                 locked.conn,
                 locked.page,
-                content=rendered,
-                origin="manual",
-                base_revision_id=command.expected_revision_id,
-                source_ids=_source_ids(metadata),
-                actor=command.actor,
-                note=command.note,
-                idempotency_key=f"manual:{command.request_id}",
-                metadata=metadata,
-                revision_id=revision_id,
+                transition_key=transition_key,
+                transition_prefix=transition_prefix,
+                request_id=request_id,
+                expected_revision_id=expected_revision_id,
+                allow_path_transition_replay=target_page_path is not None,
             )
-            intent_id = self.prepare_write_intent_locked(
-                locked.conn,
-                locked.page,
-                revision=revision,
-                expected_revision_id=command.expected_revision_id,
-                expected_file_hash=locked.page.get("file_hash"),
-                write_token=write_token,
-            )
-            prepared = MutationResult(
-                page_id=locked.page["page_id"],
-                page_path=command.page_path,
-                status="prepared",
-                revision_id=revision.id,
-                current_revision_id=command.expected_revision_id,
-                generated_revision_id=locked.page.get("generated_revision_id"),
-                write_intent_id=intent_id,
-            )
+            if replay is not None:
+                revision, intent = replay
+                replayed = True
+                intent_id = intent["id"]
+                replay_applied = intent["status"] == "applied"
+                prepared = MutationResult(
+                    page_id=locked.page["page_id"],
+                    page_path=locked.page["path"],
+                    status="applied" if replay_applied else "prepared",
+                    revision_id=revision.id,
+                    current_revision_id=(
+                        revision.id
+                        if replay_applied
+                        else locked.page.get("current_revision_id")
+                    ),
+                    generated_revision_id=locked.page.get("generated_revision_id"),
+                    write_intent_id=intent_id,
+                    replayed=True,
+                )
+            else:
+                if locked.page.get("current_revision_id") != expected_revision_id:
+                    raise RevisionConflict(
+                        f"{transition_prefix} mutation precondition failed",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get("pending_write_intent_id"),
+                    )
+                if locked.page.get("pending_write_intent_id") is not None:
+                    raise RevisionConflict(
+                        "page already has a pending write",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get("pending_write_intent_id"),
+                    )
+                if target_page_path is not None or page_domain is not None:
+                    previous_path = locked.page["path"]
+                    next_path = target_page_path or previous_path
+                    next_domain = page_domain or locked.page["domain"]
+                    transitioned = locked.conn.execute(
+                        """
+                        UPDATE wiki_pages SET path=?,domain=?,updated_at=?
+                        WHERE page_id=? AND path=? AND current_revision_id=?
+                          AND pending_write_intent_id IS NULL
+                        """,
+                        (
+                            next_path,
+                            next_domain,
+                            now_iso(),
+                            locked.page["page_id"],
+                            previous_path,
+                            expected_revision_id,
+                        ),
+                    )
+                    if transitioned.rowcount != 1:
+                        raise RevisionConflict(
+                            "page changed during metadata transition",
+                            current_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            pending_intent_id=locked.page.get(
+                                "pending_write_intent_id"
+                            ),
+                        )
+                    locked.conn.execute(
+                        "UPDATE review_items SET page_path=? WHERE page_path=?",
+                        (next_path, previous_path),
+                    )
+                    locked.page["path"] = next_path
+                    locked.page["domain"] = next_domain
+                if source_content is None:
+                    current = locked.conn.execute(
+                        "SELECT content FROM wiki_page_revisions WHERE id=?",
+                        (expected_revision_id,),
+                    ).fetchone()
+                    if current is None:
+                        raise WikiRevisionError(
+                            f"current revision not found: {expected_revision_id}"
+                        )
+                    mutation_content = current["content"].encode("utf-8")
+                else:
+                    mutation_content = source_content
+                document = parse_wiki_bytes(mutation_content)
+                for key, value in metadata_changes.items():
+                    if not isinstance(key, str) or not key:
+                        raise MarkdownParseError(
+                            "invalid_metadata_key",
+                            "metadata keys must be non-empty strings",
+                        )
+                    document.frontmatter[key] = value
+                if owner is not None:
+                    document.frontmatter["owner"] = owner
+                if review_status_required:
+                    status_value = review_status
+                elif "review_status" in document.frontmatter:
+                    status_value = document.frontmatter["review_status"]
+                else:
+                    status_value = locked.page.get("review_status")
+                effective_status = _review_status(status_value)
+                revision_id = f"wrev_{uuid.uuid4().hex}"
+                write_token = f"write_{uuid.uuid4().hex}"
+                rendered = render_managed_frontmatter(
+                    document,
+                    page_id=locked.page["page_id"],
+                    revision_id=revision_id,
+                    write_token=write_token,
+                    review_status=effective_status,
+                )
+                final_document = parse_wiki_bytes(rendered)
+                metadata = _plain(final_document.frontmatter)
+                revision = self._create_revision_locked(
+                    locked.conn,
+                    locked.page,
+                    content=rendered,
+                    origin="manual",
+                    base_revision_id=expected_revision_id,
+                    source_ids=_source_ids(metadata),
+                    actor=actor,
+                    note=note,
+                    idempotency_key=transition_key,
+                    metadata=metadata,
+                    revision_id=revision_id,
+                )
+                intent_id = self.prepare_write_intent_locked(
+                    locked.conn,
+                    locked.page,
+                    revision=revision,
+                    expected_revision_id=expected_revision_id,
+                    expected_file_hash=locked.page.get("file_hash"),
+                    write_token=write_token,
+                )
+                prepared = MutationResult(
+                    page_id=locked.page["page_id"],
+                    page_path=locked.page["path"],
+                    status="prepared",
+                    revision_id=revision.id,
+                    current_revision_id=expected_revision_id,
+                    generated_revision_id=locked.page.get("generated_revision_id"),
+                    write_intent_id=intent_id,
+                )
+        if replay_applied:
+            return replace(self._mutation_for_intent(intent_id), replayed=True)
         if not execute_intent:
             return prepared
 
@@ -616,11 +887,84 @@ class WikiRevisionService:
         result = IntentExecutor(self.settings).execute(intent_id)
         if result is None or result.intent_status != "applied":
             raise RevisionConflict(
-                "manual save requires recovery",
-                current_revision_id=command.expected_revision_id,
+                f"{transition_prefix} mutation requires recovery",
+                current_revision_id=expected_revision_id,
                 pending_intent_id=intent_id,
             )
-        return self._mutation_for_intent(intent_id)
+        return replace(self._mutation_for_intent(intent_id), replayed=replayed)
+
+    def prepare_manual_save(
+        self,
+        command: ManualSaveCommand,
+        *,
+        execute_intent: bool = True,
+    ) -> MutationResult:
+        return self._prepare_human_mutation(
+            page_path=command.page_path,
+            expected_revision_id=command.expected_revision_id,
+            request_id=command.request_id,
+            transition_prefix="manual",
+            actor=command.actor,
+            note=command.note,
+            source_content=command.content.encode("utf-8"),
+            metadata_changes={},
+            review_status=command.review_status,
+            review_status_required=True,
+            owner=command.owner,
+            target_page_path=None,
+            page_domain=None,
+            execute_intent=execute_intent,
+        )
+
+    def update_status(
+        self,
+        command: StatusUpdateCommand,
+        *,
+        execute_intent: bool = True,
+    ) -> MutationResult:
+        return self._prepare_human_mutation(
+            page_path=command.page_path,
+            expected_revision_id=command.expected_revision_id,
+            request_id=command.request_id,
+            transition_prefix="status",
+            actor=command.actor,
+            note=command.note,
+            source_content=None,
+            metadata_changes={},
+            review_status=command.review_status,
+            review_status_required=True,
+            owner=command.owner,
+            target_page_path=None,
+            page_domain=None,
+            execute_intent=execute_intent,
+        )
+
+    def update_metadata(
+        self,
+        command: MetadataUpdateCommand,
+        *,
+        execute_intent: bool = True,
+        target_page_path: str | None = None,
+        page_domain: str | None = None,
+        locked_page: LockedPage | None = None,
+    ) -> MutationResult:
+        return self._prepare_human_mutation(
+            page_path=command.page_path,
+            expected_revision_id=command.expected_revision_id,
+            request_id=command.request_id,
+            transition_prefix="metadata",
+            actor=command.actor,
+            note=command.note,
+            source_content=None,
+            metadata_changes=command.changes,
+            review_status=None,
+            review_status_required=False,
+            owner=None,
+            target_page_path=target_page_path,
+            page_domain=page_domain,
+            execute_intent=execute_intent,
+            locked_page=locked_page,
+        )
 
     def _mutation_for_intent(self, intent_id: str) -> MutationResult:
         with connect_app(self.settings) as conn:
@@ -633,15 +977,15 @@ class WikiRevisionService:
                 (intent["page_id"],),
             ).fetchone()
             jobs = conn.execute(
-                "SELECT id FROM knowledge_projection_jobs WHERE page_id=? AND projection_epoch=? ORDER BY target",
-                (page["page_id"], page["projection_epoch"]),
+                "SELECT id FROM knowledge_projection_jobs WHERE page_id=? AND revision_id=? ORDER BY target",
+                (page["page_id"], intent["revision_id"]),
             ).fetchall()
         return MutationResult(
             page_id=page["page_id"],
             page_path=page["path"],
             status="applied",
             revision_id=intent["revision_id"],
-            current_revision_id=page["current_revision_id"],
+            current_revision_id=intent["revision_id"],
             generated_revision_id=page["generated_revision_id"],
             write_intent_id=intent_id,
             projection_job_ids=tuple(row["id"] for row in jobs),
