@@ -911,6 +911,10 @@ class WikiRevisionService:
                     )
                     locked.page["path"] = next_path
                     locked.page["domain"] = next_domain
+                    self._reconcile_pending_reviews_locked(
+                        locked.conn,
+                        locked.page["page_id"],
+                    )
                 if source_content is None:
                     current = locked.conn.execute(
                         "SELECT content FROM wiki_page_revisions WHERE id=?",
@@ -1269,6 +1273,10 @@ class WikiRevisionService:
             if command.owner is not None:
                 locked.page["owner"] = command.owner
 
+            conflict_id = self._reconcile_pending_reviews_locked(
+                locked.conn,
+                locked.page["page_id"],
+            )
             should_write = (
                 old_current != candidate.id
                 and (
@@ -1306,10 +1314,6 @@ class WikiRevisionService:
                     replayed=candidate_replayed,
                 )
             else:
-                conflict_id = self._reconcile_pending_reviews_locked(
-                    locked.conn,
-                    locked.page["page_id"],
-                )
                 prepared = MutationResult(
                     page_id=locked.page["page_id"],
                     page_path=locked.page["path"],
@@ -1439,6 +1443,561 @@ class WikiRevisionService:
             projection_job_ids=tuple(row["id"] for row in jobs),
         )
 
+    @staticmethod
+    def _resolution_command_payload(
+        command: ResolveConflictCommand,
+    ) -> dict[str, Any]:
+        merged_hash = None
+        if command.merged_content is not None:
+            merged_hash = hashlib.sha256(
+                command.merged_content.encode("utf-8")
+            ).hexdigest()
+        return {
+            "review_id": command.review_id,
+            "resolution": command.resolution,
+            "expected_current_revision_id": command.expected_current_revision_id,
+            "expected_generated_revision_id": command.expected_generated_revision_id,
+            "request_id": command.request_id,
+            "actor": command.actor,
+            "note": command.note,
+            "merged_content_hash": merged_hash,
+        }
+
+    @staticmethod
+    def _audit_payloads_locked(
+        conn: Any,
+        event_type: str,
+    ) -> Iterator[dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT payload_json FROM audit_logs WHERE event_type=? ORDER BY id DESC",
+            (event_type,),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                yield payload
+
+    def _resolution_payload_for_command_locked(
+        self,
+        conn: Any,
+        event_type: str,
+        command: ResolveConflictCommand,
+    ) -> dict[str, Any] | None:
+        expected = self._resolution_command_payload(command)
+        for payload in self._audit_payloads_locked(conn, event_type):
+            if (
+                payload.get("review_id") != command.review_id
+                or payload.get("request_id") != command.request_id
+            ):
+                continue
+            if any(payload.get(key) != value for key, value in expected.items()):
+                raise RevisionConflict(
+                    "conflict resolution request was reused with different input",
+                    current_revision_id=command.expected_current_revision_id,
+                )
+            return payload
+        return None
+
+    @staticmethod
+    def _resolved_mutation_from_payload(
+        payload: dict[str, Any],
+        *,
+        replayed: bool,
+    ) -> MutationResult:
+        return MutationResult(
+            page_id=str(payload["page_id"]),
+            page_path=str(payload["page_path"]),
+            status="resolved",
+            revision_id=str(payload["resolution_revision_id"]),
+            current_revision_id=str(payload["resolution_revision_id"]),
+            generated_revision_id=payload.get("generated_revision_id"),
+            candidate_revision_id=payload.get("candidate_revision_id"),
+            write_intent_id=payload.get("write_intent_id"),
+            conflict_review_id=str(payload["review_id"]),
+            projection_job_ids=tuple(payload.get("projection_job_ids") or ()),
+            replayed=replayed,
+        )
+
+    def _validate_pending_conflict_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        review: Any,
+        command: ResolveConflictCommand,
+    ) -> Any:
+        if review["status"] != "pending":
+            raise RevisionConflict(
+                "conflict review is no longer pending",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        if (
+            page.get("current_revision_id")
+            != command.expected_current_revision_id
+            or page.get("generated_revision_id")
+            != command.expected_generated_revision_id
+            or review["base_revision_id"]
+            != command.expected_current_revision_id
+        ):
+            raise RevisionConflict(
+                "conflict resolution state changed",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        expected_state_json = canonical_state_json(
+            self._canonical_state_locked(conn, page)
+        )
+        if review["expected_state_json"] != expected_state_json:
+            raise RevisionConflict(
+                "conflict review expected state changed",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        candidate = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (review["candidate_revision_id"],),
+        ).fetchone()
+        if candidate is None or candidate["page_id"] != page["page_id"]:
+            raise RevisionConflict(
+                "conflict candidate is no longer valid",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        if review["issue_type"] == "content_conflict":
+            if review["candidate_revision_id"] != page.get("generated_revision_id"):
+                raise RevisionConflict(
+                    "content conflict candidate is no longer generated",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+        elif review["issue_type"] == "concurrent_write_conflict":
+            if candidate["origin"] not in {"manual", "external"}:
+                raise RevisionConflict(
+                    "concurrent conflict candidate must be manual or external",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+        else:
+            raise RevisionConflict(
+                "review is not a resolvable wiki conflict",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        return candidate
+
+    def _record_resolved_conflict_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        review: Any,
+        command_payload: dict[str, Any],
+        *,
+        resolution_revision_id: str,
+        write_intent_id: str | None,
+        projection_job_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        if review["issue_type"] == "content_conflict":
+            expected_accepted = page.get("accepted_generated_revision_id")
+            accepted_sql = (
+                "accepted_generated_revision_id IS NULL"
+                if expected_accepted is None
+                else "accepted_generated_revision_id=?"
+            )
+            generated = command_payload["expected_generated_revision_id"]
+            generated_sql = (
+                "generated_revision_id IS NULL"
+                if generated is None
+                else "generated_revision_id=?"
+            )
+            params: list[Any] = [
+                review["candidate_revision_id"],
+                timestamp,
+                page["page_id"],
+                resolution_revision_id,
+            ]
+            if generated is not None:
+                params.append(generated)
+            if expected_accepted is not None:
+                params.append(expected_accepted)
+            accepted = conn.execute(
+                f"""
+                UPDATE wiki_pages
+                SET accepted_generated_revision_id=?,updated_at=?
+                WHERE page_id=? AND current_revision_id=?
+                  AND {generated_sql} AND {accepted_sql}
+                """,
+                tuple(params),
+            )
+            if accepted.rowcount != 1:
+                raise RevisionConflict(
+                    "accepted generated revision changed during resolution",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            page["accepted_generated_revision_id"] = review[
+                "candidate_revision_id"
+            ]
+
+        closed = conn.execute(
+            """
+            UPDATE review_items
+            SET status='resolved',resolution_revision_id=?,resolved_at=?,updated_at=?
+            WHERE id=? AND status='pending' AND base_revision_id=?
+              AND candidate_revision_id=? AND expected_state_json=?
+            """,
+            (
+                resolution_revision_id,
+                timestamp,
+                timestamp,
+                review["id"],
+                review["base_revision_id"],
+                review["candidate_revision_id"],
+                review["expected_state_json"],
+            ),
+        )
+        if closed.rowcount != 1:
+            raise RevisionConflict(
+                "conflict review changed during resolution",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        payload = {
+            **command_payload,
+            "page_id": page["page_id"],
+            "page_path": page["path"],
+            "issue_type": review["issue_type"],
+            "candidate_revision_id": review["candidate_revision_id"],
+            "resolution_revision_id": resolution_revision_id,
+            "generated_revision_id": page.get("generated_revision_id"),
+            "accepted_generated_revision_id": page.get(
+                "accepted_generated_revision_id"
+            ),
+            "write_intent_id": write_intent_id,
+            "projection_job_ids": list(projection_job_ids),
+            "resolved_at": timestamp,
+        }
+        audit(conn, "wiki_conflict_resolved", payload, timestamp)
+        self._reconcile_pending_reviews_locked(conn, page["page_id"])
+        return payload
+
+    def list_conflicts(
+        self,
+        page_path: str,
+        status: str = "pending",
+    ) -> list[dict[str, Any]]:
+        self._target(page_path)
+        with connect_app(self.settings) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM review_items
+                WHERE page_path=? AND status=?
+                  AND issue_type IN ('content_conflict','concurrent_write_conflict')
+                ORDER BY created_at,id
+                """,
+                (page_path, status),
+            ).fetchall()
+        conflicts: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["source_ids"] = json.loads(item.pop("source_ids_json") or "[]")
+            item["expected_state"] = json.loads(
+                item.pop("expected_state_json") or "{}"
+            )
+            conflicts.append(item)
+        return conflicts
+
+    def resolve_conflict(
+        self,
+        command: ResolveConflictCommand,
+    ) -> MutationResult:
+        if command.resolution == "merged_content" and command.merged_content is None:
+            raise WikiRevisionError("merged_content resolution requires content")
+        if command.resolution != "merged_content" and command.merged_content is not None:
+            raise WikiRevisionError(
+                "merged content is only valid for merged_content resolution"
+            )
+        with connect_app(self.settings) as conn:
+            locator = conn.execute(
+                "SELECT page_id FROM review_items WHERE id=?",
+                (command.review_id,),
+            ).fetchone()
+        if locator is None or locator["page_id"] is None:
+            raise RevisionConflict(
+                "conflict review not found",
+                current_revision_id=command.expected_current_revision_id,
+            )
+
+        intent_id: str | None = None
+        command_payload = self._resolution_command_payload(command)
+        with self.coordinator.lock_page(page_id=locator["page_id"]) as locked:
+            suffix = (
+                " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+            )
+            review = locked.conn.execute(
+                "SELECT * FROM review_items WHERE id=?" + suffix,
+                (command.review_id,),
+            ).fetchone()
+            if review is None:
+                raise RevisionConflict(
+                    "conflict review not found",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+            resolved = self._resolution_payload_for_command_locked(
+                locked.conn,
+                "wiki_conflict_resolved",
+                command,
+            )
+            if resolved is not None:
+                return self._resolved_mutation_from_payload(
+                    resolved,
+                    replayed=True,
+                )
+            candidate = self._validate_pending_conflict_locked(
+                locked.conn,
+                locked.page,
+                review,
+                command,
+            )
+            prepared = self._resolution_payload_for_command_locked(
+                locked.conn,
+                "wiki_conflict_resolution_prepared",
+                command,
+            )
+            if prepared is not None:
+                intent_id = prepared.get("write_intent_id")
+                if (
+                    not isinstance(intent_id, str)
+                    or locked.page.get("pending_write_intent_id") != intent_id
+                ):
+                    raise RevisionConflict(
+                        "prepared conflict resolution is no longer current",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+            elif command.resolution == "keep_current":
+                if locked.page.get("pending_write_intent_id") is not None:
+                    raise RevisionConflict(
+                        "page already has a pending write",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                payload = self._record_resolved_conflict_locked(
+                    locked.conn,
+                    locked.page,
+                    review,
+                    command_payload,
+                    resolution_revision_id=command.expected_current_revision_id,
+                    write_intent_id=None,
+                )
+                return self._resolved_mutation_from_payload(
+                    payload,
+                    replayed=False,
+                )
+            else:
+                if locked.page.get("pending_write_intent_id") is not None:
+                    raise RevisionConflict(
+                        "page already has a pending write",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                if command.resolution == "accept_candidate":
+                    resolution_revision = RevisionRecord.from_row(candidate)
+                    candidate_document = parse_wiki_bytes(
+                        resolution_revision.content.encode("utf-8")
+                    )
+                    token = candidate_document.frontmatter.get("lgdo_write_token")
+                    if not isinstance(token, str) or not token:
+                        raise WikiRevisionError(
+                            "conflict candidate has no managed write token"
+                        )
+                    write_token = token
+                else:
+                    document = parse_wiki_bytes(
+                        command.merged_content.encode("utf-8")
+                    )
+                    effective_status = _review_status(
+                        document.frontmatter.get("review_status")
+                        or locked.page.get("review_status")
+                    )
+                    revision_id = f"wrev_{uuid.uuid4().hex}"
+                    write_token = f"write_{uuid.uuid4().hex}"
+                    rendered = render_managed_frontmatter(
+                        document,
+                        page_id=locked.page["page_id"],
+                        revision_id=revision_id,
+                        write_token=write_token,
+                        review_status=effective_status,
+                    )
+                    final_document = parse_wiki_bytes(rendered)
+                    metadata = _plain(final_document.frontmatter)
+                    state_digest = hashlib.sha256(
+                        review["expected_state_json"].encode("utf-8")
+                    ).hexdigest()
+                    resolution_revision = self._create_revision_locked(
+                        locked.conn,
+                        locked.page,
+                        content=rendered,
+                        origin="merge",
+                        base_revision_id=command.expected_current_revision_id,
+                        source_ids=_source_ids(metadata),
+                        actor=command.actor,
+                        note=command.note,
+                        idempotency_key=(
+                            f"resolve:{command.review_id}:{command.request_id}:"
+                            f"{state_digest}"
+                        ),
+                        metadata=metadata,
+                        revision_id=revision_id,
+                    )
+                intent_id = self.prepare_write_intent_locked(
+                    locked.conn,
+                    locked.page,
+                    revision=resolution_revision,
+                    expected_revision_id=command.expected_current_revision_id,
+                    expected_file_hash=locked.page.get("file_hash"),
+                    write_token=write_token,
+                )
+                prepared_payload = {
+                    **command_payload,
+                    "page_id": locked.page["page_id"],
+                    "page_path": locked.page["path"],
+                    "issue_type": review["issue_type"],
+                    "candidate_revision_id": review["candidate_revision_id"],
+                    "resolution_revision_id": resolution_revision.id,
+                    "accepted_generated_revision_id": locked.page.get(
+                        "accepted_generated_revision_id"
+                    ),
+                    "expected_state_json": review["expected_state_json"],
+                    "write_intent_id": intent_id,
+                }
+                audit(
+                    locked.conn,
+                    "wiki_conflict_resolution_prepared",
+                    prepared_payload,
+                    now_iso(),
+                )
+
+        if intent_id is None:
+            raise WikiRevisionError("conflict resolution did not prepare an intent")
+        from app.vault_writer import IntentExecutor
+
+        executed = IntentExecutor(self.settings).execute(intent_id)
+        if executed is None or executed.intent_status != "applied":
+            with connect_app(self.settings) as conn:
+                intent = conn.execute(
+                    "SELECT status FROM vault_write_intents WHERE id=?",
+                    (intent_id,),
+                ).fetchone()
+            if intent is None or intent["status"] != "applied":
+                raise RevisionConflict(
+                    "conflict resolution requires write recovery",
+                    current_revision_id=command.expected_current_revision_id,
+                    pending_intent_id=intent_id,
+                )
+        with connect_app(self.settings) as conn:
+            resolved = self._resolution_payload_for_command_locked(
+                conn,
+                "wiki_conflict_resolved",
+                command,
+            )
+        if resolved is None:
+            raise WikiRevisionError(
+                "applied conflict resolution has no completion audit"
+            )
+        return self._resolved_mutation_from_payload(resolved, replayed=False)
+
+    def _prepared_resolution_for_intent_locked(
+        self,
+        conn: Any,
+        intent_id: str,
+    ) -> dict[str, Any] | None:
+        for payload in self._audit_payloads_locked(
+            conn,
+            "wiki_conflict_resolution_prepared",
+        ):
+            if payload.get("write_intent_id") == intent_id:
+                return payload
+        return None
+
+    def _validate_prepared_resolution_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        intent: Any,
+        revision: Any,
+        payload: dict[str, Any],
+    ) -> Any:
+        required_strings = (
+            "review_id",
+            "resolution",
+            "expected_current_revision_id",
+            "request_id",
+            "actor",
+            "issue_type",
+            "candidate_revision_id",
+            "resolution_revision_id",
+            "expected_state_json",
+            "write_intent_id",
+        )
+        if any(not isinstance(payload.get(key), str) for key in required_strings):
+            raise WikiRevisionError("prepared conflict resolution audit is invalid")
+        if (
+            payload["write_intent_id"] != intent["id"]
+            or payload["resolution_revision_id"] != revision["id"]
+            or payload["expected_current_revision_id"]
+            != intent["expected_revision_id"]
+            or payload["resolution"] not in {"accept_candidate", "merged_content"}
+        ):
+            raise RevisionConflict(
+                "prepared conflict resolution no longer matches its intent",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+        review = conn.execute(
+            "SELECT * FROM review_items WHERE id=?" + suffix,
+            (payload["review_id"],),
+        ).fetchone()
+        if (
+            review is None
+            or review["issue_type"] != payload["issue_type"]
+            or review["candidate_revision_id"]
+            != payload["candidate_revision_id"]
+            or review["expected_state_json"] != payload["expected_state_json"]
+        ):
+            raise RevisionConflict(
+                "prepared conflict review changed before finalize",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        command = ResolveConflictCommand(
+            review_id=payload["review_id"],
+            resolution=payload["resolution"],
+            merged_content=None,
+            expected_current_revision_id=payload[
+                "expected_current_revision_id"
+            ],
+            expected_generated_revision_id=payload.get(
+                "expected_generated_revision_id"
+            ),
+            request_id=payload["request_id"],
+            actor=payload["actor"],
+            note=payload.get("note"),
+        )
+        self._validate_pending_conflict_locked(conn, page, review, command)
+        return review
+
     def finalize_intent(self, intent_id: str, executor_owner: str) -> MutationResult:
         with connect_app(self.settings) as read_conn:
             locator = read_conn.execute(
@@ -1463,6 +2022,19 @@ class WikiRevisionService:
             ).fetchone()
             if revision is None:
                 raise WikiRevisionError(f"write revision not found: {intent['revision_id']}")
+            resolution_payload = self._prepared_resolution_for_intent_locked(
+                locked.conn,
+                intent_id,
+            )
+            resolution_review = None
+            if resolution_payload is not None:
+                resolution_review = self._validate_prepared_resolution_locked(
+                    locked.conn,
+                    locked.page,
+                    intent,
+                    revision,
+                    resolution_payload,
+                )
             if (
                 intent["status"] != "installed"
                 or intent["executor_owner"] != executor_owner
@@ -1537,7 +2109,31 @@ class WikiRevisionService:
             )
             if applied.rowcount != 1:
                 raise WikiRevisionError("intent owner/status CAS failed during finalize")
-            self._reconcile_pending_reviews_locked(locked.conn, intent["page_id"])
+            locked.page.update(
+                {
+                    "current_revision_id": revision["id"],
+                    "file_hash": revision["file_hash"],
+                    "semantic_hash": revision["semantic_hash"],
+                    "projection_epoch": next_epoch,
+                    "pending_write_intent_id": None,
+                    "lifecycle_status": "active",
+                }
+            )
+            if resolution_payload is not None and resolution_review is not None:
+                self._record_resolved_conflict_locked(
+                    locked.conn,
+                    locked.page,
+                    resolution_review,
+                    resolution_payload,
+                    resolution_revision_id=revision["id"],
+                    write_intent_id=intent_id,
+                    projection_job_ids=tuple(jobs),
+                )
+            else:
+                self._reconcile_pending_reviews_locked(
+                    locked.conn,
+                    intent["page_id"],
+                )
             audit(
                 locked.conn,
                 "wiki_revision_applied",
@@ -1567,14 +2163,17 @@ class WikiRevisionService:
         if page_row is None:
             raise PageNotFound(page_id)
         page = dict(page_row)
-        pending = conn.execute(
-            """
-            SELECT * FROM review_items
-            WHERE page_id=? AND issue_type='content_conflict' AND status='pending'
-            ORDER BY created_at,id
-            """,
-            (page_id,),
-        ).fetchall()
+        pending = list(
+            conn.execute(
+                """
+                SELECT * FROM review_items
+                WHERE page_id=? AND status='pending'
+                  AND issue_type IN ('content_conflict','concurrent_write_conflict')
+                ORDER BY created_at,id
+                """,
+                (page_id,),
+            ).fetchall()
+        )
 
         generated = None
         if page["generated_revision_id"] is not None:
@@ -1598,7 +2197,7 @@ class WikiRevisionService:
                     f"{page['accepted_generated_revision_id']}"
                 )
 
-        has_conflict = (
+        has_content_conflict = (
             page["current_revision_id"] is not None
             and generated is not None
             and page["current_revision_id"] != page["generated_revision_id"]
@@ -1607,22 +2206,77 @@ class WikiRevisionService:
                 or generated["semantic_hash"] != accepted["semantic_hash"]
             )
         )
-        current_state_json = canonical_state_json(
-            self._canonical_state_locked(conn, page)
-        )
-        matching = None
-        for review in pending:
+        desired: dict[str, dict[str, Any]] = {}
+        if has_content_conflict:
+            desired["content_conflict"] = {
+                "base_revision_id": page["current_revision_id"],
+                "candidate_revision_id": page["generated_revision_id"],
+                "owner": page["owner"],
+                "source_ids_json": generated["source_ids_json"],
+            }
+
+        for review in reversed(pending):
+            if review["issue_type"] != "concurrent_write_conflict":
+                continue
+            candidate = conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (review["candidate_revision_id"],),
+            ).fetchone()
             if (
-                has_conflict
+                candidate is not None
+                and candidate["page_id"] == page_id
+                and candidate["origin"] in {"manual", "external"}
                 and review["base_revision_id"] == page["current_revision_id"]
                 and review["candidate_revision_id"]
-                == page["generated_revision_id"]
-                and review["expected_state_json"] == current_state_json
+                != page["current_revision_id"]
             ):
-                matching = review
-                continue
-            timestamp = now_iso()
-            conn.execute(
+                desired["concurrent_write_conflict"] = {
+                    "base_revision_id": page["current_revision_id"],
+                    "candidate_revision_id": review["candidate_revision_id"],
+                    "owner": review["owner"] or page["owner"],
+                    "source_ids_json": candidate["source_ids_json"],
+                }
+                break
+
+        matching: dict[str, Any] = {}
+        for issue_type, spec in desired.items():
+            candidates = [
+                review
+                for review in pending
+                if review["issue_type"] == issue_type
+                and review["base_revision_id"] == spec["base_revision_id"]
+                and review["candidate_revision_id"]
+                == spec["candidate_revision_id"]
+            ]
+            if len(candidates) == 1:
+                matching[issue_type] = candidates[0]
+
+        planned_ids = {
+            issue_type: (
+                str(matching[issue_type]["id"])
+                if issue_type in matching
+                else f"review_{uuid.uuid4().hex}"
+            )
+            for issue_type in desired
+        }
+        expected_state = self._canonical_state_locked(conn, page)
+        expected_state["pending_conflict"] = sorted(planned_ids.values())
+        expected_state_json = canonical_state_json(expected_state)
+        stable = (
+            len(pending) == len(desired)
+            and len(matching) == len(desired)
+            and all(
+                review["expected_state_json"] == expected_state_json
+                for review in matching.values()
+            )
+        )
+        if stable:
+            content = matching.get("content_conflict")
+            return str(content["id"]) if content is not None else None
+
+        timestamp = now_iso()
+        for review in pending:
+            superseded = conn.execute(
                 """
                 UPDATE review_items
                 SET status='superseded',resolved_at=?,updated_at=?
@@ -1630,38 +2284,46 @@ class WikiRevisionService:
                 """,
                 (timestamp, timestamp, review["id"]),
             )
+            if superseded.rowcount != 1:
+                raise RevisionConflict(
+                    "pending conflict changed during reconciliation",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
 
-        if not has_conflict:
+        if not desired:
             return None
-        if matching is not None:
-            return str(matching["id"])
-
-        timestamp = now_iso()
-        review_id = f"review_{uuid.uuid4().hex}"
+        final_ids = {
+            issue_type: f"review_{uuid.uuid4().hex}"
+            for issue_type in desired
+        }
         expected_state = self._canonical_state_locked(conn, page)
-        expected_state["pending_conflict"] = sorted(
-            [*expected_state["pending_conflict"], review_id]
-        )
+        expected_state["pending_conflict"] = sorted(final_ids.values())
         expected_state_json = canonical_state_json(expected_state)
-        conn.execute(
-            """
-            INSERT INTO review_items(
-              id,page_path,page_id,issue_type,status,owner,source_ids_json,
-              created_at,updated_at,base_revision_id,candidate_revision_id,
-              expected_state_json
-            ) VALUES (?,?,?,'content_conflict','pending',?,?,?,?,?,?,?)
-            """,
-            (
-                review_id,
-                page["path"],
-                page_id,
-                page["owner"],
-                generated["source_ids_json"],
-                timestamp,
-                timestamp,
-                page["current_revision_id"],
-                page["generated_revision_id"],
-                expected_state_json,
-            ),
-        )
-        return review_id
+        for issue_type in ("content_conflict", "concurrent_write_conflict"):
+            spec = desired.get(issue_type)
+            if spec is None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO review_items(
+                  id,page_path,page_id,issue_type,status,owner,source_ids_json,
+                  created_at,updated_at,base_revision_id,candidate_revision_id,
+                  expected_state_json
+                ) VALUES (?,?,?,?,'pending',?,?,?,?,?,?,?)
+                """,
+                (
+                    final_ids[issue_type],
+                    page["path"],
+                    page_id,
+                    issue_type,
+                    spec["owner"],
+                    spec["source_ids_json"],
+                    timestamp,
+                    timestamp,
+                    spec["base_revision_id"],
+                    spec["candidate_revision_id"],
+                    expected_state_json,
+                ),
+            )
+        return final_ids.get("content_conflict")

@@ -1,19 +1,24 @@
 import hashlib
 import json
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from app.config import get_settings
-from app.db import connect_app, init_app_db
+from app.db import connect_app, connect_app_write, init_app_db
 from app.ingest import scan_sources
 from app.models import CompileRequest, ScanRequest
 from app.wiki import compile_wiki
 from app.wiki_markdown import MarkdownParseError
 from app.wiki_revisions import (
+    CompileCandidateCommand,
     ManualSaveCommand,
     MetadataUpdateCommand,
+    PageReadResult,
+    ResolveConflictCommand,
     RevisionConflict,
     StatusUpdateCommand,
     WikiRevisionService,
@@ -646,6 +651,122 @@ def test_unchanged_generated_artifact_still_reconciles_new_manual_divergence(
     assert result.conflicted_pages == 1
 
 
+def test_generated_transition_reconciles_before_auto_write_finalize(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    command = CompileCandidateCommand(
+        page_path=before.page_path,
+        content=before.content + "\nGenerated transition before finalize.\n",
+        domain=before.metadata["domain"],
+        page_type=before.metadata["page_type"],
+        title=before.metadata["title"],
+        source_ids=before.metadata["source_ids"],
+        owner=before.metadata.get("owner"),
+        source_hash="generated-before-finalize-v2",
+        compiler_version="wiki-revision-v1",
+        compile_job_id="generated-before-finalize",
+    )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(IntentExecutor, "execute", lambda self, intent_id: None)
+        with pytest.raises(RevisionConflict):
+            service.apply_generated_candidate(command)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        pending = conn.execute(
+            """
+            SELECT * FROM review_items
+            WHERE page_id=? AND issue_type='content_conflict' AND status='pending'
+            """,
+            (before.page_id,),
+        ).fetchall()
+    assert page["current_revision_id"] == before.current_revision_id
+    assert page["generated_revision_id"] != before.generated_revision_id
+    assert page["pending_write_intent_id"] is not None
+    assert len(pending) == 1
+    assert pending[0]["base_revision_id"] == before.current_revision_id
+    assert pending[0]["candidate_revision_id"] == page["generated_revision_id"]
+    assert json.loads(pending[0]["expected_state_json"]) == {
+        "accepted_generated": page["accepted_generated_revision_id"],
+        "current": page["current_revision_id"],
+        "file_hash": page["file_hash"],
+        "generated": page["generated_revision_id"],
+        "lifecycle": page["lifecycle_status"],
+        "path": page["path"],
+        "pending_conflict": [pending[0]["id"]],
+    }
+
+    recovered = IntentExecutor(service.settings).execute(
+        page["pending_write_intent_id"]
+    )
+    assert recovered is not None
+    assert recovered.intent_status == "applied"
+    with connect_app(service.settings) as conn:
+        finalized = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        review = conn.execute(
+            "SELECT status FROM review_items WHERE id=?",
+            (pending[0]["id"],),
+        ).fetchone()
+    assert finalized["current_revision_id"] == finalized["generated_revision_id"]
+    assert finalized["pending_write_intent_id"] is None
+    assert review["status"] == "superseded"
+
+
+def test_reused_generated_artifact_reconciles_in_transition_transaction(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    with connect_app(service.settings) as conn:
+        generated = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (before.generated_revision_id,),
+        ).fetchone()
+    generated_metadata = json.loads(generated["metadata_json"])
+    calls = []
+    original_reconcile = service._reconcile_pending_reviews_locked
+
+    def observe_reconcile(conn, page_id):
+        page = conn.execute(
+            "SELECT generated_revision_id FROM wiki_pages WHERE page_id=?",
+            (page_id,),
+        ).fetchone()
+        calls.append((page_id, page["generated_revision_id"]))
+        return original_reconcile(conn, page_id)
+
+    monkeypatch.setattr(
+        service,
+        "_reconcile_pending_reviews_locked",
+        observe_reconcile,
+    )
+    result = service.apply_generated_candidate(
+        CompileCandidateCommand(
+            page_path=before.page_path,
+            content=generated["content"],
+            domain=before.metadata["domain"],
+            page_type=before.metadata["page_type"],
+            title=before.metadata["title"],
+            source_ids=before.metadata["source_ids"],
+            owner=before.metadata.get("owner"),
+            source_hash=generated_metadata["source_hash"],
+            compiler_version=generated_metadata["compiler_version"],
+            compile_job_id="reuse-with-reconcile-spy",
+        )
+    )
+
+    assert result.candidate_revision_id == before.generated_revision_id
+    assert calls == [(before.page_id, before.generated_revision_id)]
+
+
 def test_applied_compile_job_replay_does_not_report_or_enqueue_an_update(
     compiled_source_fixture,
 ):
@@ -789,3 +910,495 @@ def test_compile_replay_fails_closed_while_matching_intent_cannot_be_claimed(
     assert completed_page["current_revision_id"] == completed_page["generated_revision_id"]
     assert completed_page["pending_write_intent_id"] is None
     assert completed_jobs == 2
+
+
+@dataclass(frozen=True)
+class ContentConflictScenario:
+    service: WikiRevisionService
+    conflict: dict
+    current: PageReadResult
+    generated_content: str
+
+    def generated_job(
+        self,
+        content: str,
+        source_hash: str,
+        job_id: str,
+    ) -> CompileCandidateCommand:
+        metadata = self.current.metadata
+        return CompileCandidateCommand(
+            page_path=self.current.page_path,
+            content=content,
+            domain=metadata["domain"],
+            page_type=metadata["page_type"],
+            title=metadata["title"],
+            source_ids=metadata["source_ids"],
+            owner=metadata.get("owner"),
+            source_hash=source_hash,
+            compiler_version="wiki-revision-v1",
+            compile_job_id=job_id,
+        )
+
+    def same_semantic_new_job(self) -> CompileCandidateCommand:
+        return self.generated_job(
+            self.generated_content,
+            "same-semantic-v2",
+            "compile-same-semantic",
+        )
+
+    def new_candidate_job(self) -> CompileCandidateCommand:
+        return self.generated_job(
+            self.generated_content + "\nNew generated fact.\n",
+            "different-semantic-v3",
+            "compile-different-semantic",
+        )
+
+
+@pytest.fixture
+def content_conflict_fixture(page_with_generated):
+    service, generated_page = page_with_generated
+    service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=generated_page.page_path,
+            content=generated_page.content + "\nHuman divergence.\n",
+            expected_revision_id=generated_page.current_revision_id,
+            request_id="fixture-manual-divergence",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        )
+    )
+    current = service.get_page(generated_page.page_path)
+    service.apply_generated_candidate(
+        CompileCandidateCommand(
+            page_path=current.page_path,
+            content=generated_page.content,
+            domain=current.metadata["domain"],
+            page_type=current.metadata["page_type"],
+            title=current.metadata["title"],
+            source_ids=current.metadata["source_ids"],
+            owner=current.metadata.get("owner"),
+            source_hash="fixture-generated-v1",
+            compiler_version="wiki-revision-v1",
+            compile_job_id="fixture-conflict",
+        )
+    )
+    conflict = service.list_conflicts(current.page_path, status="pending")[0]
+    assert conflict["issue_type"] == "content_conflict"
+    assert isinstance(conflict["source_ids"], list)
+    assert isinstance(conflict["expected_state"], dict)
+    return ContentConflictScenario(
+        service,
+        conflict,
+        current,
+        generated_page.content,
+    )
+
+
+@pytest.fixture
+def concurrent_conflict_fixture(page_with_generated):
+    service, before = page_with_generated
+    prepared = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=before.page_path,
+            content=before.content + "\nConcurrent manual candidate.\n",
+            expected_revision_id=before.current_revision_id,
+            request_id="fixture-concurrent-candidate",
+            actor="bob",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        ),
+        execute_intent=False,
+    )
+    review_id = f"review_{uuid.uuid4().hex}"
+    with connect_app_write(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        timestamp = "2026-07-14T00:00:00+00:00"
+        conn.execute(
+            """
+            UPDATE vault_write_intents
+            SET status='superseded',updated_at=?
+            WHERE id=? AND status='pending'
+            """,
+            (timestamp, prepared.write_intent_id),
+        )
+        cleared = conn.execute(
+            """
+            UPDATE wiki_pages SET pending_write_intent_id=NULL
+            WHERE page_id=? AND pending_write_intent_id=?
+            """,
+            (before.page_id, prepared.write_intent_id),
+        )
+        assert cleared.rowcount == 1
+        expected_state = {
+            "accepted_generated": page["accepted_generated_revision_id"],
+            "current": page["current_revision_id"],
+            "file_hash": page["file_hash"],
+            "generated": page["generated_revision_id"],
+            "lifecycle": page["lifecycle_status"],
+            "path": page["path"],
+            "pending_conflict": [review_id],
+        }
+        conn.execute(
+            """
+            INSERT INTO review_items(
+              id,page_path,issue_type,status,source_ids_json,created_at,updated_at,
+              page_id,base_revision_id,candidate_revision_id,expected_state_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                review_id,
+                before.page_path,
+                "concurrent_write_conflict",
+                "pending",
+                page["source_ids_json"],
+                timestamp,
+                timestamp,
+                before.page_id,
+                before.current_revision_id,
+                prepared.revision_id,
+                canonical_state_json(expected_state),
+            ),
+        )
+    conflict = service.list_conflicts(before.page_path, status="pending")[0]
+    assert conflict["issue_type"] == "concurrent_write_conflict"
+    return service, conflict, before
+
+
+@pytest.mark.parametrize(
+    ("resolution", "merged_suffix", "revision_delta", "intent_delta"),
+    [
+        ("keep_current", None, 0, 0),
+        ("accept_candidate", None, 0, 1),
+        ("merged_content", "\nMerged human rule\n", 1, 1),
+    ],
+)
+def test_content_conflict_resolution_records_locked_branch_contract(
+    content_conflict_fixture,
+    resolution,
+    merged_suffix,
+    revision_delta,
+    intent_delta,
+):
+    scenario = content_conflict_fixture
+    service, conflict, current = scenario.service, scenario.conflict, scenario.current
+    merged = current.content + merged_suffix if merged_suffix else None
+    with connect_app(service.settings) as conn:
+        revisions_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0]
+        intents_before = conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0]
+
+    result = service.resolve_conflict(
+        ResolveConflictCommand(
+            review_id=conflict["id"],
+            resolution=resolution,
+            merged_content=merged,
+            expected_current_revision_id=conflict["base_revision_id"],
+            expected_generated_revision_id=conflict["candidate_revision_id"],
+            request_id=f"resolve-{resolution}",
+            actor="alice",
+            note="reviewed",
+        )
+    )
+    page = service.get_page(current.page_path)
+    with connect_app(service.settings) as conn:
+        review = conn.execute(
+            "SELECT * FROM review_items WHERE id=?",
+            (conflict["id"],),
+        ).fetchone()
+        revisions_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0]
+        intents_after = conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0]
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (page.current_revision_id,),
+        ).fetchone()
+        audit_payload = json.loads(
+            conn.execute(
+                """
+                SELECT payload_json FROM audit_logs
+                WHERE event_type='wiki_conflict_resolved'
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()[0]
+        )
+
+    assert result.status == "resolved"
+    assert page.accepted_generated_revision_id == conflict["candidate_revision_id"]
+    assert revisions_after == revisions_before + revision_delta
+    assert intents_after == intents_before + intent_delta
+    assert review["status"] == "resolved"
+    assert review["resolved_at"] is not None
+    assert review["resolution_revision_id"] == page.current_revision_id
+    assert audit_payload["resolution"] == resolution
+    assert audit_payload["actor"] == "alice"
+    assert audit_payload["note"] == "reviewed"
+
+    if resolution == "keep_current":
+        assert result.revision_id == current.current_revision_id
+        assert page.current_revision_id == current.current_revision_id
+        assert revision["origin"] == "manual"
+    elif resolution == "accept_candidate":
+        assert result.revision_id == conflict["candidate_revision_id"]
+        assert page.current_revision_id == page.generated_revision_id
+        assert revision["origin"] == "generated"
+    else:
+        assert result.revision_id == page.current_revision_id
+        assert page.current_revision_id != page.generated_revision_id
+        assert revision["origin"] == "merge"
+        assert revision["base_revision_id"] == current.current_revision_id
+
+
+def test_same_semantic_candidate_after_keep_does_not_reopen_content_conflict(
+    content_conflict_fixture,
+):
+    scenario = content_conflict_fixture
+    service, conflict, current = scenario.service, scenario.conflict, scenario.current
+    service.resolve_conflict(
+        ResolveConflictCommand(
+            conflict["id"],
+            "keep_current",
+            None,
+            conflict["base_revision_id"],
+            conflict["candidate_revision_id"],
+            "keep-1",
+            "alice",
+            None,
+        )
+    )
+
+    same_semantic = service.apply_generated_candidate(
+        scenario.same_semantic_new_job()
+    )
+
+    assert same_semantic.candidate_revision_id != conflict["candidate_revision_id"]
+    assert service.list_conflicts(current.page_path, status="pending") == []
+
+    changed = service.apply_generated_candidate(scenario.new_candidate_job())
+    pending = service.list_conflicts(current.page_path, status="pending")
+    assert len(pending) == 1
+    assert pending[0]["candidate_revision_id"] == changed.candidate_revision_id
+
+
+def test_new_candidate_supersedes_old_and_stale_resolve_cannot_roll_back_generated(
+    content_conflict_fixture,
+):
+    scenario = content_conflict_fixture
+    service, old_conflict, current = scenario.service, scenario.conflict, scenario.current
+    newer = service.apply_generated_candidate(scenario.new_candidate_job())
+    pending = service.list_conflicts(current.page_path, status="pending")
+    assert len(pending) == 1
+    assert pending[0]["id"] != old_conflict["id"]
+    assert pending[0]["candidate_revision_id"] == newer.candidate_revision_id
+    with connect_app(service.settings) as conn:
+        old_status = conn.execute(
+            "SELECT status FROM review_items WHERE id=?",
+            (old_conflict["id"],),
+        ).fetchone()[0]
+    assert old_status == "superseded"
+    before_file = (service.settings.vault_path / current.page_path).read_bytes()
+
+    with pytest.raises(RevisionConflict):
+        service.resolve_conflict(
+            ResolveConflictCommand(
+                old_conflict["id"],
+                "accept_candidate",
+                None,
+                old_conflict["base_revision_id"],
+                old_conflict["candidate_revision_id"],
+                "stale-resolve",
+                "alice",
+                None,
+            )
+        )
+
+    page = service.get_page(current.page_path)
+    assert page.generated_revision_id == newer.candidate_revision_id
+    assert (service.settings.vault_path / current.page_path).read_bytes() == before_file
+
+
+def test_path_transition_reconciles_stale_content_conflict_before_intent(
+    content_conflict_fixture,
+):
+    scenario = content_conflict_fixture
+    service, old_conflict, current = scenario.service, scenario.conflict, scenario.current
+    target_path = "wiki/product/faq/demo-renamed.md"
+
+    service.update_metadata(
+        MetadataUpdateCommand(
+            page_path=current.page_path,
+            changes={},
+            expected_revision_id=current.current_revision_id,
+            request_id="rename-with-conflict",
+            actor="alice",
+        ),
+        target_page_path=target_path,
+        execute_intent=False,
+    )
+
+    pending = service.list_conflicts(target_path, status="pending")
+    assert len(pending) == 1
+    assert pending[0]["id"] != old_conflict["id"]
+    assert pending[0]["expected_state"]["path"] == target_path
+    with connect_app(service.settings) as conn:
+        old_status = conn.execute(
+            "SELECT status FROM review_items WHERE id=?",
+            (old_conflict["id"],),
+        ).fetchone()[0]
+    assert old_status == "superseded"
+
+
+@pytest.mark.parametrize(
+    ("resolution", "revision_delta", "intent_delta"),
+    [
+        ("keep_current", 0, 0),
+        ("accept_candidate", 0, 1),
+        ("merged_content", 1, 1),
+    ],
+)
+def test_concurrent_write_resolution_never_changes_generated_pointers(
+    concurrent_conflict_fixture,
+    resolution,
+    revision_delta,
+    intent_delta,
+):
+    service, conflict, before = concurrent_conflict_fixture
+    with connect_app(service.settings) as conn:
+        revisions_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        intents_before = conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+
+    result = service.resolve_conflict(
+        ResolveConflictCommand(
+            conflict["id"],
+            resolution,
+            before.content + "\nmerged\n" if resolution == "merged_content" else None,
+            conflict["base_revision_id"],
+            before.generated_revision_id,
+            f"concurrent-{resolution}",
+            "alice",
+            None,
+        )
+    )
+    after = service.get_page(before.page_path)
+    with connect_app(service.settings) as conn:
+        review = conn.execute(
+            "SELECT * FROM review_items WHERE id=?",
+            (conflict["id"],),
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (after.current_revision_id,),
+        ).fetchone()
+        revisions_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        intents_after = conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+
+    assert result.status == "resolved"
+    assert after.generated_revision_id == before.generated_revision_id
+    assert after.accepted_generated_revision_id == before.accepted_generated_revision_id
+    assert revisions_after == revisions_before + revision_delta
+    assert intents_after == intents_before + intent_delta
+    assert review["status"] == "resolved"
+    assert review["resolution_revision_id"] == after.current_revision_id
+
+    if resolution == "keep_current":
+        assert result.revision_id == before.current_revision_id
+        assert after.current_revision_id == before.current_revision_id
+    elif resolution == "accept_candidate":
+        assert result.revision_id == conflict["candidate_revision_id"]
+        assert after.current_revision_id == conflict["candidate_revision_id"]
+        assert revision["origin"] == "manual"
+    else:
+        assert result.revision_id == after.current_revision_id
+        assert after.current_revision_id != conflict["candidate_revision_id"]
+        assert revision["origin"] == "merge"
+        assert revision["base_revision_id"] == before.current_revision_id
+
+
+def test_merge_origin_concurrent_candidate_is_rejected_and_superseded(
+    concurrent_conflict_fixture,
+):
+    service, conflict, before = concurrent_conflict_fixture
+    target = service.settings.vault_path / before.page_path
+    file_before = target.read_bytes()
+    with connect_app_write(service.settings) as conn:
+        changed = conn.execute(
+            "UPDATE wiki_page_revisions SET origin='merge' WHERE id=?",
+            (conflict["candidate_revision_id"],),
+        )
+        assert changed.rowcount == 1
+        page_before = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+
+    with pytest.raises(RevisionConflict):
+        service.resolve_conflict(
+            ResolveConflictCommand(
+                review_id=conflict["id"],
+                resolution="keep_current",
+                merged_content=None,
+                expected_current_revision_id=conflict["base_revision_id"],
+                expected_generated_revision_id=before.generated_revision_id,
+                request_id="reject-merge-origin-candidate",
+                actor="alice",
+                note=None,
+            )
+        )
+
+    with service.coordinator.lock_page(page_id=before.page_id) as locked:
+        service._reconcile_pending_reviews_locked(locked.conn, before.page_id)
+
+    with connect_app(service.settings) as conn:
+        page_after = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        review = conn.execute(
+            "SELECT * FROM review_items WHERE id=?",
+            (conflict["id"],),
+        ).fetchone()
+        pending = conn.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE page_id=? AND issue_type='concurrent_write_conflict'
+              AND status='pending'
+            """,
+            (before.page_id,),
+        ).fetchone()[0]
+    assert review["status"] == "superseded"
+    assert review["resolved_at"] is not None
+    assert pending == 0
+    assert page_after["current_revision_id"] == page_before["current_revision_id"]
+    assert page_after["generated_revision_id"] == page_before["generated_revision_id"]
+    assert (
+        page_after["accepted_generated_revision_id"]
+        == page_before["accepted_generated_revision_id"]
+    )
+    assert target.read_bytes() == file_before
