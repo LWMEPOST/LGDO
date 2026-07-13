@@ -1,3 +1,4 @@
+import sqlite3
 import socket
 
 import pytest
@@ -55,6 +56,37 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     assert scan.status_code == 200
     compile_result = client.post("/api/internal/wiki/compile", json={"domain": "product"})
     assert compile_result.status_code == 200
+
+    with sqlite3.connect(sqlite_path) as conn:
+        page_path, source_ids_json = conn.execute(
+            "SELECT path, source_ids_json FROM wiki_pages ORDER BY path DESC LIMIT 1"
+        ).fetchone()
+        page_id = "page_migration_fixture"
+        revision_id = "wrev_migration_fixture"
+        content = (settings.vault_path / page_path).read_text(encoding="utf-8")
+        conn.execute(
+            """
+            UPDATE wiki_pages
+            SET page_id=?, current_revision_id=?, revision_number=1,
+                file_hash='fixture_file_hash', semantic_hash='fixture_semantic_hash'
+            WHERE path=?
+            """,
+            (page_id, revision_id, page_path),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_page_revisions(
+              id,page_id,page_path,revision_number,file_hash,semantic_hash,content,origin,
+              base_revision_id,source_ids_json,actor,note,metadata_json,idempotency_key,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                revision_id, page_id, page_path, 1, "fixture_file_hash", "fixture_semantic_hash",
+                content, "legacy", None, source_ids_json, "migration-test", None, "{}",
+                "migration:test:revision", "t0",
+            ),
+        )
+
     answer_before = client.post(
         "/api/internal/ask",
         json={"question": "管理员怎么导出成员权限清单？", "domain": "product"},
@@ -86,6 +118,11 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
                 "feedback",
                 "knowledge_gaps",
                 "query_logs",
+                "knowledge_projection_jobs",
+                "vault_write_intents",
+                "vault_change_events",
+                "wiki_file_observations",
+                "wiki_page_revisions",
                 "review_items",
                 "wiki_pages",
                 "ingest_reports",
@@ -102,6 +139,16 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     assert result["tables"]["document_chunks"] >= 2
     assert result["tables"]["entity_aliases"] == len(DEFAULT_ENTITY_ALIASES) + 1
     assert result["total_rows"] >= 6
+    assert result["tables"]["wiki_page_revisions"] == 1
+
+    with connect_postgres(settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT revision_number, projection_epoch, lifecycle_status FROM wiki_pages ORDER BY path LIMIT 1"
+        )
+        revision_number, projection_epoch, lifecycle_status = cur.fetchone()
+    assert revision_number == 0
+    assert projection_epoch == 0
+    assert lifecycle_status == "active"
 
     monkeypatch.setattr(settings, "database_backend", "postgres")
     migrated_sources = client.get("/api/internal/sources?domain=product")
