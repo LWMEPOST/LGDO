@@ -21,6 +21,7 @@ from app.wiki_revisions import (
     ResolveConflictCommand,
     RevisionConflict,
     StatusUpdateCommand,
+    WikiRevisionError,
     WikiRevisionService,
     canonical_state_json,
 )
@@ -2504,3 +2505,759 @@ def test_merge_origin_concurrent_candidate_is_rejected_and_superseded(
         == page_before["accepted_generated_revision_id"]
     )
     assert target.read_bytes() == file_before
+
+
+@pytest.fixture
+def page_with_two_conflict_types(page_with_generated):
+    service, before = page_with_generated
+    content_review_id = f"review_{uuid.uuid4().hex}"
+    concurrent_review_id = f"review_{uuid.uuid4().hex}"
+    with service.coordinator.lock_page(page_id=before.page_id) as locked:
+        generated = service._create_revision_locked(
+            locked.conn,
+            locked.page,
+            content=before.raw_bytes + b"\nGenerated conflict candidate.\n",
+            origin="generated",
+            base_revision_id=before.current_revision_id,
+            source_ids=before.metadata["source_ids"],
+            actor="test-compiler",
+            note=None,
+            idempotency_key=f"fixture:generated-conflict:{before.page_id}",
+            metadata=before.metadata,
+        )
+        concurrent = service._create_revision_locked(
+            locked.conn,
+            locked.page,
+            content=before.raw_bytes + b"\nConcurrent conflict candidate.\n",
+            origin="manual",
+            base_revision_id=before.current_revision_id,
+            source_ids=before.metadata["source_ids"],
+            actor="alice",
+            note=None,
+            idempotency_key=f"fixture:concurrent-conflict:{before.page_id}",
+            metadata=before.metadata,
+        )
+        updated = locked.conn.execute(
+            """
+            UPDATE wiki_pages SET generated_revision_id=?,updated_at=?
+            WHERE page_id=? AND generated_revision_id=?
+            """,
+            (
+                generated.id,
+                "2026-07-14T00:00:00+00:00",
+                before.page_id,
+                before.generated_revision_id,
+            ),
+        )
+        assert updated.rowcount == 1
+        locked.page["generated_revision_id"] = generated.id
+        expected_state = service._canonical_state_locked(locked.conn, locked.page)
+        expected_state["pending_conflict"] = sorted(
+            [content_review_id, concurrent_review_id]
+        )
+        expected_state_json = canonical_state_json(expected_state)
+        timestamp = "2026-07-14T00:00:00+00:00"
+        for review_id, issue_type, candidate_revision_id in (
+            (content_review_id, "content_conflict", generated.id),
+            (concurrent_review_id, "concurrent_write_conflict", concurrent.id),
+        ):
+            locked.conn.execute(
+                """
+                INSERT INTO review_items(
+                  id,page_path,page_id,issue_type,status,owner,source_ids_json,
+                  created_at,updated_at,base_revision_id,candidate_revision_id,
+                  expected_state_json
+                ) VALUES (?,?,?,?,'pending',?,?,?,?,?,?,?)
+                """,
+                (
+                    review_id,
+                    before.page_path,
+                    before.page_id,
+                    issue_type,
+                    "alice",
+                    json.dumps(before.metadata["source_ids"]),
+                    timestamp,
+                    timestamp,
+                    before.current_revision_id,
+                    candidate_revision_id,
+                    expected_state_json,
+                ),
+            )
+    page = service.get_page(before.page_path)
+    assert len(service.list_conflicts(page.page_path, status="pending")) == 2
+    return service, page
+
+
+def test_rename_is_audit_only_revision_and_preserves_content_pointer(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    old_absolute = service.settings.vault_path / before.page_path
+    new_path = "wiki/product/faq/demo-renamed.md"
+    new_absolute = service.settings.vault_path / new_path
+    with connect_app(service.settings) as conn:
+        revision_count_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            UPDATE wiki_pages
+            SET rag_visible_revision_id=?,rag_visible_epoch=?
+            WHERE page_id=?
+            """,
+            (before.current_revision_id, before.projection_epoch, before.page_id),
+        )
+    old_absolute.rename(new_absolute)
+
+    result = service.rename_page("rename-1", before.page_path, new_path)
+    with connect_app(service.settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                before.page_path,
+                "page_reused_old_path",
+                "product",
+                "faq",
+                "Replacement",
+                "[]",
+                "draft",
+                "t1",
+                "t1",
+            ),
+        )
+    replay = service.rename_page("rename-1", before.page_path, new_path)
+    after = service.get_page(new_path)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        audit_revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (result.audit_revision_id,),
+        ).fetchone()
+        revisions_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id='rename-1'"
+        ).fetchone()
+        jobs = conn.execute(
+            """
+            SELECT target,operation,revision_id,payload_json
+            FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch=?
+            ORDER BY target
+            """,
+            (before.page_id, after.projection_epoch),
+        ).fetchall()
+
+    assert result.status == "renamed"
+    assert result.revision_id == result.audit_revision_id
+    assert result.audit_revision_id == replay.audit_revision_id
+    assert replay.page_id == result.page_id == before.page_id
+    assert replay.replayed is True
+    assert after.page_id == before.page_id
+    assert after.current_revision_id == before.current_revision_id
+    assert after.generated_revision_id == before.generated_revision_id
+    assert (
+        after.accepted_generated_revision_id
+        == before.accepted_generated_revision_id
+    )
+    assert after.raw_bytes == before.raw_bytes == new_absolute.read_bytes()
+    assert after.projection_epoch == before.projection_epoch + 1
+    assert page["rag_visible_revision_id"] is None
+    assert page["rag_visible_epoch"] is None
+    assert revisions_after == revision_count_before + 1
+    assert audit_revision["origin"] == "rename"
+    assert audit_revision["page_path"] == new_path
+    assert audit_revision["base_revision_id"] == before.current_revision_id
+    assert audit_revision["content"].encode("utf-8") == before.raw_bytes
+    assert audit_revision["revision_number"] == page["revision_number"]
+    assert event["kind"] == "rename"
+    assert event["old_page_path"] == before.page_path
+    assert event["page_path"] == new_path
+    assert event["status"] == "applied"
+    assert event["result_revision_id"] == result.audit_revision_id
+    assert {
+        (job["target"], job["operation"], job["revision_id"])
+        for job in jobs
+    } == {
+        ("rag", "rename", before.current_revision_id),
+        ("gbrain", "rename", before.current_revision_id),
+    }
+    assert {
+        tuple(sorted(json.loads(job["payload_json"]).items())) for job in jobs
+    } == {
+        tuple(sorted({"old_path": before.page_path, "path": new_path}.items()))
+    }
+
+
+def test_rename_supersedes_pending_invalid_frontmatter_review(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    old_target = service.settings.vault_path / before.page_path
+    invalid_bytes = b"---\ntitle: [invalid\n---\n# Broken\n"
+    old_target.write_bytes(invalid_bytes)
+    invalid = service.ingest_external_change(
+        "invalid-before-rename",
+        before.page_path,
+        capture_file_observation(old_target, max_content_bytes=1_000_000),
+    )
+    invalid_page = service.get_page(before.page_path)
+    old_target.write_bytes(invalid_page.raw_bytes)
+    new_path = "wiki/product/faq/invalid-review-renamed.md"
+    old_target.rename(service.settings.vault_path / new_path)
+
+    renamed = service.rename_page(
+        "rename-invalid-review",
+        before.page_path,
+        new_path,
+    )
+    after = service.get_page(new_path)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        review = conn.execute(
+            "SELECT * FROM review_items WHERE id=?",
+            (invalid.conflict_review_id,),
+        ).fetchone()
+        pending = conn.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE page_id=? AND status='pending'
+            """,
+            (before.page_id,),
+        ).fetchone()[0]
+
+    assert invalid.status == "invalid"
+    assert renamed.status == "renamed"
+    assert pending == 0
+    assert review["status"] == "superseded"
+    assert review["resolved_at"] is not None
+    assert review["page_path"] == new_path
+    assert page["path"] == new_path
+    assert page["projection_epoch"] == invalid_page.projection_epoch + 1
+    assert after.projection_epoch == invalid_page.projection_epoch + 1
+    assert after.lifecycle_status == "invalid"
+    assert after.current_revision_id == before.current_revision_id
+
+
+def test_delete_and_restore_same_revision_each_create_new_projection_epoch(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    original = target.read_bytes()
+    with connect_app(service.settings) as conn:
+        revision_count_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+    target.unlink()
+
+    deleted = service.delete_page("delete-1", before.page_path)
+    deleted_replay = service.delete_page("delete-1", before.page_path)
+    with connect_app(service.settings) as conn:
+        deleted_page = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (before.page_id,),
+            ).fetchone()
+        )
+    target.write_bytes(original)
+    observation = capture_file_observation(target, max_content_bytes=1_000_000)
+    restored = service.ingest_external_change(
+        "restore-1",
+        before.page_path,
+        observation,
+    )
+    restored_replay = service.ingest_external_change(
+        "restore-1",
+        before.page_path,
+        observation,
+    )
+    after = service.get_page(before.page_path)
+
+    with connect_app(service.settings) as conn:
+        stored = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        revisions_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        events = conn.execute(
+            """
+            SELECT * FROM vault_change_events
+            WHERE id IN ('delete-1','restore-1') ORDER BY id
+            """
+        ).fetchall()
+        jobs = conn.execute(
+            """
+            SELECT target,operation,revision_id,projection_epoch
+            FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch IN (?,?)
+            ORDER BY projection_epoch,target
+            """,
+            (
+                before.page_id,
+                before.projection_epoch + 1,
+                before.projection_epoch + 2,
+            ),
+        ).fetchall()
+
+    assert deleted.status == "deleted"
+    assert deleted.revision_id == before.current_revision_id
+    assert deleted_replay.replayed is True
+    assert deleted_replay.page_id == before.page_id
+    assert deleted_page["lifecycle_status"] == "deleted"
+    assert deleted_page["deleted_at"] is not None
+    assert deleted_page["observed_file_hash"] is None
+    assert deleted_page["current_revision_id"] == before.current_revision_id
+    assert deleted_page["generated_revision_id"] == before.generated_revision_id
+    assert (
+        deleted_page["accepted_generated_revision_id"]
+        == before.accepted_generated_revision_id
+    )
+    assert deleted_page["projection_epoch"] == before.projection_epoch + 1
+    assert restored.status == "applied"
+    assert restored.revision_id == before.current_revision_id
+    assert restored.write_intent_id is None
+    assert restored_replay.replayed is True
+    assert restored_replay.revision_id == before.current_revision_id
+    assert after.current_revision_id == before.current_revision_id
+    assert after.generated_revision_id == before.generated_revision_id
+    assert (
+        after.accepted_generated_revision_id
+        == before.accepted_generated_revision_id
+    )
+    assert after.raw_bytes == original
+    assert after.lifecycle_status == "active"
+    assert after.sync_error is None
+    assert after.projection_epoch == before.projection_epoch + 2
+    assert stored["deleted_at"] is None
+    assert stored["observed_file_hash"] == observation.file_hash
+    assert revisions_after == revision_count_before
+    assert {event["id"]: event["status"] for event in events} == {
+        "delete-1": "applied",
+        "restore-1": "applied",
+    }
+    assert {event["id"]: event["result_revision_id"] for event in events} == {
+        "delete-1": before.current_revision_id,
+        "restore-1": before.current_revision_id,
+    }
+    assert {
+        (
+            job["projection_epoch"],
+            job["target"],
+            job["operation"],
+            job["revision_id"],
+        )
+        for job in jobs
+    } == {
+        (before.projection_epoch + 1, "rag", "delete", None),
+        (before.projection_epoch + 1, "gbrain", "delete", None),
+        (
+            before.projection_epoch + 2,
+            "rag",
+            "upsert",
+            before.current_revision_id,
+        ),
+        (
+            before.projection_epoch + 2,
+            "gbrain",
+            "upsert",
+            before.current_revision_id,
+        ),
+    }
+
+
+@pytest.mark.parametrize("transition", ["rename", "delete"])
+def test_path_or_lifecycle_change_supersedes_stale_reviews(
+    page_with_two_conflict_types,
+    transition,
+):
+    service, page = page_with_two_conflict_types
+    target = service.settings.vault_path / page.page_path
+    if transition == "rename":
+        new_path = "wiki/product/faq/two-conflicts-renamed.md"
+        target.rename(service.settings.vault_path / new_path)
+        service.rename_page("rename-conflicted", page.page_path, new_path)
+    else:
+        target.unlink()
+        service.delete_page("delete-conflicted", page.page_path)
+
+    with connect_app(service.settings) as conn:
+        pending = conn.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE page_id=? AND status='pending'
+            """,
+            (page.page_id,),
+        ).fetchone()[0]
+        superseded = conn.execute(
+            """
+            SELECT issue_type FROM review_items
+            WHERE page_id=? AND status='superseded'
+            ORDER BY issue_type
+            """,
+            (page.page_id,),
+        ).fetchall()
+
+    assert pending == 0
+    assert [row["issue_type"] for row in superseded] == [
+        "concurrent_write_conflict",
+        "content_conflict",
+    ]
+
+
+def test_ensure_projection_jobs_recreates_only_missing_desired_epoch(
+    page_with_generated,
+):
+    service, page = page_with_generated
+    with connect_app(service.settings) as conn:
+        conn.execute(
+            "DELETE FROM knowledge_projection_jobs WHERE page_id=?",
+            (page.page_id,),
+        )
+        conn.execute(
+            """
+            UPDATE wiki_pages
+            SET rag_visible_revision_id=?,rag_visible_epoch=?
+            WHERE page_id=?
+            """,
+            (page.current_revision_id, page.projection_epoch, page.page_id),
+        )
+
+    first = service.ensure_projection_jobs(page.page_id)
+    replay = service.ensure_projection_jobs(page.page_id)
+    scanned = service.ensure_projection_jobs()
+
+    with connect_app(service.settings) as conn:
+        stored = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()
+        jobs = conn.execute(
+            """
+            SELECT * FROM knowledge_projection_jobs
+            WHERE page_id=? ORDER BY target
+            """,
+            (page.page_id,),
+        ).fetchall()
+
+    assert first == replay
+    assert scanned == first
+    assert len(first) == 2
+    assert {job["id"] for job in jobs} == set(first)
+    assert {(job["target"], job["operation"]) for job in jobs} == {
+        ("rag", "upsert"),
+        ("gbrain", "upsert"),
+    }
+    assert {job["revision_id"] for job in jobs} == {page.current_revision_id}
+    assert {job["projection_epoch"] for job in jobs} == {page.projection_epoch}
+    assert {json.loads(job["payload_json"])["path"] for job in jobs} == {
+        page.page_path
+    }
+    assert stored["rag_visible_revision_id"] == page.current_revision_id
+    assert stored["rag_visible_epoch"] == page.projection_epoch
+
+
+@pytest.mark.parametrize("transition", ["rename", "delete"])
+def test_lifecycle_event_stale_cas_supersedes_losing_occurrence(
+    page_with_generated,
+    monkeypatch,
+    transition,
+):
+    service, before = page_with_generated
+    old_path = before.page_path
+    target = service.settings.vault_path / old_path
+    new_path = "wiki/product/faq/stale-cas-renamed.md"
+    if transition == "rename":
+        target.rename(service.settings.vault_path / new_path)
+    else:
+        target.unlink()
+
+    original_state = service._lifecycle_event_state_locked
+    calls = 0
+
+    def fail_first_transition(conn, page):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated lifecycle transition crash")
+        return original_state(conn, page)
+
+    losing_event_id = f"{transition}-losing-occurrence"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            service,
+            "_lifecycle_event_state_locked",
+            fail_first_transition,
+        )
+        with pytest.raises(RuntimeError, match="lifecycle transition crash"):
+            if transition == "rename":
+                service.rename_page(losing_event_id, old_path, new_path)
+            else:
+                service.delete_page(losing_event_id, old_path)
+
+    winner_event_id = f"{transition}-winning-occurrence"
+    if transition == "rename":
+        service.rename_page(winner_event_id, old_path, new_path)
+        with pytest.raises(RevisionConflict):
+            service.rename_page(losing_event_id, old_path, new_path)
+    else:
+        service.delete_page(winner_event_id, old_path)
+        with pytest.raises(RevisionConflict):
+            service.delete_page(losing_event_id, old_path)
+
+    with connect_app(service.settings) as conn:
+        events = conn.execute(
+            """
+            SELECT id,status FROM vault_change_events
+            WHERE id IN (?,?) ORDER BY id
+            """,
+            (losing_event_id, winner_event_id),
+        ).fetchall()
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+
+    assert {row["id"]: row["status"] for row in events} == {
+        losing_event_id: "superseded",
+        winner_event_id: "applied",
+    }
+    if transition == "rename":
+        assert page["path"] == new_path
+        assert page["lifecycle_status"] == "active"
+    else:
+        assert page["path"] == old_path
+        assert page["lifecycle_status"] == "deleted"
+    assert page["current_revision_id"] == before.current_revision_id
+
+
+def test_pending_rename_loser_supersedes_after_page_moves_again(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    old_path = before.page_path
+    first_path = "wiki/product/faq/rename-winner.md"
+    second_path = "wiki/product/faq/rename-after-winner.md"
+    old_target = service.settings.vault_path / old_path
+    first_target = service.settings.vault_path / first_path
+    second_target = service.settings.vault_path / second_path
+    old_target.rename(first_target)
+
+    original_state = service._lifecycle_event_state_locked
+    calls = 0
+
+    def fail_loser_transition(conn, page):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated pending rename occurrence")
+        return original_state(conn, page)
+
+    loser_event_id = "rename-loser-before-second-move"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            service,
+            "_lifecycle_event_state_locked",
+            fail_loser_transition,
+        )
+        with pytest.raises(RuntimeError, match="pending rename occurrence"):
+            service.rename_page(loser_event_id, old_path, first_path)
+
+    with connect_app(service.settings) as conn:
+        pending = conn.execute(
+            "SELECT status FROM vault_change_events WHERE id=?",
+            (loser_event_id,),
+        ).fetchone()[0]
+    assert pending == "pending"
+
+    service.rename_page("rename-winner-before-second-move", old_path, first_path)
+    first_target.rename(second_target)
+    service.rename_page("rename-page-second-move", first_path, second_path)
+
+    with pytest.raises(WikiRevisionError) as exc_info:
+        service.rename_page(loser_event_id, old_path, first_path)
+
+    with connect_app(service.settings) as conn:
+        loser = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (loser_event_id,),
+        ).fetchone()
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+    assert loser["status"] == "superseded"
+    assert isinstance(exc_info.value, RevisionConflict)
+    assert page["path"] == second_path
+    assert page["current_revision_id"] == before.current_revision_id
+    assert second_target.read_bytes() == before.raw_bytes
+
+
+def test_pending_delete_loser_supersedes_after_winner_restore(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    target.unlink()
+
+    original_state = service._lifecycle_event_state_locked
+    calls = 0
+
+    def fail_loser_transition(conn, page):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated pending delete occurrence")
+        return original_state(conn, page)
+
+    loser_event_id = "delete-loser-before-restore"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            service,
+            "_lifecycle_event_state_locked",
+            fail_loser_transition,
+        )
+        with pytest.raises(RuntimeError, match="pending delete occurrence"):
+            service.delete_page(loser_event_id, before.page_path)
+
+    with connect_app(service.settings) as conn:
+        pending = conn.execute(
+            "SELECT status FROM vault_change_events WHERE id=?",
+            (loser_event_id,),
+        ).fetchone()[0]
+    assert pending == "pending"
+
+    service.delete_page("delete-winner-before-restore", before.page_path)
+    target.write_bytes(before.raw_bytes)
+    service.ingest_external_change(
+        "restore-after-delete-winner",
+        before.page_path,
+        capture_file_observation(target, max_content_bytes=1_000_000),
+    )
+
+    with pytest.raises(RevisionConflict):
+        service.delete_page(loser_event_id, before.page_path)
+
+    with connect_app(service.settings) as conn:
+        loser = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (loser_event_id,),
+        ).fetchone()
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+    assert loser["status"] == "superseded"
+    assert page["lifecycle_status"] == "active"
+    assert page["current_revision_id"] == before.current_revision_id
+    assert target.read_bytes() == before.raw_bytes
+
+
+@pytest.mark.parametrize("lifecycle", ["deleted", "invalid"])
+def test_ensure_projection_jobs_rebuilds_desired_delete_without_old_epoch(
+    page_with_generated,
+    lifecycle,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    if lifecycle == "deleted":
+        target.unlink()
+        service.delete_page("delete-before-ensure", before.page_path)
+    else:
+        target.write_bytes(b"---\ntitle: [invalid\n---\n# Broken\n")
+        service.ingest_external_change(
+            "invalid-before-ensure",
+            before.page_path,
+            capture_file_observation(target, max_content_bytes=1_000_000),
+        )
+
+    with connect_app(service.settings) as conn:
+        page_before = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (before.page_id,),
+            ).fetchone()
+        )
+        old_jobs_before = conn.execute(
+            """
+            SELECT id,status FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch<? ORDER BY id
+            """,
+            (before.page_id, page_before["projection_epoch"]),
+        ).fetchall()
+        conn.execute(
+            """
+            DELETE FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch=?
+            """,
+            (before.page_id, page_before["projection_epoch"]),
+        )
+
+    first = service.ensure_projection_jobs(before.page_id)
+    replay = service.ensure_projection_jobs(before.page_id)
+
+    with connect_app(service.settings) as conn:
+        page_after = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        current_jobs = conn.execute(
+            """
+            SELECT * FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch=? ORDER BY target
+            """,
+            (before.page_id, page_after["projection_epoch"]),
+        ).fetchall()
+        old_jobs_after = conn.execute(
+            """
+            SELECT id,status FROM knowledge_projection_jobs
+            WHERE page_id=? AND projection_epoch<? ORDER BY id
+            """,
+            (before.page_id, page_after["projection_epoch"]),
+        ).fetchall()
+
+    assert first == replay
+    assert len(first) == 2
+    assert {job["id"] for job in current_jobs} == set(first)
+    assert {(job["target"], job["operation"]) for job in current_jobs} == {
+        ("rag", "delete"),
+        ("gbrain", "delete"),
+    }
+    assert {job["revision_id"] for job in current_jobs} == {None}
+    assert [tuple(row) for row in old_jobs_after] == [
+        tuple(row) for row in old_jobs_before
+    ]
+    assert all(
+        row["status"] not in {"pending", "failed", "running"}
+        for row in old_jobs_after
+    )
+    assert page_after["projection_epoch"] == page_before["projection_epoch"]
+    assert (
+        page_after["rag_visible_revision_id"],
+        page_after["rag_visible_epoch"],
+    ) == (
+        page_before["rag_visible_revision_id"],
+        page_before["rag_visible_epoch"],
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -420,7 +421,7 @@ class WikiRevisionService:
             raise WikiRevisionError(f"page has no current revision: {page_path}")
         if (
             page["pending_write_intent_id"] is not None
-            or page["lifecycle_status"] == "invalid"
+            or page["lifecycle_status"] != "active"
         ):
             with connect_app(self.settings) as conn:
                 revision = conn.execute(
@@ -519,6 +520,883 @@ class WikiRevisionService:
                 pending_intent_id=intent_id,
             )
         return self.get_page(page_path)
+
+    def _lifecycle_event_state_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = self._canonical_state_locked(conn, page)
+        state["page_id"] = page["page_id"]
+        state["projection_epoch"] = int(page.get("projection_epoch") or 0)
+        return state
+
+    @staticmethod
+    def _decoded_event_state(event: dict[str, Any]) -> dict[str, Any]:
+        try:
+            state = json.loads(event.get("expected_state_json") or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RevisionConflict(
+                "lifecycle event has no valid expected state",
+                current_revision_id=event.get("result_revision_id"),
+            ) from exc
+        if not isinstance(state, dict) or not isinstance(state.get("page_id"), str):
+            raise RevisionConflict(
+                "lifecycle event has no stable page identity",
+                current_revision_id=event.get("result_revision_id"),
+            )
+        return state
+
+    @staticmethod
+    def _validate_lifecycle_event_identity(
+        event: dict[str, Any],
+        *,
+        event_id: str,
+        kind: str,
+        page_path: str,
+        old_page_path: str | None,
+    ) -> None:
+        if (
+            event.get("id") != event_id
+            or event.get("kind") != kind
+            or event.get("page_path") != page_path
+            or event.get("old_page_path") != old_page_path
+            or event.get("observation_id") is not None
+        ):
+            raise RevisionConflict(
+                "lifecycle event identity changed",
+                current_revision_id=event.get("result_revision_id"),
+            )
+
+    def _replay_lifecycle_event(
+        self,
+        event: dict[str, Any],
+        *,
+        kind: Literal["rename", "delete"],
+    ) -> MutationResult:
+        state = self._decoded_event_state(event)
+        if event.get("status") != "applied":
+            raise RevisionConflict(
+                "lifecycle event has no replayable result",
+                current_revision_id=event.get("result_revision_id")
+                or state.get("current"),
+            )
+        page_id = state["page_id"]
+        result_revision_id = event.get("result_revision_id")
+        with connect_app(self.settings) as conn:
+            page = conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (page_id,),
+            ).fetchone()
+            if page is None:
+                raise PageNotFound(page_id)
+            revision = None
+            if result_revision_id is not None:
+                revision = conn.execute(
+                    "SELECT * FROM wiki_page_revisions WHERE id=?",
+                    (result_revision_id,),
+                ).fetchone()
+                if revision is None or revision["page_id"] != page_id:
+                    raise RevisionConflict(
+                        "lifecycle event result belongs to another page",
+                        current_revision_id=state.get("current"),
+                    )
+            if kind == "rename":
+                try:
+                    metadata = json.loads(revision["metadata_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    metadata = None
+                if (
+                    revision is None
+                    or revision["origin"] != "rename"
+                    or revision["page_path"] != event["page_path"]
+                    or revision["base_revision_id"] != state.get("current")
+                    or not isinstance(metadata, dict)
+                    or metadata.get("vault_change_event_id") != event["id"]
+                    or metadata.get("old_page_path") != event["old_page_path"]
+                    or metadata.get("page_path") != event["page_path"]
+                ):
+                    raise RevisionConflict(
+                        "rename event audit revision does not match",
+                        current_revision_id=state.get("current"),
+                    )
+            elif result_revision_id != state.get("current"):
+                raise RevisionConflict(
+                    "delete event result does not match expected current revision",
+                    current_revision_id=state.get("current"),
+                )
+            result_epoch = int(state.get("projection_epoch") or 0) + 1
+            jobs = conn.execute(
+                """
+                SELECT id FROM knowledge_projection_jobs
+                WHERE page_id=? AND projection_epoch=? AND operation=?
+                ORDER BY target
+                """,
+                (page_id, result_epoch, kind),
+            ).fetchall()
+        return MutationResult(
+            page_id=page_id,
+            page_path=event["page_path"],
+            status="renamed" if kind == "rename" else "deleted",
+            revision_id=result_revision_id,
+            current_revision_id=state.get("current"),
+            generated_revision_id=state.get("generated"),
+            audit_revision_id=result_revision_id if kind == "rename" else None,
+            projection_job_ids=tuple(str(row["id"]) for row in jobs),
+            replayed=True,
+        )
+
+    def _existing_lifecycle_event(
+        self,
+        event_id: str,
+        *,
+        kind: Literal["rename", "delete"],
+        page_path: str,
+        old_page_path: str | None,
+    ) -> dict[str, Any] | None:
+        with connect_app(self.settings) as conn:
+            row = conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        event = dict(row)
+        self._validate_lifecycle_event_identity(
+            event,
+            event_id=event_id,
+            kind=kind,
+            page_path=page_path,
+            old_page_path=old_page_path,
+        )
+        return event
+
+    def _persist_lifecycle_occurrence(
+        self,
+        event_id: str,
+        *,
+        kind: Literal["rename", "delete"],
+        page_path: str,
+        old_page_path: str | None,
+        stable_page_id: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        lookup_path = old_page_path if kind == "rename" else page_path
+        timestamp = now_iso()
+        suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+        with connect_app_write(self.settings) as conn:
+            existing = conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                event = dict(existing)
+                self._validate_lifecycle_event_identity(
+                    event,
+                    event_id=event_id,
+                    kind=kind,
+                    page_path=page_path,
+                    old_page_path=old_page_path,
+                )
+                return event, False
+
+            if stable_page_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM wiki_pages WHERE page_id=?" + suffix,
+                    (stable_page_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM wiki_pages WHERE path=?" + suffix,
+                    (lookup_path,),
+                ).fetchone()
+            if row is None or row["page_id"] is None:
+                raise PageNotFound(str(lookup_path or stable_page_id))
+            page = dict(row)
+            if page["path"] != lookup_path:
+                raise RevisionConflict(
+                    "lifecycle event page path does not match stable identity",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            if stable_page_id is not None and page["page_id"] != stable_page_id:
+                raise RevisionConflict(
+                    "lifecycle event managed page identity changed",
+                    current_revision_id=page.get("current_revision_id"),
+                )
+            if page.get("pending_write_intent_id") is not None:
+                raise RevisionConflict(
+                    "page already has a pending write",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            if kind == "rename":
+                occupied = conn.execute(
+                    "SELECT page_id FROM wiki_pages WHERE path=?" + suffix,
+                    (page_path,),
+                ).fetchone()
+                if occupied is not None and occupied["page_id"] != page["page_id"]:
+                    raise RevisionConflict(
+                        "rename target path already belongs to another page",
+                        current_revision_id=page.get("current_revision_id"),
+                    )
+            expected_state_json = canonical_state_json(
+                self._lifecycle_event_state_locked(conn, page)
+            )
+            inserted = conn.execute(
+                """
+                INSERT INTO vault_change_events(
+                  id,kind,page_path,old_page_path,observation_id,
+                  expected_state_json,status,detected_at,updated_at
+                ) VALUES (?,?,?,?,NULL,?,'pending',?,?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    event_id,
+                    kind,
+                    page_path,
+                    old_page_path,
+                    expected_state_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            stored = conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            if stored is None:
+                raise WikiRevisionError(
+                    f"lifecycle event insert did not produce a row: {event_id}"
+                )
+            event = dict(stored)
+            self._validate_lifecycle_event_identity(
+                event,
+                event_id=event_id,
+                kind=kind,
+                page_path=page_path,
+                old_page_path=old_page_path,
+            )
+            return event, inserted.rowcount == 1
+
+    @staticmethod
+    def _managed_page_id(raw_bytes: bytes) -> str | None:
+        document = parse_wiki_bytes(raw_bytes)
+        value = document.frontmatter.get("lgdo_page_id") or document.frontmatter.get(
+            "id"
+        )
+        return str(value) if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _is_unique_path_error(exc: Exception) -> bool:
+        if isinstance(exc, sqlite3.IntegrityError):
+            return "unique" in str(exc).lower() and "wiki_pages.path" in str(exc)
+        return getattr(exc, "sqlstate", None) == "23505"
+
+    def rename_page(
+        self,
+        event_id: str,
+        old_path: str,
+        new_path: str,
+    ) -> MutationResult:
+        self._target(old_path)
+        new_target = self._target(new_path)
+        if old_path == new_path:
+            raise RevisionConflict(
+                "rename target must differ from the old path",
+                current_revision_id=None,
+            )
+        event = self._existing_lifecycle_event(
+            event_id,
+            kind="rename",
+            page_path=new_path,
+            old_page_path=old_path,
+        )
+        if event is not None and event["status"] == "applied":
+            return self._replay_lifecycle_event(event, kind="rename")
+
+        def read_renamed_file() -> tuple[bytes, str]:
+            try:
+                content = new_target.read_bytes()
+            except OSError as exc:
+                raise PageNotFound(new_path) from exc
+            try:
+                page_id = self._managed_page_id(content)
+            except MarkdownParseError as exc:
+                raise RevisionConflict(
+                    "renamed file has invalid managed identity",
+                    current_revision_id=None,
+                ) from exc
+            if page_id is None:
+                raise RevisionConflict(
+                    "renamed file has no managed page identity",
+                    current_revision_id=None,
+                )
+            return content, page_id
+
+        renamed_file: tuple[bytes, str] | None = None
+        if event is None:
+            renamed_file = read_renamed_file()
+            event, _ = self._persist_lifecycle_occurrence(
+                event_id,
+                kind="rename",
+                page_path=new_path,
+                old_page_path=old_path,
+                stable_page_id=renamed_file[1],
+            )
+        state = self._decoded_event_state(event)
+
+        pending_conflict: RevisionConflict | None = None
+        replay_event: dict[str, Any] | None = None
+        result: MutationResult | None = None
+        try:
+            with self.coordinator.lock_page(page_id=state["page_id"]) as locked:
+                stored_row = locked.conn.execute(
+                    "SELECT * FROM vault_change_events WHERE id=?",
+                    (event_id,),
+                ).fetchone()
+                if stored_row is None:
+                    raise WikiRevisionError(f"rename event disappeared: {event_id}")
+                stored = dict(stored_row)
+                self._validate_lifecycle_event_identity(
+                    stored,
+                    event_id=event_id,
+                    kind="rename",
+                    page_path=new_path,
+                    old_page_path=old_path,
+                )
+                if stored["status"] == "applied":
+                    replay_event = stored
+                elif stored["status"] != "pending":
+                    pending_conflict = RevisionConflict(
+                        "rename event is no longer pending",
+                        current_revision_id=stored.get("result_revision_id")
+                        or locked.page.get("current_revision_id"),
+                    )
+                else:
+                    current_state_json = canonical_state_json(
+                        self._lifecycle_event_state_locked(locked.conn, locked.page)
+                    )
+                    if current_state_json != stored["expected_state_json"]:
+                        superseded = locked.conn.execute(
+                            """
+                            UPDATE vault_change_events
+                            SET status='superseded',updated_at=?
+                            WHERE id=? AND status='pending'
+                            """,
+                            (now_iso(), event_id),
+                        )
+                        if superseded.rowcount != 1:
+                            raise WikiRevisionError(
+                                "rename event stale-state CAS failed"
+                            )
+                        pending_conflict = RevisionConflict(
+                            "rename event expected state changed",
+                            current_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            pending_intent_id=locked.page.get(
+                                "pending_write_intent_id"
+                            ),
+                        )
+                    elif locked.page.get("pending_write_intent_id") is not None:
+                        pending_conflict = RevisionConflict(
+                            "page already has a pending write",
+                            current_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            pending_intent_id=locked.page.get(
+                                "pending_write_intent_id"
+                            ),
+                        )
+                    elif locked.page["path"] != old_path:
+                        pending_conflict = RevisionConflict(
+                            "rename source path changed",
+                            current_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                        )
+                    else:
+                        if renamed_file is None:
+                            renamed_file = read_renamed_file()
+                        renamed_bytes, managed_page_id = renamed_file
+                        if managed_page_id != state["page_id"]:
+                            raise RevisionConflict(
+                                "renamed file identity does not match lifecycle event",
+                                current_revision_id=state.get("current"),
+                            )
+                        current = locked.conn.execute(
+                            "SELECT * FROM wiki_page_revisions WHERE id=?",
+                            (locked.page.get("current_revision_id"),),
+                        ).fetchone()
+                        if current is None:
+                            raise WikiRevisionError(
+                                "rename page has no current revision"
+                            )
+                        current_bytes = current["content"].encode("utf-8")
+                        if renamed_bytes != current_bytes:
+                            pending_conflict = RevisionConflict(
+                                "renamed file bytes differ from current revision",
+                                current_revision_id=locked.page.get(
+                                    "current_revision_id"
+                                ),
+                            )
+                        else:
+                            occupied = locked.conn.execute(
+                                "SELECT page_id FROM wiki_pages WHERE path=?",
+                                (new_path,),
+                            ).fetchone()
+                            if (
+                                occupied is not None
+                                and occupied["page_id"] != locked.page["page_id"]
+                            ):
+                                pending_conflict = RevisionConflict(
+                                    "rename target path already belongs to another page",
+                                    current_revision_id=locked.page.get(
+                                        "current_revision_id"
+                                    ),
+                                )
+                            else:
+                                previous_epoch = int(
+                                    locked.page.get("projection_epoch") or 0
+                                )
+                                next_epoch = previous_epoch + 1
+                                transitioned = locked.conn.execute(
+                                    """
+                                    UPDATE wiki_pages
+                                    SET path=?,projection_epoch=?,
+                                        rag_visible_revision_id=NULL,
+                                        rag_visible_epoch=NULL,updated_at=?
+                                    WHERE page_id=? AND path=?
+                                      AND current_revision_id=?
+                                      AND projection_epoch=?
+                                      AND pending_write_intent_id IS NULL
+                                      AND NOT EXISTS (
+                                        SELECT 1 FROM wiki_pages AS occupied
+                                        WHERE occupied.path=?
+                                          AND occupied.page_id<>?
+                                      )
+                                    """,
+                                    (
+                                        new_path,
+                                        next_epoch,
+                                        now_iso(),
+                                        locked.page["page_id"],
+                                        old_path,
+                                        locked.page["current_revision_id"],
+                                        previous_epoch,
+                                        new_path,
+                                        locked.page["page_id"],
+                                    ),
+                                )
+                                if transitioned.rowcount != 1:
+                                    raise RevisionConflict(
+                                        "page changed during rename transition",
+                                        current_revision_id=locked.page.get(
+                                            "current_revision_id"
+                                        ),
+                                        pending_intent_id=locked.page.get(
+                                            "pending_write_intent_id"
+                                        ),
+                                    )
+                                locked.page.update(
+                                    path=new_path,
+                                    projection_epoch=next_epoch,
+                                    rag_visible_revision_id=None,
+                                    rag_visible_epoch=None,
+                                )
+                                state_digest = hashlib.sha256(
+                                    stored["expected_state_json"].encode("utf-8")
+                                ).hexdigest()
+                                audit_revision = self._create_revision_locked(
+                                    locked.conn,
+                                    locked.page,
+                                    content=current_bytes,
+                                    origin="rename",
+                                    base_revision_id=locked.page[
+                                        "current_revision_id"
+                                    ],
+                                    source_ids=json.loads(
+                                        current["source_ids_json"] or "[]"
+                                    ),
+                                    actor="vault-observer",
+                                    note=None,
+                                    idempotency_key=(
+                                        f"rename:{event_id}:"
+                                        f"{locked.page['page_id']}:{state_digest}"
+                                    ),
+                                    metadata={
+                                        "vault_change_event_id": event_id,
+                                        "old_page_path": old_path,
+                                        "page_path": new_path,
+                                        "projection_epoch": next_epoch,
+                                    },
+                                )
+                                locked.conn.execute(
+                                    "UPDATE review_items SET page_path=? WHERE page_id=?",
+                                    (new_path, locked.page["page_id"]),
+                                )
+                                self._reconcile_pending_reviews_locked(
+                                    locked.conn,
+                                    locked.page["page_id"],
+                                    allow_conflicts=False,
+                                )
+                                review_timestamp = now_iso()
+                                locked.conn.execute(
+                                    """
+                                    UPDATE review_items
+                                    SET status='superseded',resolved_at=?,updated_at=?
+                                    WHERE page_id=? AND status='pending'
+                                    """,
+                                    (
+                                        review_timestamp,
+                                        review_timestamp,
+                                        locked.page["page_id"],
+                                    ),
+                                )
+                                self.outbox.supersede_stale(
+                                    locked.conn,
+                                    locked.page["page_id"],
+                                    next_epoch,
+                                )
+                                jobs = self.outbox.enqueue_pair_for_state(
+                                    locked.conn,
+                                    locked.page,
+                                    "rename",
+                                    {"old_path": old_path, "path": new_path},
+                                )
+                                applied = locked.conn.execute(
+                                    """
+                                    UPDATE vault_change_events
+                                    SET status='applied',result_revision_id=?,updated_at=?
+                                    WHERE id=? AND kind='rename' AND status='pending'
+                                      AND old_page_path=? AND page_path=?
+                                    """,
+                                    (
+                                        audit_revision.id,
+                                        now_iso(),
+                                        event_id,
+                                        old_path,
+                                        new_path,
+                                    ),
+                                )
+                                if applied.rowcount != 1:
+                                    raise WikiRevisionError(
+                                        "rename event status CAS failed"
+                                    )
+                                audit(
+                                    locked.conn,
+                                    "wiki_page_renamed",
+                                    {
+                                        "event_id": event_id,
+                                        "page_id": locked.page["page_id"],
+                                        "old_path": old_path,
+                                        "path": new_path,
+                                        "audit_revision_id": audit_revision.id,
+                                    },
+                                    now_iso(),
+                                )
+                                result = MutationResult(
+                                    page_id=locked.page["page_id"],
+                                    page_path=new_path,
+                                    status="renamed",
+                                    revision_id=audit_revision.id,
+                                    current_revision_id=locked.page[
+                                        "current_revision_id"
+                                    ],
+                                    generated_revision_id=locked.page.get(
+                                        "generated_revision_id"
+                                    ),
+                                    audit_revision_id=audit_revision.id,
+                                    projection_job_ids=tuple(jobs),
+                                )
+        except Exception as exc:
+            if self._is_unique_path_error(exc):
+                raise RevisionConflict(
+                    "rename target path already belongs to another page",
+                    current_revision_id=state.get("current"),
+                ) from exc
+            raise
+        if replay_event is not None:
+            return self._replay_lifecycle_event(replay_event, kind="rename")
+        if pending_conflict is not None:
+            raise pending_conflict
+        if result is None:
+            raise WikiRevisionError("rename event did not produce a result")
+        return result
+
+    def delete_page(self, event_id: str, page_path: str) -> MutationResult:
+        target = self._target(page_path)
+        event = self._existing_lifecycle_event(
+            event_id,
+            kind="delete",
+            page_path=page_path,
+            old_page_path=None,
+        )
+        if event is not None and event["status"] == "applied":
+            return self._replay_lifecycle_event(event, kind="delete")
+        if event is None:
+            if target.exists():
+                raise RevisionConflict(
+                    "delete event observed a file that still exists",
+                    current_revision_id=None,
+                )
+            event, _ = self._persist_lifecycle_occurrence(
+                event_id,
+                kind="delete",
+                page_path=page_path,
+                old_page_path=None,
+                stable_page_id=None,
+            )
+        state = self._decoded_event_state(event)
+        pending_conflict: RevisionConflict | None = None
+        replay_event: dict[str, Any] | None = None
+        result: MutationResult | None = None
+        with self.coordinator.lock_page(page_id=state["page_id"]) as locked:
+            stored_row = locked.conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            if stored_row is None:
+                raise WikiRevisionError(f"delete event disappeared: {event_id}")
+            stored = dict(stored_row)
+            self._validate_lifecycle_event_identity(
+                stored,
+                event_id=event_id,
+                kind="delete",
+                page_path=page_path,
+                old_page_path=None,
+            )
+            if stored["status"] == "applied":
+                replay_event = stored
+            elif stored["status"] != "pending":
+                pending_conflict = RevisionConflict(
+                    "delete event is no longer pending",
+                    current_revision_id=stored.get("result_revision_id")
+                    or locked.page.get("current_revision_id"),
+                )
+            else:
+                current_state_json = canonical_state_json(
+                    self._lifecycle_event_state_locked(locked.conn, locked.page)
+                )
+                if current_state_json != stored["expected_state_json"]:
+                    superseded = locked.conn.execute(
+                        """
+                        UPDATE vault_change_events
+                        SET status='superseded',updated_at=?
+                        WHERE id=? AND status='pending'
+                        """,
+                        (now_iso(), event_id),
+                    )
+                    if superseded.rowcount != 1:
+                        raise WikiRevisionError("delete event stale-state CAS failed")
+                    pending_conflict = RevisionConflict(
+                        "delete event expected state changed",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                elif locked.page.get("pending_write_intent_id") is not None:
+                    pending_conflict = RevisionConflict(
+                        "page already has a pending write",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                elif locked.page["path"] != page_path:
+                    pending_conflict = RevisionConflict(
+                        "delete page path changed",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                    )
+                elif target.exists():
+                    pending_conflict = RevisionConflict(
+                        "delete event observed a file that still exists",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                    )
+                elif locked.page.get("lifecycle_status") == "deleted":
+                    pending_conflict = RevisionConflict(
+                        "page is already deleted by another event",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                    )
+                else:
+                    previous_epoch = int(locked.page.get("projection_epoch") or 0)
+                    next_epoch = previous_epoch + 1
+                    timestamp = now_iso()
+                    transitioned = locked.conn.execute(
+                        """
+                        UPDATE wiki_pages
+                        SET lifecycle_status='deleted',deleted_at=?,sync_error=NULL,
+                            observed_file_hash=NULL,projection_epoch=?,
+                            rag_visible_revision_id=NULL,rag_visible_epoch=NULL,
+                            updated_at=?
+                        WHERE page_id=? AND path=? AND projection_epoch=?
+                          AND current_revision_id=?
+                          AND pending_write_intent_id IS NULL
+                        """,
+                        (
+                            timestamp,
+                            next_epoch,
+                            timestamp,
+                            locked.page["page_id"],
+                            page_path,
+                            previous_epoch,
+                            locked.page.get("current_revision_id"),
+                        ),
+                    )
+                    if transitioned.rowcount != 1:
+                        raise RevisionConflict(
+                            "page changed during delete transition",
+                            current_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            pending_intent_id=locked.page.get(
+                                "pending_write_intent_id"
+                            ),
+                        )
+                    locked.page.update(
+                        lifecycle_status="deleted",
+                        deleted_at=timestamp,
+                        sync_error=None,
+                        observed_file_hash=None,
+                        projection_epoch=next_epoch,
+                        rag_visible_revision_id=None,
+                        rag_visible_epoch=None,
+                    )
+                    self._reconcile_pending_reviews_locked(
+                        locked.conn,
+                        locked.page["page_id"],
+                        allow_conflicts=False,
+                    )
+                    locked.conn.execute(
+                        """
+                        UPDATE review_items
+                        SET status='superseded',resolved_at=?,updated_at=?
+                        WHERE page_id=? AND issue_type='invalid_frontmatter'
+                          AND status='pending'
+                        """,
+                        (timestamp, timestamp, locked.page["page_id"]),
+                    )
+                    self.outbox.supersede_stale(
+                        locked.conn,
+                        locked.page["page_id"],
+                        next_epoch,
+                    )
+                    jobs = self.outbox.enqueue_pair_for_state(
+                        locked.conn,
+                        {**locked.page, "current_revision_id": None},
+                        "delete",
+                        {"path": page_path, "reason": "deleted"},
+                    )
+                    applied = locked.conn.execute(
+                        """
+                        UPDATE vault_change_events
+                        SET status='applied',result_revision_id=?,updated_at=?
+                        WHERE id=? AND kind='delete' AND status='pending'
+                          AND page_path=? AND old_page_path IS NULL
+                        """,
+                        (
+                            locked.page.get("current_revision_id"),
+                            timestamp,
+                            event_id,
+                            page_path,
+                        ),
+                    )
+                    if applied.rowcount != 1:
+                        raise WikiRevisionError("delete event status CAS failed")
+                    audit(
+                        locked.conn,
+                        "wiki_page_deleted",
+                        {
+                            "event_id": event_id,
+                            "page_id": locked.page["page_id"],
+                            "path": page_path,
+                            "current_revision_id": locked.page.get(
+                                "current_revision_id"
+                            ),
+                        },
+                        timestamp,
+                    )
+                    result = MutationResult(
+                        page_id=locked.page["page_id"],
+                        page_path=page_path,
+                        status="deleted",
+                        revision_id=locked.page.get("current_revision_id"),
+                        current_revision_id=locked.page.get(
+                            "current_revision_id"
+                        ),
+                        generated_revision_id=locked.page.get(
+                            "generated_revision_id"
+                        ),
+                        projection_job_ids=tuple(jobs),
+                    )
+        if replay_event is not None:
+            return self._replay_lifecycle_event(replay_event, kind="delete")
+        if pending_conflict is not None:
+            raise pending_conflict
+        if result is None:
+            raise WikiRevisionError("delete event did not produce a result")
+        return result
+
+    def ensure_projection_jobs(self, page_id: str | None = None) -> list[str]:
+        with connect_app(self.settings) as conn:
+            if page_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT page_id FROM wiki_pages
+                    WHERE page_id IS NOT NULL ORDER BY page_id
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT page_id FROM wiki_pages WHERE page_id=?",
+                    (page_id,),
+                ).fetchall()
+        page_ids = [str(row["page_id"]) for row in rows]
+        if page_id is not None and not page_ids:
+            raise PageNotFound(page_id)
+
+        job_ids: list[str] = []
+        for stable_page_id in page_ids:
+            with self.coordinator.lock_page(page_id=stable_page_id) as locked:
+                lifecycle = locked.page.get("lifecycle_status")
+                current_revision_id = locked.page.get("current_revision_id")
+                operation: str | None
+                payload: dict[str, Any]
+                projection_page = locked.page
+                if lifecycle == "active" and current_revision_id is not None:
+                    operation = "upsert"
+                    payload = {"path": locked.page["path"]}
+                elif lifecycle in {"deleted", "invalid"}:
+                    operation = "delete"
+                    payload = {
+                        "path": locked.page["path"],
+                        "reason": locked.page.get("sync_error") or lifecycle,
+                    }
+                    projection_page = {
+                        **locked.page,
+                        "current_revision_id": None,
+                    }
+                else:
+                    operation = None
+                    payload = {}
+                if operation is None:
+                    continue
+                epoch = int(locked.page.get("projection_epoch") or 0)
+                self.outbox.supersede_stale(
+                    locked.conn,
+                    stable_page_id,
+                    epoch,
+                )
+                job_ids.extend(
+                    self.outbox.enqueue_pair_for_state(
+                        locked.conn,
+                        projection_page,
+                        operation,
+                        payload,
+                    )
+                )
+        return job_ids
 
     @staticmethod
     def _observation_matches_input(
@@ -736,13 +1614,6 @@ class WikiRevisionService:
                     )
             intent = None
             if event["status"] == "applied":
-                intent = conn.execute(
-                    """
-                    SELECT * FROM vault_write_intents
-                    WHERE revision_id=? ORDER BY created_at,id LIMIT 1
-                    """,
-                    (event["result_revision_id"],),
-                ).fetchone()
                 try:
                     metadata = (
                         json.loads(revision["metadata_json"] or "{}")
@@ -755,33 +1626,62 @@ class WikiRevisionService:
                     f"external:{event['id']}:"
                     f"{hashlib.sha256(event['expected_state_json'].encode('utf-8')).hexdigest()}"
                 )
-                if (
-                    revision is None
-                    or stored_observation is None
-                    or intent is None
-                    or not isinstance(metadata, dict)
-                    or revision["page_id"] != stable_page_id
-                    or revision["page_path"] != event["page_path"]
-                    or revision["origin"] != "external"
-                    or revision["base_revision_id"] != expected_state["current"]
-                    or revision["idempotency_key"] != expected_key
-                    or metadata.get("vault_change_event_id") != event["id"]
-                    or metadata.get("observation_id") != event["observation_id"]
-                    or metadata.get("observed_file_hash")
-                    != stored_observation["file_hash"]
-                    or intent["page_id"] != stable_page_id
-                    or intent["revision_id"] != revision["id"]
-                    or intent["expected_revision_id"] != expected_state["current"]
-                    or intent["expected_file_hash"]
-                    != stored_observation["file_hash"]
-                    or intent["target_path"] != event["page_path"]
-                    or intent["status"] != "applied"
-                ):
-                    raise RevisionConflict(
-                        "applied external event does not match its revision intent",
-                        current_revision_id=page.get("current_revision_id"),
-                        pending_intent_id=page.get("pending_write_intent_id"),
-                    )
+                is_external_successor = (
+                    revision is not None
+                    and revision["origin"] == "external"
+                    and isinstance(metadata, dict)
+                    and metadata.get("vault_change_event_id") == event["id"]
+                )
+                if is_external_successor:
+                    intent = conn.execute(
+                        """
+                        SELECT * FROM vault_write_intents
+                        WHERE revision_id=? ORDER BY created_at,id LIMIT 1
+                        """,
+                        (event["result_revision_id"],),
+                    ).fetchone()
+                    if (
+                        stored_observation is None
+                        or intent is None
+                        or revision["page_id"] != stable_page_id
+                        or revision["page_path"] != event["page_path"]
+                        or revision["base_revision_id"] != expected_state["current"]
+                        or revision["idempotency_key"] != expected_key
+                        or metadata.get("observation_id")
+                        != event["observation_id"]
+                        or metadata.get("observed_file_hash")
+                        != stored_observation["file_hash"]
+                        or intent["page_id"] != stable_page_id
+                        or intent["revision_id"] != revision["id"]
+                        or intent["expected_revision_id"]
+                        != expected_state["current"]
+                        or intent["expected_file_hash"]
+                        != stored_observation["file_hash"]
+                        or intent["target_path"] != event["page_path"]
+                        or intent["status"] != "applied"
+                    ):
+                        raise RevisionConflict(
+                            "applied external event does not match its revision intent",
+                            current_revision_id=page.get("current_revision_id"),
+                            pending_intent_id=page.get("pending_write_intent_id"),
+                        )
+                else:
+                    observed_content = stored_observation["content_bytes"]
+                    if (
+                        revision is None
+                        or event["result_revision_id"] != expected_state["current"]
+                        or stored_observation["parse_status"] != "valid"
+                        or observed_content is None
+                        or bytes(observed_content)
+                        != revision["content"].encode("utf-8")
+                        or stored_observation["file_hash"]
+                        != revision["file_hash"]
+                    ):
+                        raise RevisionConflict(
+                            "applied external event does not match reused current bytes",
+                            current_revision_id=page.get("current_revision_id"),
+                            pending_intent_id=page.get("pending_write_intent_id"),
+                        )
             review = None
             if event["status"] == "invalid":
                 review = conn.execute(
@@ -918,7 +1818,7 @@ class WikiRevisionService:
         invalidated = locked.conn.execute(
             f"""
             UPDATE wiki_pages
-            SET lifecycle_status='invalid',sync_error=?,observed_file_hash=?,
+            SET lifecycle_status='invalid',deleted_at=NULL,sync_error=?,observed_file_hash=?,
                 projection_epoch=?,rag_visible_revision_id=NULL,rag_visible_epoch=NULL,
                 updated_at=?
             WHERE page_id=? AND current_revision_id=? AND projection_epoch=?
@@ -939,6 +1839,12 @@ class WikiRevisionService:
             projection_epoch=next_epoch,
             rag_visible_revision_id=None,
             rag_visible_epoch=None,
+            deleted_at=None,
+        )
+        self._reconcile_pending_reviews_locked(
+            locked.conn,
+            page["page_id"],
+            allow_conflicts=False,
         )
 
         pending = list(
@@ -1060,6 +1966,149 @@ class WikiRevisionService:
             current_revision_id=page.get("current_revision_id"),
             generated_revision_id=page.get("generated_revision_id"),
             conflict_review_id=review_id,
+            observation_id=observation["id"],
+            projection_job_ids=tuple(jobs),
+        )
+
+    def _reuse_current_observation_locked(
+        self,
+        locked: LockedPage,
+        *,
+        event_id: str,
+        observation: dict[str, Any],
+        expected_state_json: str,
+        content: bytes,
+    ) -> MutationResult:
+        page = locked.page
+        current = locked.conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (page.get("current_revision_id"),),
+        ).fetchone()
+        if current is None or current["content"].encode("utf-8") != content:
+            raise RevisionConflict(
+                "observed bytes no longer match the current revision",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        if current["file_hash"] != observation["file_hash"]:
+            raise RevisionConflict(
+                "observed hash no longer matches the current revision",
+                current_revision_id=page.get("current_revision_id"),
+            )
+        timestamp = now_iso()
+        observed = locked.conn.execute(
+            """
+            UPDATE wiki_file_observations
+            SET parse_status='valid',error_code=NULL,error_message=NULL
+            WHERE id=? AND page_id=? AND file_hash=?
+            """,
+            (
+                observation["id"],
+                page["page_id"],
+                observation["file_hash"],
+            ),
+        )
+        if observed.rowcount != 1:
+            raise WikiRevisionError("current-byte observation status CAS failed")
+        previous_epoch = int(page.get("projection_epoch") or 0)
+        next_epoch = previous_epoch + 1
+        lifecycle_changed = page.get("lifecycle_status") != "active"
+        restored = locked.conn.execute(
+            """
+            UPDATE wiki_pages
+            SET lifecycle_status='active',deleted_at=NULL,sync_error=NULL,
+                observed_file_hash=?,projection_epoch=?,
+                rag_visible_revision_id=NULL,rag_visible_epoch=NULL,updated_at=?
+            WHERE page_id=? AND path=? AND current_revision_id=?
+              AND projection_epoch=? AND pending_write_intent_id IS NULL
+            """,
+            (
+                observation["file_hash"],
+                next_epoch,
+                timestamp,
+                page["page_id"],
+                page["path"],
+                page["current_revision_id"],
+                previous_epoch,
+            ),
+        )
+        if restored.rowcount != 1:
+            raise RevisionConflict(
+                "page changed while reusing current observed bytes",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        page.update(
+            lifecycle_status="active",
+            deleted_at=None,
+            sync_error=None,
+            observed_file_hash=observation["file_hash"],
+            projection_epoch=next_epoch,
+            rag_visible_revision_id=None,
+            rag_visible_epoch=None,
+        )
+        locked.conn.execute(
+            """
+            UPDATE review_items
+            SET status='superseded',resolved_at=?,updated_at=?
+            WHERE page_id=? AND issue_type='invalid_frontmatter'
+              AND status='pending'
+            """,
+            (timestamp, timestamp, page["page_id"]),
+        )
+        self._reconcile_pending_reviews_locked(
+            locked.conn,
+            page["page_id"],
+            allow_conflicts=not lifecycle_changed,
+        )
+        self.outbox.supersede_stale(
+            locked.conn,
+            page["page_id"],
+            next_epoch,
+        )
+        jobs = self.outbox.enqueue_pair_for_state(
+            locked.conn,
+            page,
+            "upsert",
+            {"path": page["path"]},
+        )
+        applied = locked.conn.execute(
+            """
+            UPDATE vault_change_events
+            SET expected_state_json=?,status='applied',result_revision_id=?,updated_at=?
+            WHERE id=? AND observation_id=? AND status='pending'
+            """,
+            (
+                expected_state_json,
+                page["current_revision_id"],
+                timestamp,
+                event_id,
+                observation["id"],
+            ),
+        )
+        if applied.rowcount != 1:
+            raise RevisionConflict(
+                "external event changed while reusing current bytes",
+                current_revision_id=page.get("current_revision_id"),
+            )
+        audit(
+            locked.conn,
+            "wiki_external_change_reused_current",
+            {
+                "event_id": event_id,
+                "observation_id": observation["id"],
+                "page_id": page["page_id"],
+                "revision_id": page["current_revision_id"],
+            },
+            timestamp,
+        )
+        return MutationResult(
+            page_id=page["page_id"],
+            page_path=page["path"],
+            status="applied",
+            revision_id=page["current_revision_id"],
+            current_revision_id=page["current_revision_id"],
+            generated_revision_id=page.get("generated_revision_id"),
             observation_id=observation["id"],
             projection_job_ids=tuple(jobs),
         )
@@ -1206,6 +2255,7 @@ class WikiRevisionService:
                 write_token: str | None = None
                 source_ids: list[str] | None = None
                 metadata: dict[str, Any] | None = None
+                reuse_current = False
                 if bool(observed["content_truncated"]):
                     error_code = "file_too_large"
                     error_message = "file exceeds the observation capture limit"
@@ -1229,17 +2279,28 @@ class WikiRevisionService:
                                 locked.page.get("review_status"),
                             )
                             review_status = _review_status(status_value)
-                            revision_id = f"wrev_{uuid.uuid4().hex}"
-                            write_token = f"write_{uuid.uuid4().hex}"
-                            rendered = render_managed_frontmatter(
-                                document,
-                                page_id=locked.page["page_id"],
-                                revision_id=revision_id,
-                                write_token=write_token,
-                                review_status=review_status,
+                            current = locked.conn.execute(
+                                "SELECT content FROM wiki_page_revisions WHERE id=?",
+                                (locked.page.get("current_revision_id"),),
+                            ).fetchone()
+                            reuse_current = (
+                                current is not None
+                                and current["content"].encode("utf-8") == content
                             )
-                            final_document = parse_wiki_bytes(rendered)
-                            metadata = _plain(final_document.frontmatter)
+                            if reuse_current:
+                                metadata = _plain(document.frontmatter)
+                            else:
+                                revision_id = f"wrev_{uuid.uuid4().hex}"
+                                write_token = f"write_{uuid.uuid4().hex}"
+                                rendered = render_managed_frontmatter(
+                                    document,
+                                    page_id=locked.page["page_id"],
+                                    revision_id=revision_id,
+                                    write_token=write_token,
+                                    review_status=review_status,
+                                )
+                                final_document = parse_wiki_bytes(rendered)
+                                metadata = _plain(final_document.frontmatter)
                         except MarkdownParseError as exc:
                             error_code = exc.code
                             error_message = str(exc)
@@ -1253,95 +2314,120 @@ class WikiRevisionService:
                         error_message=error_message,
                     )
                 else:
-                    if (
-                        content is None
-                        or document is None
-                        or rendered is None
-                        or revision_id is None
-                        or write_token is None
-                        or source_ids is None
-                        or metadata is None
-                    ):
-                        raise WikiRevisionError("valid observation has no parsed content")
-                    locked.conn.execute(
-                        """
-                        UPDATE wiki_file_observations
-                        SET parse_status='valid',error_code=NULL,error_message=NULL
-                        WHERE id=?
-                        """,
-                        (observed["id"],),
-                    )
-                    metadata.update(
-                        {
-                            "vault_change_event_id": event_id,
-                            "observation_id": observed["id"],
-                            "observed_file_hash": observed["file_hash"],
-                        }
-                    )
-                    state_digest = hashlib.sha256(
-                        expected_state_json.encode("utf-8")
-                    ).hexdigest()
-                    revision = self._create_revision_locked(
-                        locked.conn,
-                        locked.page,
-                        content=rendered,
-                        origin="external",
-                        base_revision_id=locked.page.get("current_revision_id"),
-                        source_ids=source_ids,
-                        actor="vault-observer",
-                        note=None,
-                        idempotency_key=f"external:{event_id}:{state_digest}",
-                        metadata=metadata,
-                        revision_id=revision_id,
-                    )
-                    intent_page = {
-                        **locked.page,
-                        "file_hash": observed["file_hash"],
-                    }
-                    intent_id = self.prepare_write_intent_locked(
-                        locked.conn,
-                        intent_page,
-                        revision=revision,
-                        expected_revision_id=locked.page.get("current_revision_id"),
-                        expected_file_hash=observed["file_hash"],
-                        write_token=write_token,
-                    )
-                    transitioned = locked.conn.execute(
-                        """
-                        UPDATE vault_change_events
-                        SET expected_state_json=?,result_revision_id=?,updated_at=?
-                        WHERE id=? AND observation_id=?
-                          AND status IN ('pending','prepared')
-                        """,
-                        (
-                            expected_state_json,
-                            revision.id,
-                            now_iso(),
-                            event_id,
-                            observed["id"],
-                        ),
-                    )
-                    if transitioned.rowcount != 1:
-                        raise RevisionConflict(
-                            "external event changed while preparing revision",
-                            current_revision_id=locked.page.get("current_revision_id"),
-                            pending_intent_id=intent_id,
+                    if reuse_current:
+                        if content is None:
+                            raise WikiRevisionError(
+                                "current-byte observation has no content"
+                            )
+                        prepared = self._reuse_current_observation_locked(
+                            locked,
+                            event_id=event_id,
+                            observation=observed,
+                            expected_state_json=expected_state_json,
+                            content=content,
                         )
-                    prepared = MutationResult(
-                        page_id=locked.page["page_id"],
-                        page_path=page_path,
-                        status="prepared",
-                        revision_id=revision.id,
-                        current_revision_id=locked.page.get("current_revision_id"),
-                        generated_revision_id=locked.page.get("generated_revision_id"),
-                        write_intent_id=intent_id,
-                        observation_id=observed["id"],
-                    )
+                    else:
+                        if (
+                            content is None
+                            or document is None
+                            or rendered is None
+                            or revision_id is None
+                            or write_token is None
+                            or source_ids is None
+                            or metadata is None
+                        ):
+                            raise WikiRevisionError(
+                                "valid observation has no parsed content"
+                            )
+                        locked.conn.execute(
+                            """
+                            UPDATE wiki_file_observations
+                            SET parse_status='valid',error_code=NULL,error_message=NULL
+                            WHERE id=?
+                            """,
+                            (observed["id"],),
+                        )
+                        metadata.update(
+                            {
+                                "vault_change_event_id": event_id,
+                                "observation_id": observed["id"],
+                                "observed_file_hash": observed["file_hash"],
+                            }
+                        )
+                        state_digest = hashlib.sha256(
+                            expected_state_json.encode("utf-8")
+                        ).hexdigest()
+                        revision = self._create_revision_locked(
+                            locked.conn,
+                            locked.page,
+                            content=rendered,
+                            origin="external",
+                            base_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            source_ids=source_ids,
+                            actor="vault-observer",
+                            note=None,
+                            idempotency_key=f"external:{event_id}:{state_digest}",
+                            metadata=metadata,
+                            revision_id=revision_id,
+                        )
+                        intent_page = {
+                            **locked.page,
+                            "file_hash": observed["file_hash"],
+                        }
+                        intent_id = self.prepare_write_intent_locked(
+                            locked.conn,
+                            intent_page,
+                            revision=revision,
+                            expected_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            expected_file_hash=observed["file_hash"],
+                            write_token=write_token,
+                        )
+                        transitioned = locked.conn.execute(
+                            """
+                            UPDATE vault_change_events
+                            SET expected_state_json=?,result_revision_id=?,updated_at=?
+                            WHERE id=? AND observation_id=?
+                              AND status IN ('pending','prepared')
+                            """,
+                            (
+                                expected_state_json,
+                                revision.id,
+                                now_iso(),
+                                event_id,
+                                observed["id"],
+                            ),
+                        )
+                        if transitioned.rowcount != 1:
+                            raise RevisionConflict(
+                                "external event changed while preparing revision",
+                                current_revision_id=locked.page.get(
+                                    "current_revision_id"
+                                ),
+                                pending_intent_id=intent_id,
+                            )
+                        prepared = MutationResult(
+                            page_id=locked.page["page_id"],
+                            page_path=page_path,
+                            status="prepared",
+                            revision_id=revision.id,
+                            current_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            generated_revision_id=locked.page.get(
+                                "generated_revision_id"
+                            ),
+                            write_intent_id=intent_id,
+                            observation_id=observed["id"],
+                        )
         if pending_conflict is not None:
             raise pending_conflict
         if prepared is None:
             raise WikiRevisionError("external change did not produce a result")
-        if prepared.status == "invalid":
+        if prepared.status in {"invalid", "applied"}:
             return prepared
 
         from app.vault_writer import IntentExecutor
@@ -2911,7 +3997,7 @@ class WikiRevisionService:
                 UPDATE wiki_pages
                 SET current_revision_id=?,file_hash=?,semantic_hash=?,last_write_token=?,
                     projection_epoch=?,rag_visible_revision_id=NULL,rag_visible_epoch=NULL,
-                    lifecycle_status='active',sync_error=NULL,observed_file_hash=?,
+                    lifecycle_status='active',deleted_at=NULL,sync_error=NULL,observed_file_hash=?,
                     pending_write_intent_id=NULL,review_status=?,owner=COALESCE(?,owner),updated_at=?
                 WHERE page_id=? AND pending_write_intent_id=? AND {expected_sql}
                 """,
@@ -3039,6 +4125,8 @@ class WikiRevisionService:
         self,
         conn: Any,
         page_id: str,
+        *,
+        allow_conflicts: bool = True,
     ) -> str | None:
         page_row = conn.execute(
             "SELECT * FROM wiki_pages WHERE page_id=?",
@@ -3082,7 +4170,9 @@ class WikiRevisionService:
                 )
 
         has_content_conflict = (
-            page["current_revision_id"] is not None
+            allow_conflicts
+            and page["lifecycle_status"] == "active"
+            and page["current_revision_id"] is not None
             and generated is not None
             and page["current_revision_id"] != page["generated_revision_id"]
             and (
@@ -3100,6 +4190,8 @@ class WikiRevisionService:
             }
 
         for review in reversed(pending):
+            if not allow_conflicts or page["lifecycle_status"] != "active":
+                break
             if review["issue_type"] != "concurrent_write_conflict":
                 continue
             candidate = conn.execute(
