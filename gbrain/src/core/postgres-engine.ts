@@ -4834,14 +4834,32 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Sync
-  async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void> {
+  async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<boolean> {
     newSlug = validateSlug(newSlug);
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
     // Source-qualify so a rename in source A doesn't sweep up same-slug rows
     // in sources B/C/D (which would either rename them all OR fail the
     // (source_id, slug) UNIQUE if the new slug already exists in another source).
-    await sql`UPDATE pages SET slug = ${newSlug}, updated_at = now() WHERE slug = ${oldSlug} AND source_id = ${sourceId}`;
+    const rows = await sql`
+      UPDATE pages SET slug = ${newSlug}, updated_at = now()
+      WHERE slug = ${oldSlug} AND source_id = ${sourceId}
+      RETURNING slug
+    `;
+    return rows.length === 1;
+  }
+
+  async bumpPageGeneration(slug: string, opts: { sourceId: string }): Promise<number> {
+    const sql = this.sql;
+    const rows = await sql<{ generation: number }[]>`
+      UPDATE pages SET generation = generation + 1
+      WHERE slug = ${slug} AND source_id = ${opts.sourceId}
+      RETURNING generation
+    `;
+    if (rows.length !== 1) {
+      throw new Error(`Page not found for generation bump: ${opts.sourceId}/${slug}`);
+    }
+    return Number(rows[0].generation);
   }
 
   async rewriteLinks(_oldSlug: string, _newSlug: string): Promise<void> {

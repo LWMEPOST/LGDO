@@ -138,6 +138,8 @@ BEGIN
      OR (OLD.page_kind IS DISTINCT FROM NEW.page_kind)
      OR (OLD.corpus_generation IS DISTINCT FROM NEW.corpus_generation)
      OR (OLD.content_hash IS DISTINCT FROM NEW.content_hash)
+     OR (OLD.slug IS DISTINCT FROM NEW.slug)
+     OR (OLD.source_path IS DISTINCT FROM NEW.source_path)
   THEN
     NEW.generation := OLD.generation + 1;
   END IF;
@@ -150,6 +152,17 @@ CREATE TRIGGER bump_page_generation_trg
   BEFORE INSERT OR UPDATE ON pages
   FOR EACH ROW
   EXECUTE FUNCTION bump_page_generation_fn();
+
+-- LGDO trusted-manifest projection idempotency. Results are stored as JSONB
+-- objects at the database boundary; callers must not pre-encode them.
+CREATE TABLE IF NOT EXISTS lgdo_vault_sync_runs (
+  source_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  result_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(source_id, idempotency_key)
+);
 
 -- v0.41.19.0 (D18/D19, mirror of src/schema.sql): global page-generation
 -- clock + statement-level trigger. See src/schema.sql for the full

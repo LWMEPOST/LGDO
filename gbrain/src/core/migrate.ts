@@ -5367,6 +5367,46 @@ export const MIGRATIONS: Migration[] = [
       END $$;
     `,
   },
+  {
+    version: 120,
+    name: 'lgdo_projection_generation_and_sync_runs',
+    // Projection identity changes whenever either public page identity field
+    // changes. The same migration adds the durable trusted-sync ledger.
+    idempotent: true,
+    sql: `
+      CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger AS $func$
+      BEGIN
+        IF (TG_OP = 'INSERT') THEN
+          NEW.generation := COALESCE((SELECT MAX(generation) FROM pages), 0) + 1;
+        ELSIF (OLD.compiled_truth IS DISTINCT FROM NEW.compiled_truth)
+           OR (OLD.timeline IS DISTINCT FROM NEW.timeline)
+           OR (OLD.frontmatter IS DISTINCT FROM NEW.frontmatter)
+           OR (OLD.deleted_at IS DISTINCT FROM NEW.deleted_at)
+           OR (OLD.contextual_retrieval_mode IS DISTINCT FROM NEW.contextual_retrieval_mode)
+           OR (OLD.title IS DISTINCT FROM NEW.title)
+           OR (OLD.type IS DISTINCT FROM NEW.type)
+           OR (OLD.page_kind IS DISTINCT FROM NEW.page_kind)
+           OR (OLD.corpus_generation IS DISTINCT FROM NEW.corpus_generation)
+           OR (OLD.content_hash IS DISTINCT FROM NEW.content_hash)
+           OR (OLD.slug IS DISTINCT FROM NEW.slug)
+           OR (OLD.source_path IS DISTINCT FROM NEW.source_path)
+        THEN
+          NEW.generation := OLD.generation + 1;
+        END IF;
+        RETURN NEW;
+      END;
+      $func$ LANGUAGE plpgsql;
+
+      CREATE TABLE IF NOT EXISTS lgdo_vault_sync_runs (
+        source_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        result_json JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY(source_id, idempotency_key)
+      );
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

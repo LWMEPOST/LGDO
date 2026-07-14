@@ -4819,15 +4819,27 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Sync
-  async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void> {
+  async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<boolean> {
     newSlug = validateSlug(newSlug);
     const sourceId = opts?.sourceId ?? 'default';
     // Source-qualify so a rename in source A doesn't sweep up same-slug rows
     // in sources B/C/D (mirrors postgres-engine.ts).
-    await this.db.query(
-      `UPDATE pages SET slug = $1, updated_at = now() WHERE slug = $2 AND source_id = $3`,
+    const { rows } = await this.db.query(
+      `UPDATE pages SET slug = $1, updated_at = now() WHERE slug = $2 AND source_id = $3 RETURNING slug`,
       [newSlug, oldSlug, sourceId]
     );
+    return rows.length === 1;
+  }
+
+  async bumpPageGeneration(slug: string, opts: { sourceId: string }): Promise<number> {
+    const { rows } = await this.db.query<{ generation: number }>(
+      `UPDATE pages SET generation = generation + 1 WHERE slug = $1 AND source_id = $2 RETURNING generation`,
+      [slug, opts.sourceId]
+    );
+    if (rows.length !== 1) {
+      throw new Error(`Page not found for generation bump: ${opts.sourceId}/${slug}`);
+    }
+    return Number(rows[0].generation);
   }
 
   async rewriteLinks(_oldSlug: string, _newSlug: string): Promise<void> {

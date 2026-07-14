@@ -708,3 +708,70 @@ body unchanged
     expect(shortCircuited).toBe(true);
   });
 });
+
+describe('importFromContent - LGDO restore contract', () => {
+  test('restores a tombstone inside the write transaction and returns projection identity', async () => {
+    const callOrder: string[] = [];
+    let writtenHash: string | undefined;
+    const engine = mockEngine({
+      getPage: (_slug: string, opts: Record<string, unknown>) => {
+        expect(opts).toEqual({ sourceId: 'lgdo-test', includeDeleted: true });
+        return Promise.resolve({
+          slug: 'wiki/product/demo',
+          content_hash: 'stale-content-hash',
+          deleted_at: new Date('2026-07-01T00:00:00.000Z'),
+          created_at: new Date('2026-06-01T00:00:00.000Z'),
+          updated_at: new Date('2026-07-01T00:00:00.000Z'),
+        } as any);
+      },
+      restorePage: (_slug: string, opts: Record<string, unknown>) => {
+        callOrder.push('restorePage');
+        expect(opts).toEqual({ sourceId: 'lgdo-test' });
+        return Promise.resolve(true);
+      },
+      createVersion: () => {
+        callOrder.push('createVersion');
+        return Promise.resolve();
+      },
+      putPage: (_slug: string, page: { content_hash?: string }) => {
+        callOrder.push('putPage');
+        writtenHash = page.content_hash;
+        return Promise.resolve(null);
+      },
+      upsertChunks: () => {
+        callOrder.push('upsertChunks');
+        return Promise.resolve();
+      },
+      bumpPageGeneration: (_slug: string, opts: Record<string, unknown>) => {
+        callOrder.push('bumpPageGeneration');
+        expect(opts).toEqual({ sourceId: 'lgdo-test' });
+        return Promise.resolve(42);
+      },
+    });
+
+    const result = await importFromContent(
+      engine,
+      'wiki/product/demo',
+      `---\ntype: concept\ntitle: Restored Demo\n---\n\nFresh restored content.\n`,
+      {
+        noEmbed: true,
+        sourceId: 'lgdo-test',
+        restoreDeleted: true,
+        forceRechunk: true,
+        forceGenerationBump: true,
+      },
+    );
+
+    expect(result.status).toBe('imported');
+    expect(result.content_hash).toBe(writtenHash);
+    expect(result.content_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.page_generation).toBe(42);
+    expect(callOrder).toEqual([
+      'restorePage',
+      'createVersion',
+      'putPage',
+      'upsertChunks',
+      'bumpPageGeneration',
+    ]);
+  });
+});

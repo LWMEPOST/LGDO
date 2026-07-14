@@ -201,6 +201,17 @@ export interface ImportResult {
   flagged?: boolean;
   /** Which flag tier fired, when `flagged`. */
   flag_reason?: 'markup_heavy' | 'oversized';
+  /** Stable hash written to pages.content_hash for projection attribution. */
+  content_hash?: string;
+  /** Page generation after an explicit projection generation bump. */
+  page_generation?: number;
+}
+
+export interface LgdoImportOptions {
+  /** Include and atomically restore a matching soft-deleted page. */
+  restoreDeleted?: boolean;
+  /** Advance page generation after every other write in the import transaction. */
+  forceGenerationBump?: boolean;
 }
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
@@ -282,7 +293,7 @@ export async function importFromContent(
      * leave it unset → markers preserved (the gate + CLI own them).
      */
     remote?: boolean;
-  } = {},
+  } & LgdoImportOptions = {},
 ): Promise<ImportResult> {
   // v0.18.0+ multi-source: when caller is syncing under a non-default source,
   // every per-page tx call must carry `sourceId` so writes target the right
@@ -558,8 +569,16 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
-  if (existing?.content_hash === hash && !opts.forceRechunk) {
+  const existing = await engine.getPage(slug, {
+    ...(sourceId ? { sourceId } : {}),
+    includeDeleted: opts.restoreDeleted === true,
+  });
+  if (
+    existing?.content_hash === hash
+    && !existing.deleted_at
+    && !opts.forceRechunk
+    && !opts.forceGenerationBump
+  ) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
 
@@ -729,7 +748,15 @@ export async function importFromContent(
   // schema DEFAULT — required for multi-source brains; harmless ('default')
   // for single-source callers.
   const txOpts = sourceId ? { sourceId } : undefined;
+  let pageGeneration: number | undefined;
   await engine.transaction(async (tx) => {
+    if (existing?.deleted_at) {
+      const restoreSourceId = sourceId ?? 'default';
+      const restored = await tx.restorePage(slug, { sourceId: restoreSourceId });
+      if (!restored) {
+        throw new Error(`Failed to restore deleted page: ${restoreSourceId}/${slug}`);
+      }
+    }
     if (existing) await tx.createVersion(slug, txOpts);
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
@@ -862,6 +889,12 @@ export async function importFromContent(
         );
       } catch { /* same reason — silent skip */ }
     }
+
+    if (opts.forceGenerationBump) {
+      pageGeneration = await tx.bumpPageGeneration(slug, {
+        sourceId: sourceId ?? 'default',
+      });
+    }
   });
 
   // T3 — project frontmatter `aliases:` into page_aliases (free-text alias
@@ -888,6 +921,8 @@ export async function importFromContent(
     status: 'imported',
     chunks: chunks.length,
     parsedPage,
+    content_hash: hash,
+    ...(pageGeneration !== undefined ? { page_generation: pageGeneration } : {}),
     ...(pageQuarantined ? { quarantined: true } : {}),
     ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}),
   };

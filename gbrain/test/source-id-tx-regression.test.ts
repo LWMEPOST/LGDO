@@ -402,11 +402,16 @@ describe('deletePage + updateSlug source-scoping (Data R2 CRITICAL + HIGH fix)',
     // Set up: same slug under both default and testsrc.
     await engine.putPage(REN_FROM, { type: 'concept', title: 'R default', compiled_truth: '' });
     await engine.putPage(REN_FROM, { type: 'concept', title: 'R testsrc', compiled_truth: '' }, { sourceId: 'testsrc' });
+    const generationBefore = await engine.executeRaw<{ generation: number }>(
+      `SELECT generation FROM pages WHERE slug = $1 AND source_id = $2`,
+      [REN_FROM, 'testsrc'],
+    );
 
     // Pre-fix: bare `UPDATE pages SET slug = $new WHERE slug = $old` would have
     // hit both rows; if REN_TO already existed in either source, the (source_id,
     // slug) UNIQUE would fail. Post-fix: only the testsrc row gets renamed.
-    await engine.updateSlug(REN_FROM, REN_TO, { sourceId: 'testsrc' });
+    const renamed = await engine.updateSlug(REN_FROM, REN_TO, { sourceId: 'testsrc' });
+    expect(renamed).toBe(true);
 
     const fromRows = await engine.executeRaw<{ source_id: string }>(
       `SELECT source_id FROM pages WHERE slug = $1 ORDER BY source_id`,
@@ -415,12 +420,22 @@ describe('deletePage + updateSlug source-scoping (Data R2 CRITICAL + HIGH fix)',
     expect(fromRows.length).toBe(1);
     expect(fromRows[0].source_id).toBe('default');
 
-    const toRows = await engine.executeRaw<{ source_id: string }>(
-      `SELECT source_id FROM pages WHERE slug = $1`,
+    const toRows = await engine.executeRaw<{ source_id: string; generation: number }>(
+      `SELECT source_id, generation FROM pages WHERE slug = $1`,
       [REN_TO],
     );
     expect(toRows.length).toBe(1);
     expect(toRows[0].source_id).toBe('testsrc');
+    expect(Number(toRows[0].generation)).toBeGreaterThan(Number(generationBefore[0].generation));
+  });
+
+  test('updateSlug returns false when no row matches the source-qualified slug', async () => {
+    const renamed = await engine.updateSlug(
+      'topics/regression-rename-missing',
+      'topics/regression-rename-missing-target',
+      { sourceId: 'testsrc' },
+    );
+    expect(renamed).toBe(false);
   });
 
   test('getChunks with opts.sourceId only returns the intended source\'s chunks', async () => {
@@ -462,6 +477,71 @@ describe('deletePage + updateSlug source-scoping (Data R2 CRITICAL + HIGH fix)',
     expect(rows.length).toBe(1);
     expect(rows[0].source_id).toBe('default');
     expect(rows[0].slug).toBe(REN_TO_2);
+  });
+});
+
+describe('page generation mutation contract', () => {
+  const GENERATION_SLUG = 'topics/regression-generation-bump';
+
+  test('bumpPageGeneration strictly advances only the requested source row', async () => {
+    await engine.putPage(GENERATION_SLUG, {
+      type: 'concept',
+      title: 'Generation default',
+      compiled_truth: 'default generation row',
+    });
+    await engine.putPage(GENERATION_SLUG, {
+      type: 'concept',
+      title: 'Generation testsrc',
+      compiled_truth: 'testsrc generation row',
+    }, { sourceId: 'testsrc' });
+
+    const before = await engine.executeRaw<{ source_id: string; generation: number }>(
+      `SELECT source_id, generation FROM pages WHERE slug = $1 ORDER BY source_id`,
+      [GENERATION_SLUG],
+    );
+    const defaultBefore = Number(before.find((row) => row.source_id === 'default')!.generation);
+    const testsrcBefore = Number(before.find((row) => row.source_id === 'testsrc')!.generation);
+
+    const bumped = await engine.bumpPageGeneration(GENERATION_SLUG, { sourceId: 'testsrc' });
+    expect(bumped).toBeGreaterThan(testsrcBefore);
+
+    const after = await engine.executeRaw<{ source_id: string; generation: number }>(
+      `SELECT source_id, generation FROM pages WHERE slug = $1 ORDER BY source_id`,
+      [GENERATION_SLUG],
+    );
+    expect(Number(after.find((row) => row.source_id === 'default')!.generation)).toBe(defaultBefore);
+    expect(Number(after.find((row) => row.source_id === 'testsrc')!.generation)).toBe(bumped);
+
+    await expect(
+      engine.bumpPageGeneration('topics/regression-generation-missing', { sourceId: 'testsrc' }),
+    ).rejects.toThrow(/not found/i);
+  });
+
+  test('changing source_path advances the page generation', async () => {
+    const slug = 'topics/regression-source-path-generation';
+    const page = {
+      type: 'concept' as const,
+      title: 'Source path generation',
+      compiled_truth: 'stable content',
+      source_path: 'old/location.md',
+    };
+    await engine.putPage(slug, page, { sourceId: 'testsrc' });
+    const before = await engine.executeRaw<{ generation: number }>(
+      `SELECT generation FROM pages WHERE slug = $1 AND source_id = $2`,
+      [slug, 'testsrc'],
+    );
+
+    await engine.putPage(
+      slug,
+      { ...page, source_path: 'new/location.md' },
+      { sourceId: 'testsrc' },
+    );
+    const after = await engine.executeRaw<{ generation: number }>(
+      `SELECT generation FROM pages WHERE slug = $1 AND source_id = $2`,
+      [slug, 'testsrc'],
+    );
+
+    expect(Number(after[0].generation)).toBeGreaterThan(Number(before[0].generation));
   });
 });
 

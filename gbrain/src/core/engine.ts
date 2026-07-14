@@ -1833,7 +1833,13 @@ export interface BrainEngine {
    * it, the bare `WHERE slug = old` matches every row across every source and
    * would either rename them all OR violate the (source_id, slug) UNIQUE.
    */
-  updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void>;
+  updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<boolean>;
+  /**
+   * Explicitly advance one page's projection generation. Unlike the legacy
+   * rename surface, sourceId is required so projection callers cannot mutate
+   * a same-slug page in another source. Throws when no row matches.
+   */
+  bumpPageGeneration(slug: string, opts: { sourceId: string }): Promise<number>;
   rewriteLinks(oldSlug: string, newSlug: string): Promise<void>;
 
   /**
