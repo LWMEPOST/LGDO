@@ -52,6 +52,23 @@ def seed_legacy_page(settings, content: bytes) -> str:
     return page_path
 
 
+def applied_audit_payload(settings, revision_id: str) -> dict:
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT payload_json FROM audit_logs
+            WHERE event_type='wiki_revision_applied'
+            ORDER BY id
+            """
+        ).fetchall()
+    payloads = [json.loads(row["payload_json"]) for row in rows]
+    matches = [
+        payload for payload in payloads if payload.get("revision_id") == revision_id
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def test_first_read_creates_one_legacy_revision_without_generated_baseline(tmp_path):
     settings = make_settings(tmp_path)
     page_path = seed_legacy_page(
@@ -154,6 +171,121 @@ def test_manual_save_requires_current_revision_and_keeps_generated_pointer(
     assert "Human addition" in saved.content
     assert saved.metadata["review_status"] == "reviewed"
     assert len(result.projection_job_ids) == 2
+
+
+def test_manual_applied_audit_preserves_request_identity_and_revision_metadata(
+    legacy_page_fixture,
+):
+    service, page = legacy_page_fixture
+    request_id = "save_audit_identity"
+    content = page.content.replace(
+        "---\n# Demo",
+        "_lgdo_transition: user-controlled\n---\n# Demo",
+    )
+    prepared = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page.page_path,
+            content=content + "\nAudited human edit.\n",
+            expected_revision_id=page.current_revision_id,
+            request_id=request_id,
+            actor="alice",
+            owner=None,
+            note="audit identity",
+            review_status="reviewed",
+        ),
+        execute_intent=False,
+    )
+    with connect_app(service.settings) as conn:
+        revision_before = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (prepared.revision_id,),
+        ).fetchone()
+    metadata_before = json.loads(revision_before["metadata_json"])
+
+    execution = IntentExecutor(service.settings).execute(prepared.write_intent_id)
+
+    with connect_app(service.settings) as conn:
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (prepared.revision_id,),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT * FROM vault_write_intents WHERE id=?",
+            (prepared.write_intent_id,),
+        ).fetchone()
+    payload = applied_audit_payload(service.settings, prepared.revision_id)
+    metadata_after = json.loads(revision["metadata_json"])
+    rendered_bytes = revision["content"].encode("utf-8")
+
+    assert execution.intent_status == "applied"
+    assert revision["metadata_json"] == revision_before["metadata_json"]
+    assert metadata_after == metadata_before
+    assert metadata_after["_lgdo_transition"] == {
+        "kind": "manual",
+        "request_id": request_id,
+    }
+    assert revision["idempotency_key"].startswith(f"manual:{request_id}:")
+    assert intent["revision_id"] == revision["id"]
+    assert (service.settings.vault_path / page.page_path).read_bytes() == rendered_bytes
+    assert b"_lgdo_transition" not in rendered_bytes
+    assert payload == {
+        "transition_kind": "manual",
+        "transition_id": request_id,
+        "request_id": request_id,
+        "page_id": page.page_id,
+        "page_path": page.page_path,
+        "intent_id": intent["id"],
+        "revision_id": revision["id"],
+        "origin": "manual",
+        "base_revision_id": page.current_revision_id,
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata_variant",
+    ["missing_transition", "invalid_json"],
+)
+def test_finalize_without_valid_internal_transition_identity_remains_recoverable(
+    legacy_page_fixture,
+    metadata_variant,
+):
+    service, page = legacy_page_fixture
+    prepared = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page.page_path,
+            content=page.content + "\nUpgrade-compatible edit.\n",
+            expected_revision_id=page.current_revision_id,
+            request_id=f"upgrade_{metadata_variant}",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        ),
+        execute_intent=False,
+    )
+    with connect_app_write(service.settings) as conn:
+        row = conn.execute(
+            "SELECT metadata_json FROM wiki_page_revisions WHERE id=?",
+            (prepared.revision_id,),
+        ).fetchone()
+        metadata = json.loads(row["metadata_json"])
+        if metadata_variant == "missing_transition":
+            metadata.pop("_lgdo_transition", None)
+            stored_metadata = json.dumps(metadata)
+        else:
+            stored_metadata = "{invalid-json"
+        conn.execute(
+            "UPDATE wiki_page_revisions SET metadata_json=? WHERE id=?",
+            (stored_metadata, prepared.revision_id),
+        )
+
+    execution = IntentExecutor(service.settings).execute(prepared.write_intent_id)
+    payload = applied_audit_payload(service.settings, prepared.revision_id)
+
+    assert execution.intent_status == "applied"
+    assert payload["transition_kind"] is None
+    assert payload["transition_id"] is None
+    assert "request_id" not in payload
 
 
 def test_manual_request_replays_same_state_and_can_transition_new_expected_state(
@@ -311,6 +443,36 @@ def test_status_update_is_a_manual_revision_and_changes_frontmatter(
     assert changed.accepted_generated_revision_id == page.accepted_generated_revision_id
     assert revision["origin"] == "manual"
     assert "review_status: stale" in changed.content
+
+
+def test_status_applied_audit_preserves_status_request_identity(
+    legacy_page_fixture,
+):
+    service, page = legacy_page_fixture
+    request_id = "status_audit_identity"
+
+    result = service.update_status(
+        StatusUpdateCommand(
+            page_path=page.page_path,
+            review_status="stale",
+            expected_revision_id=page.current_revision_id,
+            request_id=request_id,
+            actor="alice",
+            owner=None,
+            note="status audit identity",
+        )
+    )
+    payload = applied_audit_payload(service.settings, result.revision_id)
+
+    assert payload["transition_kind"] == "status"
+    assert payload["transition_id"] == request_id
+    assert payload["request_id"] == request_id
+    assert payload["page_id"] == page.page_id
+    assert payload["page_path"] == page.page_path
+    assert payload["intent_id"] == result.write_intent_id
+    assert payload["revision_id"] == result.revision_id
+    assert payload["origin"] == "manual"
+    assert payload["base_revision_id"] == page.current_revision_id
 
 
 def test_metadata_update_rejects_invalid_review_status(legacy_page_fixture):
@@ -507,6 +669,75 @@ def page_with_generated(compiled_source_fixture):
     settings, _, page_path = compiled_source_fixture
     service = WikiRevisionService(settings)
     return service, service.get_page(page_path)
+
+
+def test_first_generated_auto_apply_audit_preserves_compile_job_identity(
+    page_with_generated,
+):
+    service, page = page_with_generated
+    with connect_app(service.settings) as conn:
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (page.current_revision_id,),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT * FROM vault_write_intents WHERE revision_id=?",
+            (page.current_revision_id,),
+        ).fetchone()
+    payload = applied_audit_payload(service.settings, page.current_revision_id)
+
+    assert revision["origin"] == "generated"
+    assert intent["status"] == "applied"
+    assert payload["transition_kind"] == "compile"
+    assert payload["transition_id"] == "compile-initial"
+    assert payload["compile_job_id"] == "compile-initial"
+    assert payload["page_id"] == page.page_id
+    assert payload["page_path"] == page.page_path
+    assert payload["intent_id"] == intent["id"]
+    assert payload["revision_id"] == revision["id"]
+    assert payload["origin"] == "generated"
+    assert payload["base_revision_id"] is None
+
+
+def test_valid_external_change_applied_audit_preserves_event_identity(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(before.raw_bytes + b"\nAudited Obsidian edit.\n")
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-audit-identity"
+
+    result = service.ingest_external_change(
+        event_id,
+        before.page_path,
+        observation,
+    )
+    with connect_app(service.settings) as conn:
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (result.revision_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+    payload = applied_audit_payload(service.settings, result.revision_id)
+    metadata = json.loads(revision["metadata_json"])
+
+    assert metadata["vault_change_event_id"] == event_id == event["id"]
+    assert payload["transition_kind"] == "external"
+    assert payload["transition_id"] == event_id
+    assert payload["event_id"] == event_id
+    assert payload["page_id"] == before.page_id
+    assert payload["page_path"] == before.page_path
+    assert payload["intent_id"] == result.write_intent_id
+    assert payload["revision_id"] == revision["id"]
+    assert payload["origin"] == "external"
+    assert payload["base_revision_id"] == before.current_revision_id
 
 
 def test_external_edit_is_immutable_revision_and_same_event_replays(
@@ -2251,6 +2482,15 @@ def test_content_conflict_resolution_records_locked_branch_contract(
     assert audit_payload["resolution"] == resolution
     assert audit_payload["actor"] == "alice"
     assert audit_payload["note"] == "reviewed"
+
+    if resolution != "keep_current":
+        applied_payload = applied_audit_payload(
+            service.settings,
+            page.current_revision_id,
+        )
+        assert applied_payload["transition_kind"] == "conflict_resolution"
+        assert applied_payload["transition_id"] == f"resolve-{resolution}"
+        assert applied_payload["request_id"] == f"resolve-{resolution}"
 
     if resolution == "keep_current":
         assert result.revision_id == current.current_revision_id

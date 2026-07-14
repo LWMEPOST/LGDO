@@ -4450,6 +4450,7 @@ class WikiRevisionService:
                     document.frontmatter[key] = value
                 if owner is not None:
                     document.frontmatter["owner"] = owner
+                document.frontmatter.pop("_lgdo_transition", None)
                 if review_status_required:
                     status_value = review_status
                 elif "review_status" in document.frontmatter:
@@ -4468,6 +4469,10 @@ class WikiRevisionService:
                 )
                 final_document = parse_wiki_bytes(rendered)
                 metadata = _plain(final_document.frontmatter)
+                metadata["_lgdo_transition"] = {
+                    "kind": transition_prefix,
+                    "request_id": request_id,
+                }
                 revision = self._create_revision_locked(
                     locked.conn,
                     locked.page,
@@ -4670,6 +4675,7 @@ class WikiRevisionService:
                 f"{command.source_hash}:{command.compiler_version}:"
             )
             source_document = parse_wiki_bytes(command.content.encode("utf-8"))
+            source_document.frontmatter.pop("_lgdo_transition", None)
             candidate_semantic_hash = compute_semantic_hash(source_document)
             latest_generated = locked.conn.execute(
                 """
@@ -4713,6 +4719,10 @@ class WikiRevisionService:
                 revision_metadata = _plain(final_document.frontmatter)
                 revision_metadata["source_hash"] = command.source_hash
                 revision_metadata["compiler_version"] = command.compiler_version
+                revision_metadata["_lgdo_transition"] = {
+                    "kind": "compile",
+                    "compile_job_id": command.compile_job_id,
+                }
                 candidate = self._create_revision_locked(
                     locked.conn,
                     locked.page,
@@ -5929,6 +5939,67 @@ class WikiRevisionService:
                 return payload
         return None
 
+    @staticmethod
+    def _applied_transition_identity(
+        *,
+        origin: str,
+        metadata: dict[str, Any],
+        resolution_payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        identity: dict[str, Any] = {
+            "transition_kind": None,
+            "transition_id": None,
+        }
+        if resolution_payload is not None:
+            request_id = resolution_payload.get("request_id")
+            if isinstance(request_id, str) and request_id:
+                identity.update(
+                    {
+                        "transition_kind": "conflict_resolution",
+                        "transition_id": request_id,
+                        "request_id": request_id,
+                    }
+                )
+            return identity
+
+        if origin == "external":
+            event_id = metadata.get("vault_change_event_id")
+            if isinstance(event_id, str) and event_id:
+                identity.update(
+                    {
+                        "transition_kind": "external",
+                        "transition_id": event_id,
+                        "event_id": event_id,
+                    }
+                )
+            return identity
+
+        transition = metadata.get("_lgdo_transition")
+        if not isinstance(transition, dict):
+            return identity
+        kind = transition.get("kind")
+        if kind in {"manual", "human", "status", "metadata", "resolve"}:
+            request_id = transition.get("request_id")
+            if isinstance(request_id, str) and request_id:
+                identity.update(
+                    {
+                        "transition_kind": kind,
+                        "transition_id": request_id,
+                        "request_id": request_id,
+                    }
+                )
+        elif kind == "compile":
+            compile_job_id = transition.get("compile_job_id")
+            if isinstance(compile_job_id, str) and compile_job_id:
+                identity.update(
+                    {
+                        "transition_kind": "compile",
+                        "transition_id": compile_job_id,
+                        "compile_job_id": compile_job_id,
+                    }
+                )
+        return identity
+
     def _validate_prepared_resolution_locked(
         self,
         conn: Any,
@@ -6061,7 +6132,11 @@ class WikiRevisionService:
                 else (intent["expected_revision_id"],)
             )
             next_epoch = int(locked.page["projection_epoch"] or 0) + 1
-            metadata = json.loads(revision["metadata_json"] or "{}")
+            try:
+                loaded_metadata = json.loads(revision["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                loaded_metadata = {}
+            metadata = loaded_metadata if isinstance(loaded_metadata, dict) else {}
             observed_file_hash = (
                 metadata.get("observed_file_hash")
                 if revision["origin"] == "external"
@@ -6232,7 +6307,19 @@ class WikiRevisionService:
             audit(
                 locked.conn,
                 "wiki_revision_applied",
-                {"intent_id": intent_id, "revision_id": revision["id"]},
+                {
+                    "page_id": intent["page_id"],
+                    "page_path": locked.page["path"],
+                    "intent_id": intent_id,
+                    "revision_id": revision["id"],
+                    "origin": revision["origin"],
+                    "base_revision_id": revision["base_revision_id"],
+                    **self._applied_transition_identity(
+                        origin=revision["origin"],
+                        metadata=metadata,
+                        resolution_payload=resolution_payload,
+                    ),
+                },
                 now_iso(),
             )
             return MutationResult(
