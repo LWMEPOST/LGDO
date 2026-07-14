@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.config import Settings
+from app.db import init_app_db
 from app.gbrain import (
     GBrainError,
     GBrainHit,
@@ -197,13 +198,16 @@ def test_gbrain_candidates_trim_low_information_cjk_windows():
     assert not any(len(item) == 4 and item in {"梳理公司", "公司所有", "所有制度"} for item in candidates)
 
 
-def test_query_gbrain_uses_short_ttl_cache(monkeypatch):
+def test_query_gbrain_uses_short_ttl_cache(tmp_path, monkeypatch):
     _QUERY_CACHE.clear()
     settings = Settings(
+        database_backend="sqlite",
+        database_path=tmp_path / "cache.db",
         gbrain_enabled=True,
         gbrain_endpoint="http://gbrain.example/mcp",
         gbrain_query_cache_ttl_seconds=300,
     )
+    init_app_db(settings)
     calls: list[str] = []
 
     monkeypatch.setattr("app.gbrain.get_gbrain_status", lambda _settings: type("Status", (), {"available": True})())

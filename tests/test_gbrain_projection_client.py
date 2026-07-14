@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import httpx
@@ -9,7 +10,14 @@ import pytest
 
 from app.config import Settings
 from app.db import connect_app_write, init_app_db
-from app.gbrain import GBrainHit, _query_cache_key, call_gbrain_tool, normalize_gbrain_hits
+from app.gbrain import (
+    GBrainHit,
+    _QUERY_CACHE,
+    _query_cache_key,
+    call_gbrain_tool,
+    normalize_gbrain_hits,
+    query_gbrain_with_diagnostics,
+)
 from app.gbrain_projection import (
     ExpectedPage,
     GBrainProjectionClient,
@@ -59,6 +67,16 @@ def _response(payload: Any, *, content_type: str = "application/json") -> httpx.
         200,
         json=payload,
         headers={"content-type": content_type},
+        request=httpx.Request("POST", ENDPOINT),
+    )
+
+
+def _sse_response(events: list[dict[str, Any]]) -> httpx.Response:
+    content = "".join(f"event: message\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+    return httpx.Response(
+        200,
+        content=content,
+        headers={"content-type": "text/event-stream"},
         request=httpx.Request("POST", ENDPOINT),
     )
 
@@ -120,6 +138,7 @@ def _sync_payload(
         "revision_id": expected.revision_id,
         "projection_epoch": expected.projection_epoch,
         "path": expected.path,
+        "file_hash": expected.file_hash,
         "source_id": request.source_id,
         "slug": "product/faq/demo",
         "source_path": expected.path,
@@ -146,15 +165,19 @@ def _sync_payload(
     }
 
 
-def _tool_response(payload: Any, *, is_error: bool = False, sse: bool = False) -> httpx.Response:
-    envelope = {
+def _tool_envelope(payload: Any, *, is_error: bool = False, response_id: int = 2) -> dict[str, Any]:
+    return {
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": response_id,
         "result": {
             "isError": is_error,
             "content": [{"type": "text", "text": json.dumps(payload)}],
         },
     }
+
+
+def _tool_response(payload: Any, *, is_error: bool = False, sse: bool = False) -> httpx.Response:
+    envelope = _tool_envelope(payload, is_error=is_error)
     return _response(envelope, content_type="text/event-stream" if sse else "application/json")
 
 
@@ -252,6 +275,40 @@ def test_projection_client_distinguishes_malformed_json(tmp_path, monkeypatch):
         asyncio.run(GBrainProjectionClient(settings).sync(_request(settings)))
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda envelope: {key: value for key, value in envelope.items() if key != "id"},
+        lambda envelope: {**envelope, "id": 999},
+        lambda envelope: [envelope, dict(envelope)],
+    ],
+)
+def test_projection_client_rejects_missing_wrong_or_duplicate_response_ids(tmp_path, monkeypatch, mutate):
+    settings = _settings(tmp_path)
+    request = _request(settings)
+    envelope = _tool_envelope(_sync_payload(request))
+    scripted = ScriptedAsyncClient([_initialize_response(), _response(mutate(envelope))])
+    _install_transport(monkeypatch, scripted)
+
+    with pytest.raises(ProjectionProtocolError, match="response id"):
+        asyncio.run(GBrainProjectionClient(settings).sync(request))
+
+
+@pytest.mark.parametrize("transport", ["json", "sse"])
+def test_projection_client_selects_the_unique_matching_response_id(tmp_path, monkeypatch, transport: str):
+    settings = _settings(tmp_path)
+    request = _request(settings)
+    matching = _tool_envelope(_sync_payload(request))
+    unrelated = {"jsonrpc": "2.0", "id": 999, "result": {"ignored": True}}
+    response = _response([matching, unrelated]) if transport == "json" else _sse_response([matching, unrelated])
+    scripted = ScriptedAsyncClient([_initialize_response(), response])
+    _install_transport(monkeypatch, scripted)
+
+    result = asyncio.run(GBrainProjectionClient(settings).sync(request))
+
+    assert result.pages[0].status == "imported"
+
+
 def test_projection_client_rejects_missing_page_results(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
     request = _request(settings)
@@ -290,6 +347,18 @@ def test_projection_client_rejects_returned_path_identity_mismatch(tmp_path, mon
     _install_transport(monkeypatch, scripted)
 
     with pytest.raises(ProjectionProtocolError, match=field):
+        asyncio.run(GBrainProjectionClient(settings).sync(request))
+
+
+def test_projection_client_rejects_returned_file_hash_identity_mismatch(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    request = _request(settings)
+    payload = _sync_payload(request)
+    payload["pages"][0]["file_hash"] = "c" * 64
+    scripted = ScriptedAsyncClient([_initialize_response(), _tool_response(payload)])
+    _install_transport(monkeypatch, scripted)
+
+    with pytest.raises(ProjectionProtocolError, match="file_hash mismatch"):
         asyncio.run(GBrainProjectionClient(settings).sync(request))
 
 
@@ -348,6 +417,43 @@ def test_persistent_projection_generation_changes_cache_keys_across_instances(tm
     assert before_a == before_b
     assert after_a == after_b
     assert after_a != before_a
+
+
+def test_projection_generation_read_failure_never_reuses_generation_zero_cache(tmp_path, monkeypatch):
+    settings = _settings(tmp_path, gbrain_enabled=True, gbrain_query_cache_ttl_seconds=300)
+    init_app_db(settings)
+    stale = GBrainHit(slug="stale", title="Stale", snippet="old", score=1.0)
+    fresh = GBrainHit(slug="fresh", title="Fresh", snippet="new", score=1.0)
+    _QUERY_CACHE.clear()
+    try:
+        generation_zero_key = _query_cache_key(settings, "demo", 4)
+        assert generation_zero_key is not None
+        _QUERY_CACHE[generation_zero_key] = (time.monotonic(), [stale])
+        with connect_app_write(settings) as conn:
+            bump_gbrain_projection_generation(conn, "2026-07-14T12:00:00+08:00")
+
+        def fail_connect(_settings):
+            raise RuntimeError("projection state unavailable")
+
+        calls = 0
+
+        def query_fresh(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return [fresh]
+
+        monkeypatch.setattr("app.gbrain.connect_app", fail_connect)
+        monkeypatch.setattr("app.gbrain.get_gbrain_status", lambda _settings: type("Status", (), {"available": True})())
+        monkeypatch.setattr("app.gbrain._query_gbrain_with_caller", query_fresh)
+
+        result = query_gbrain_with_diagnostics(settings, "demo", limit=4)
+
+        assert _query_cache_key(settings, "demo", 4) is None
+        assert result.cache_hit is False
+        assert [hit.slug for hit in result.hits] == ["fresh"]
+        assert calls == 1
+    finally:
+        _QUERY_CACHE.clear()
 
 
 def test_normalized_hit_preserves_gbrain_projection_identity():

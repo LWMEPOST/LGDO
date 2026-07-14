@@ -91,6 +91,7 @@ class GBrainPageSyncResult:
     revision_id: str
     projection_epoch: int
     path: str
+    file_hash: str
     source_id: str
     slug: str | None
     source_path: str
@@ -151,6 +152,7 @@ class GBrainSyncResponse:
                 "revision_id",
                 "projection_epoch",
                 "path",
+                "file_hash",
                 "source_id",
                 "slug",
                 "source_path",
@@ -172,6 +174,7 @@ class GBrainSyncResponse:
                     revision_id=_required_string(page, "revision_id", f"pages[{index}]"),
                     projection_epoch=_required_int(page, "projection_epoch", f"pages[{index}]"),
                     path=_required_string(page, "path", f"pages[{index}]"),
+                    file_hash=_required_string(page, "file_hash", f"pages[{index}]"),
                     source_id=_required_string(page, "source_id", f"pages[{index}]"),
                     slug=_optional_string(page, "slug", f"pages[{index}]"),
                     source_path=_required_string(page, "source_path", f"pages[{index}]"),
@@ -275,6 +278,7 @@ class GBrainProjectionClient:
                     "clientInfo": {"name": "lgdo-projection", "version": "1"},
                 },
             },
+            expected_request_id=1,
         )
         self._raise_envelope_error(envelope, "initialize")
         if not isinstance(envelope.get("result"), Mapping):
@@ -294,6 +298,7 @@ class GBrainProjectionClient:
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments},
             },
+            expected_request_id=2,
         )
         self._raise_envelope_error(envelope, tool_name)
         result = envelope.get("result")
@@ -325,6 +330,8 @@ class GBrainProjectionClient:
         self,
         client: httpx.AsyncClient,
         payload: dict[str, Any],
+        *,
+        expected_request_id: int,
     ) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.projection_token}",
@@ -342,21 +349,13 @@ class GBrainProjectionClient:
 
         content_type = response.headers.get("content-type", "").lower()
         if "text/event-stream" in content_type:
-            envelope = _parse_sse_envelope(response.text)
+            envelopes: Any = _parse_sse_envelopes(response.text)
         else:
             try:
-                envelope = response.json()
+                envelopes = response.json()
             except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
                 raise ProjectionProtocolError("GBrain projection returned malformed JSON") from exc
-        if isinstance(envelope, list):
-            if not envelope:
-                raise ProjectionProtocolError("GBrain projection returned an empty JSON-RPC batch")
-            envelope = envelope[-1]
-        if not isinstance(envelope, dict):
-            raise ProjectionProtocolError("GBrain projection returned a non-object JSON-RPC envelope")
-        if envelope.get("jsonrpc") != "2.0":
-            raise ProjectionProtocolError("GBrain projection returned an invalid JSON-RPC version")
-        return envelope
+        return _select_response_envelope(envelopes, expected_request_id)
 
     @staticmethod
     def _raise_envelope_error(envelope: Mapping[str, Any], operation: str) -> None:
@@ -409,6 +408,8 @@ class GBrainProjectionClient:
                 raise ProjectionProtocolError(f"page result projection_epoch mismatch for {page_id}")
             if actual.path != expected.path:
                 raise ProjectionProtocolError(f"page result path mismatch for {page_id}")
+            if actual.file_hash != expected.file_hash:
+                raise ProjectionProtocolError(f"page result file_hash mismatch for {page_id}")
             if actual.source_path != expected.path:
                 raise ProjectionProtocolError(f"page result source_path mismatch for {page_id}")
             if actual.source_id != request.source_id:
@@ -441,7 +442,7 @@ def bump_gbrain_projection_generation(conn: Any, timestamp: str) -> int:
     return int(row["value"])
 
 
-def _parse_sse_envelope(raw: str) -> dict[str, Any]:
+def _parse_sse_envelopes(raw: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     data_lines: list[str] = []
     for line in raw.splitlines():
@@ -454,7 +455,35 @@ def _parse_sse_envelope(raw: str) -> dict[str, Any]:
         events.append(_parse_sse_data(data_lines))
     if not events:
         raise ProjectionProtocolError("GBrain projection returned an empty SSE response")
-    return events[-1]
+    return events
+
+
+def _select_response_envelope(value: Any, expected_request_id: int) -> dict[str, Any]:
+    envelopes = value if isinstance(value, list) else [value]
+    if not envelopes:
+        raise ProjectionProtocolError("GBrain projection returned an empty JSON-RPC batch")
+    normalized: list[dict[str, Any]] = []
+    for envelope in envelopes:
+        if not isinstance(envelope, dict):
+            raise ProjectionProtocolError("GBrain projection returned a non-object JSON-RPC envelope")
+        if envelope.get("jsonrpc") != "2.0":
+            raise ProjectionProtocolError("GBrain projection returned an invalid JSON-RPC version")
+        normalized.append(envelope)
+    matching = [
+        envelope
+        for envelope in normalized
+        if type(envelope.get("id")) is type(expected_request_id)
+        and envelope.get("id") == expected_request_id
+    ]
+    if not matching:
+        raise ProjectionProtocolError(
+            f"GBrain projection response id did not match request id {expected_request_id}"
+        )
+    if len(matching) != 1:
+        raise ProjectionProtocolError(
+            f"GBrain projection returned duplicate response id {expected_request_id}"
+        )
+    return matching[0]
 
 
 def _parse_sse_data(data_lines: Sequence[str]) -> dict[str, Any]:

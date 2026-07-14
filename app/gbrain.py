@@ -219,9 +219,10 @@ def query_gbrain_with_diagnostics(
         return GBrainQueryResult([], reason="unavailable")
     resolved_limit = limit or settings.gbrain_query_limit
     cache_key = _query_cache_key(settings, question, resolved_limit)
-    cached_hits = _get_cached_query(cache_key, settings.gbrain_query_cache_ttl_seconds)
-    if cached_hits is not None:
-        return GBrainQueryResult(cached_hits, cache_hit=True)
+    if cache_key is not None:
+        cached_hits = _get_cached_query(cache_key, settings.gbrain_query_cache_ttl_seconds)
+        if cached_hits is not None:
+            return GBrainQueryResult(cached_hits, cache_hit=True)
 
     params: dict[str, Any] = {
         "query": question,
@@ -267,7 +268,7 @@ def query_gbrain_with_diagnostics(
         )
 
     _record_gbrain_success()
-    if hits:
+    if hits and cache_key is not None:
         _set_cached_query(cache_key, hits)
     return GBrainQueryResult(
         hits,
@@ -684,7 +685,10 @@ def _dedupe_phrases(phrases: list[str]) -> list[str]:
     return result
 
 
-def _query_cache_key(settings: Settings, question: str, limit: int) -> tuple[Any, ...]:
+def _query_cache_key(settings: Settings, question: str, limit: int) -> tuple[Any, ...] | None:
+    projection_generation = _gbrain_projection_generation(settings)
+    if projection_generation is None:
+        return None
     return (
         settings.gbrain_endpoint or "local",
         str(settings.gbrain_home),
@@ -692,15 +696,15 @@ def _query_cache_key(settings: Settings, question: str, limit: int) -> tuple[Any
         settings.gbrain_source_id or "",
         settings.gbrain_query_detail,
         settings.gbrain_query_expand,
-        _gbrain_projection_generation(settings),
+        projection_generation,
         limit,
         question.strip(),
     )
 
 
-def _gbrain_projection_generation(settings: Settings) -> int:
+def _gbrain_projection_generation(settings: Settings) -> int | None:
     if settings.database_backend != "postgres" and not settings.database_path.exists():
-        return 0
+        return None
     try:
         with connect_app(settings) as conn:
             row = conn.execute(
@@ -708,10 +712,13 @@ def _gbrain_projection_generation(settings: Settings) -> int:
                 ("gbrain_projection_generation",),
             ).fetchone()
     except Exception:
-        return 0
+        return None
     if row is None:
-        return 0
-    return int(row["value"])
+        return None
+    try:
+        return int(row["value"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _get_cached_query(cache_key: tuple[Any, ...], ttl_seconds: int) -> list[GBrainHit] | None:
