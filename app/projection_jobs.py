@@ -11,6 +11,7 @@ from app.db import connect_app_write, json_dump
 
 OUTBOX_RETRY_DELAYS_SECONDS = (5, 30, 120, 600)
 TERMINAL_STATUSES = {"succeeded", "failed", "superseded"}
+EXHAUSTED_LEASE_ERROR = "projection lease expired after maximum attempts"
 
 
 def _utc_iso(value: datetime | None = None) -> str:
@@ -151,6 +152,16 @@ class ProjectionOutbox:
         suffix = " FOR UPDATE SKIP LOCKED" if self.settings.database_backend == "postgres" else ""
         jobs: list[ProjectionJob] = []
         with connect_app_write(self.settings) as conn:
+            conn.execute(
+                """
+                UPDATE knowledge_projection_jobs
+                SET status='failed', lease_owner=NULL, lease_expires_at=NULL,
+                    last_error=?, updated_at=?
+                WHERE target=? AND status='running' AND attempts>=5
+                  AND lease_expires_at<?
+                """,
+                (EXHAUSTED_LEASE_ERROR, claimed_iso, target, claimed_iso),
+            )
             rows = conn.execute(
                 """
                 SELECT * FROM knowledge_projection_jobs

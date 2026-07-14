@@ -191,6 +191,19 @@ class _ClaimLeaseLost(RuntimeError):
         super().__init__(f"projection claim lease lost: {', '.join(self.job_ids)}")
 
 
+async def _wait_for_task_completion(task: asyncio.Task) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                break
+        except Exception:
+            break
+    if not task.cancelled():
+        task.exception()
+
+
 class ProjectionWorker:
     def __init__(
         self,
@@ -430,7 +443,7 @@ class ProjectionWorker:
             )
             if renewal_task in done:
                 operation_task.cancel()
-                await asyncio.gather(operation_task, return_exceptions=True)
+                await _wait_for_task_completion(operation_task)
                 renewal_task.result()
                 raise RuntimeError("projection lease renewal stopped unexpectedly")
 
@@ -438,11 +451,11 @@ class ProjectionWorker:
             await renewal_task
             return operation_task.result()
         finally:
+            if not operation_task.done():
+                operation_task.cancel()
+            await _wait_for_task_completion(operation_task)
             finished.set()
-            for task in (operation_task, renewal_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(operation_task, renewal_task, return_exceptions=True)
+            await _wait_for_task_completion(renewal_task)
 
     async def _renew_claims(
         self,

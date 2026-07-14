@@ -311,6 +311,139 @@ def test_stop_waits_for_active_rag_thread_without_blocking_loop(settings, monkey
     asyncio.run(exercise())
 
 
+def test_stop_renews_rag_claim_until_physical_thread_exits(settings, monkeypatch):
+    initial_now = NOW
+    renewed_at = NOW + timedelta(seconds=2)
+    competitor_at = NOW + timedelta(seconds=4)
+    clock = [initial_now]
+    renewed_before_stop = threading.Event()
+    renewed_after_stop = threading.Event()
+
+    class ObservedOutbox(ProjectionOutbox):
+        def renew_lease(
+            self,
+            job_id,
+            worker_id,
+            lease_seconds,
+            now=None,
+        ):
+            renewed = super().renew_lease(
+                job_id,
+                worker_id,
+                lease_seconds,
+                now=now,
+            )
+            if renewed and now == initial_now:
+                renewed_before_stop.set()
+            if renewed and now == renewed_at:
+                renewed_after_stop.set()
+            return renewed
+
+    outbox = ObservedOutbox(settings)
+    with connect_app_write(settings) as conn:
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="upsert",
+            page_id="page-stop-renewal",
+            revision_id="revision-stop-renewal",
+            projection_epoch=1,
+            payload={"path": "wiki/stop-renewal.md"},
+        )
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    finish_results: list[bool] = []
+
+    class Projector:
+        def __init__(self, configured, claimed_outbox):
+            self.outbox = claimed_outbox
+
+        def project(self, job, worker_id):
+            started.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("test did not release the RAG projection")
+            finish_results.append(self.outbox.mark_succeeded(job.id, worker_id))
+            finished.set()
+
+    monkeypatch.setattr(projection_worker, "WikiRagProjector", Projector)
+    monkeypatch.setattr(projection_worker, "PROJECTION_LEASE_SECONDS", 3)
+    monkeypatch.setattr(projection_worker, "PROJECTION_LEASE_RENEW_SECONDS", 0.001)
+    worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: clock[0],
+    )
+
+    async def wait_for_threading_event(event: threading.Event) -> None:
+        while not event.is_set():
+            await asyncio.sleep(0)
+
+    async def exercise() -> None:
+        await worker.start()
+        worker_tasks = tuple(worker._tasks)
+        rag_task = next(
+            task for task in worker_tasks if task.get_name() == "projection-rag"
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        await asyncio.wait_for(
+            wait_for_threading_event(renewed_before_stop),
+            timeout=1,
+        )
+
+        stopping = asyncio.create_task(worker.stop())
+        try:
+            while worker._tasks or rag_task.cancelling() == 0:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert stopping.done() is False
+            assert rag_task.cancel() is True
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert stopping.done() is False
+
+            clock[0] = renewed_at
+            try:
+                await asyncio.wait_for(
+                    wait_for_threading_event(renewed_after_stop),
+                    timeout=0.1,
+                )
+            except TimeoutError:
+                pass
+
+            claimed = ProjectionOutbox(settings).claim(
+                target="rag",
+                worker_id="worker-b",
+                limit=1,
+                lease_seconds=30,
+                now=competitor_at,
+            )
+            assert claimed == []
+            assert renewed_after_stop.is_set()
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(stopping), timeout=1)
+
+        assert finished.is_set()
+        assert finish_results == [True]
+        assert all(task.done() for task in worker_tasks)
+        assert worker._tasks == []
+
+    asyncio.run(exercise())
+
+    with connect_app(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT status,attempts,lease_owner,lease_expires_at
+            FROM knowledge_projection_jobs WHERE id=?
+            """,
+            (job_id,),
+        ).fetchone()
+    assert tuple(row) == ("succeeded", 1, None, None)
+
+
 def test_only_one_gbrain_batch_runs_at_a_time(settings, monkeypatch):
     outbox = ScriptedOutbox(
         gbrain=[[_job("gbrain-1", "gbrain")], [_job("gbrain-2", "gbrain")]]

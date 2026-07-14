@@ -117,6 +117,65 @@ def test_fifth_attempt_can_renew_its_lease_and_finish(tmp_path):
     assert outbox.mark_succeeded(job.id, "worker_a") is True
 
 
+def test_expired_fifth_attempt_is_terminalized_before_claim(tmp_path):
+    settings = sqlite_settings(tmp_path)
+    outbox = ProjectionOutbox(settings)
+    now = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
+    with connect_app(settings) as conn:
+        seed_page(conn)
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="upsert",
+            page_id="page_1",
+            revision_id="wrev_1",
+            projection_epoch=1,
+            payload={"path": "wiki/product/faq/demo.md"},
+        )
+        conn.execute(
+            """
+            UPDATE knowledge_projection_jobs
+            SET status='failed', attempts=4, available_at=?, last_error=?
+            WHERE id=?
+            """,
+            (now.isoformat(), "attempt four failed", job_id),
+        )
+
+    fifth = outbox.claim(
+        target="rag",
+        worker_id="worker-five",
+        limit=1,
+        lease_seconds=1,
+        now=now,
+    )
+    assert [(job.id, job.attempts) for job in fifth] == [(job_id, 5)]
+
+    reaped_at = now + timedelta(seconds=2)
+    assert outbox.claim(
+        target="rag",
+        worker_id="worker-six",
+        limit=1,
+        lease_seconds=30,
+        now=reaped_at,
+    ) == []
+    with connect_app(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT status,attempts,lease_owner,lease_expires_at,last_error,updated_at
+            FROM knowledge_projection_jobs WHERE id=?
+            """,
+            (job_id,),
+        ).fetchone()
+    assert tuple(row) == (
+        "failed",
+        5,
+        None,
+        None,
+        "projection lease expired after maximum attempts",
+        reaped_at.isoformat(),
+    )
+
+
 @pytest.mark.parametrize(
     "attempt,delay_seconds",
     [(1, 5), (2, 30), (3, 120), (4, 600), (5, None)],
