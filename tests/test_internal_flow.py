@@ -22,6 +22,8 @@ def test_internal_mvp_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "database_path", data_dir / "test.db")
     monkeypatch.setattr(settings, "vault_path", vault_dir)
     monkeypatch.setattr(settings, "upload_path", tmp_path / "uploads")
+    monkeypatch.setattr(settings, "gbrain_enabled", False)
+    monkeypatch.setattr(settings, "gbrain_import_on_compile", False)
 
     client = TestClient(app)
 
@@ -122,6 +124,8 @@ def test_internal_mvp_flow(tmp_path, monkeypatch):
         f"/api/internal/wiki/pages/{page_path}",
         json={
             "content": edited_content,
+            "expected_revision_id": page_content.json()["current_revision_id"],
+            "request_id": "internal-flow-save-1",
             "review_status": "reviewed",
             "owner": "tester",
             "note": "补充企业客户规则",
@@ -135,22 +139,34 @@ def test_internal_mvp_flow(tmp_path, monkeypatch):
 
     stale = client.patch(
         f"/api/internal/wiki/pages/{page_path}/status",
-        json={"review_status": "stale", "note": "测试过期标记"},
+        json={
+            "review_status": "stale",
+            "expected_revision_id": save_page.json()["current_revision_id"],
+            "request_id": "internal-flow-status-1",
+            "note": "测试过期标记",
+        },
     )
     assert stale.status_code == 200
     assert stale.json()["review_status"] == "stale"
 
-    reviews = client.get("/api/internal/reviews?status=pending")
-    assert reviews.status_code == 200
-    assert len(reviews.json()) >= 1
-    review_id = reviews.json()[0]["id"]
-
-    review_update = client.patch(
-        f"/api/internal/reviews/{review_id}",
-        json={"status": "approved", "owner": "tester", "note": "样例通过"},
+    compile_after_manual = client.post(
+        "/api/internal/wiki/compile",
+        json={
+            "domain": "product",
+            "source_ids": [source_id],
+            "compile_job_id": "internal-flow-recompile-after-manual",
+        },
     )
-    assert review_update.status_code == 200
-    assert review_update.json()["status"] == "approved"
+    assert compile_after_manual.status_code == 200
+    assert compile_after_manual.json()["conflicted_pages"] == 1
+
+    page_after_recompile = client.get(f"/api/internal/wiki/pages/{page_path}")
+    assert page_after_recompile.status_code == 200
+    assert "企业客户需要转财务审核" in page_after_recompile.json()["content"]
+    conflicts = client.get(f"/api/internal/wiki/pages/{page_path}/conflicts")
+    assert conflicts.status_code == 200
+    assert len(conflicts.json()) == 1
+    assert conflicts.json()[0]["issue_type"] == "content_conflict"
 
     ask = client.post("/api/internal/ask", json={"question": "用户如何申请退款？", "domain": "product"})
     assert ask.status_code == 200
