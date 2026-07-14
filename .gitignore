@@ -9,7 +9,7 @@ venv/
 data/
 dist/
 node_modules/
-output/
+/output/
 vault/
 uploads/
 frontend/node_modules/

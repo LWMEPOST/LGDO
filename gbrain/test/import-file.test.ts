@@ -1,11 +1,41 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { writeFileSync, mkdirSync, rmSync, symlinkSync, readdirSync, readFileSync, existsSync } from 'fs';
+import {
+  writeFileSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  existsSync,
+} from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { importFile, importFromContent } from '../src/core/import-file.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
 
 const TMP = join(import.meta.dir, '.tmp-import-test');
+
+const fileSymlinksAvailable = (() => {
+  const probeDir = mkdtempSync(join(tmpdir(), 'gbrain-file-symlink-probe-'));
+  const targetPath = join(probeDir, 'target.md');
+  const linkPath = join(probeDir, 'link.md');
+  try {
+    writeFileSync(targetPath, 'probe');
+    symlinkSync(targetPath, linkPath, 'file');
+    return lstatSync(linkPath).isSymbolicLink();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) {
+      return false;
+    }
+    throw error;
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+})();
 
 // Minimal mock engine that tracks calls and supports transaction()
 function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
@@ -150,7 +180,7 @@ Content.
     expect(result.slug).toBe('concepts/from-path');
   });
 
-  test('skips symlinks in importFromFile (defense-in-depth)', async () => {
+  test.skipIf(!fileSymlinksAvailable)('skips symlinks in importFromFile (defense-in-depth)', async () => {
     // Even if the walker somehow passes a symlink through, importFromFile
     // should catch it and return skipped.
     const realFile = join(TMP, 'real-target.md');
@@ -163,7 +193,8 @@ Content.
 `);
     const linkPath = join(TMP, 'symlink-file.md');
     try { rmSync(linkPath); } catch { /* may not exist */ }
-    symlinkSync(realFile, linkPath);
+    symlinkSync(realFile, linkPath, 'file');
+    expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
 
     const engine = mockEngine();
     const result = await importFile(engine, linkPath, 'symlink-file.md', { noEmbed: true });
