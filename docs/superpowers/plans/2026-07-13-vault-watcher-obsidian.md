@@ -1,5 +1,11 @@
 # Vault Watcher And Obsidian Workflow Implementation Plan
 
+> [!CAUTION]
+> **Superseded on 2026-07-15. Do not execute this plan.** Use
+> [`2026-07-15-vault-watcher-obsidian-revised.md`](./2026-07-15-vault-watcher-obsidian-revised.md),
+> which corrects event ownership, external-create/relocate contracts, persistence,
+> lifecycle cleanup, authorization, and Windows safety requirements.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a persistent, restart-safe Vault watcher and Obsidian workflow so external Markdown edits flow through the existing revision/outbox contracts without overwriting user bytes or exposing stale projections.
