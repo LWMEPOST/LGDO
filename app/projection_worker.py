@@ -15,7 +15,7 @@ from app.gbrain_projection import (
     GBrainProjectionClient,
     ProjectionLeaseLost as GBrainProjectionLeaseLost,
 )
-from app.projection_jobs import ProjectionJob, ProjectionOutbox
+from app.projection_jobs import TERMINAL_STATUSES, ProjectionJob, ProjectionOutbox
 from app.wiki_rag_projection import (
     ProjectionLeaseLost as RagProjectionLeaseLost,
     ProjectionSuperseded,
@@ -193,7 +193,14 @@ class ProjectionWorker:
             nonlocal succeeded, failed, superseded
             for job in jobs:
                 try:
-                    await asyncio.to_thread(projector.project, job, self.worker_id)
+                    projection_task = asyncio.create_task(
+                        asyncio.to_thread(projector.project, job, self.worker_id)
+                    )
+                    try:
+                        await asyncio.shield(projection_task)
+                    except asyncio.CancelledError:
+                        await asyncio.gather(projection_task, return_exceptions=True)
+                        raise
                     succeeded += 1
                 except ProjectionSuperseded:
                     superseded += 1
@@ -307,9 +314,23 @@ class ProjectionWorker:
                 f"SELECT id,status FROM knowledge_projection_jobs WHERE id IN ({placeholders})",
                 job_ids,
             ).fetchall()
-        statuses = [str(row["status"]) for row in rows]
-        if not statuses:
-            statuses = ["succeeded"] * len(jobs)
+        statuses_by_id = {str(row["id"]): str(row["status"]) for row in rows}
+        missing = [job_id for job_id in job_ids if job_id not in statuses_by_id]
+        if missing:
+            raise RuntimeError(
+                f"GBrain terminal result missing claimed jobs: {', '.join(missing)}"
+            )
+        non_terminal = [
+            f"{job_id}={statuses_by_id[job_id]}"
+            for job_id in job_ids
+            if statuses_by_id[job_id] not in TERMINAL_STATUSES
+        ]
+        if non_terminal:
+            raise RuntimeError(
+                "GBrain terminal result has non-terminal claimed jobs: "
+                + ", ".join(non_terminal)
+            )
+        statuses = [statuses_by_id[job_id] for job_id in job_ids]
         return WorkerRunResult(
             target="gbrain",
             claimed=len(jobs),

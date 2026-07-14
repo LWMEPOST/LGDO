@@ -12,7 +12,7 @@ import pytest
 import app.main as main_module
 import app.projection_worker as projection_worker
 from app.config import Settings
-from app.db import connect_app, connect_app_write, init_app_db
+from app.db import connect_app, connect_app_write, init_app_db, json_dump
 from app.projection_jobs import ProjectionJob, ProjectionOutbox
 from app.wiki_rag_projection import ProjectionLeaseLost as RagProjectionLeaseLost
 
@@ -105,8 +105,101 @@ class ScriptedOutbox:
         return True
 
 
-def _patch_gbrain_repository(monkeypatch, repository_type: type) -> None:
-    monkeypatch.setattr(projection_worker, "GBrainBatchRepository", repository_type)
+def _persist_claimed_jobs(
+    settings: Settings,
+    jobs: list[ProjectionJob],
+    worker_id: str,
+) -> None:
+    with connect_app_write(settings) as conn:
+        for job in jobs:
+            existing = conn.execute(
+                "SELECT status,lease_owner FROM knowledge_projection_jobs WHERE id=?",
+                (job.id,),
+            ).fetchone()
+            if existing is not None:
+                assert (existing["status"], existing["lease_owner"]) == (
+                    "running",
+                    worker_id,
+                )
+                continue
+            conn.execute(
+                """
+                INSERT INTO knowledge_projection_jobs(
+                  id,idempotency_key,target,operation,page_id,revision_id,
+                  projection_epoch,payload_json,status,attempts,available_at,
+                  lease_owner,lease_expires_at,last_error,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    job.id,
+                    job.idempotency_key,
+                    job.target,
+                    job.operation,
+                    job.page_id,
+                    job.revision_id,
+                    job.projection_epoch,
+                    json_dump(job.payload),
+                    "running",
+                    job.attempts,
+                    job.available_at,
+                    worker_id,
+                    job.lease_expires_at,
+                    None,
+                    job.created_at,
+                    job.updated_at,
+                ),
+            )
+
+
+def _finish_test_repository_jobs(
+    settings: Settings,
+    jobs: list[ProjectionJob],
+    worker_id: str,
+) -> None:
+    outbox = ProjectionOutbox(settings)
+    with connect_app_write(settings) as conn:
+        for job in jobs:
+            row = conn.execute(
+                "SELECT status,lease_owner FROM knowledge_projection_jobs WHERE id=?",
+                (job.id,),
+            ).fetchone()
+            if row["status"] != "running":
+                continue
+            assert row["lease_owner"] == worker_id
+            assert outbox.finish_claimed(
+                conn,
+                job_id=job.id,
+                worker_id=worker_id,
+                status="succeeded",
+            )
+
+
+def _patch_gbrain_repository(
+    monkeypatch,
+    repository_type: type,
+    settings: Settings,
+) -> None:
+    class PersistingRepository(repository_type):
+        def create_batch(self, jobs, **kwargs):
+            self._claimed_jobs = list(jobs)
+            self._worker_id = str(kwargs["worker_id"])
+            _persist_claimed_jobs(settings, self._claimed_jobs, self._worker_id)
+            return super().create_batch(jobs, **kwargs)
+
+        async def execute_batch(self, batch_id, **kwargs):
+            result = await super().execute_batch(batch_id, **kwargs)
+            _finish_test_repository_jobs(
+                settings,
+                self._claimed_jobs,
+                self._worker_id,
+            )
+            return result
+
+    monkeypatch.setattr(
+        projection_worker,
+        "GBrainBatchRepository",
+        PersistingRepository,
+    )
     monkeypatch.setattr(
         projection_worker,
         "GBrainProjectionClient",
@@ -160,7 +253,7 @@ def test_stop_cancels_an_active_projection_operation(settings, monkeypatch):
                 Repository.cancelled.set()
                 raise
 
-    _patch_gbrain_repository(monkeypatch, Repository)
+    _patch_gbrain_repository(monkeypatch, Repository, settings)
     worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
 
     async def exercise() -> None:
@@ -170,6 +263,50 @@ def test_stop_cancels_an_active_projection_operation(settings, monkeypatch):
         await asyncio.wait_for(Repository.started.wait(), timeout=1)
         await worker.stop()
         assert Repository.cancelled.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_stop_waits_for_active_rag_thread_without_blocking_loop(settings, monkeypatch):
+    outbox = ScriptedOutbox(rag=[[_job("active-rag", "rag")]])
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class Projector:
+        def __init__(self, configured, claimed_outbox):
+            pass
+
+        def project(self, job, worker_id):
+            started.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("test did not release the RAG projection")
+            finished.set()
+
+    monkeypatch.setattr(projection_worker, "WikiRagProjector", Projector)
+    worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
+
+    async def exercise() -> None:
+        await worker.start()
+        while not started.is_set():
+            await asyncio.sleep(0)
+        stopping = asyncio.create_task(worker.stop())
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(stopping), timeout=0.05)
+            probe_ran = False
+
+            async def probe() -> None:
+                nonlocal probe_ran
+                await asyncio.sleep(0)
+                probe_ran = True
+
+            await asyncio.wait_for(probe(), timeout=0.1)
+            assert probe_ran is True
+        finally:
+            release.set()
+            await asyncio.wait_for(stopping, timeout=1)
+        assert finished.is_set()
 
     asyncio.run(exercise())
 
@@ -202,7 +339,7 @@ def test_only_one_gbrain_batch_runs_at_a_time(settings, monkeypatch):
             await asyncio.sleep(0)
             Repository.active -= 1
 
-    _patch_gbrain_repository(monkeypatch, Repository)
+    _patch_gbrain_repository(monkeypatch, Repository, settings)
     worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
 
     async def exercise() -> None:
@@ -246,7 +383,7 @@ def test_rag_progresses_while_gbrain_batch_is_active(settings, monkeypatch):
         def project(self, job, worker_id):
             rag_calls.append(job.id)
 
-    _patch_gbrain_repository(monkeypatch, Repository)
+    _patch_gbrain_repository(monkeypatch, Repository, settings)
     monkeypatch.setattr(projection_worker, "WikiRagProjector", Projector)
     worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
 
@@ -283,7 +420,7 @@ def test_claims_use_180_second_leases_and_renew_every_60_seconds(
             while not outbox.renewals:
                 await asyncio.sleep(0)
 
-    _patch_gbrain_repository(monkeypatch, Repository)
+    _patch_gbrain_repository(monkeypatch, Repository, settings)
     monkeypatch.setattr(projection_worker, "PROJECTION_LEASE_RENEW_SECONDS", 0.001)
     worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
 
@@ -293,6 +430,128 @@ def test_claims_use_180_second_leases_and_renew_every_60_seconds(
     assert outbox.claims[0]["lease_seconds"] == 180
     assert outbox.renewals[0]["lease_seconds"] == 180
     assert outbox.renewals[0]["now"] is NOW
+
+
+def test_gbrain_renewal_ignores_members_completed_by_an_earlier_segment(
+    settings,
+    monkeypatch,
+):
+    outbox = ProjectionOutbox(settings)
+    with connect_app_write(settings) as conn:
+        job_ids = [
+            outbox.enqueue(
+                conn,
+                target="gbrain",
+                operation="upsert",
+                page_id=f"page-{index}",
+                revision_id=f"revision-{index}",
+                projection_epoch=1,
+                payload={"path": f"wiki/page-{index}.md"},
+            )
+            for index in range(2)
+        ]
+
+    class Repository:
+        cancelled = False
+
+        def __init__(self, configured, claimed_outbox):
+            self.outbox = claimed_outbox
+            self.jobs = []
+
+        def create_batch(self, jobs, **kwargs):
+            self.jobs = list(jobs)
+            return SimpleNamespace(id="segmented-batch")
+
+        async def execute_batch(self, batch_id, **kwargs):
+            worker_id = kwargs["worker_id"]
+            with connect_app_write(settings) as conn:
+                assert self.outbox.finish_claimed(
+                    conn,
+                    job_id=self.jobs[0].id,
+                    worker_id=worker_id,
+                    status="succeeded",
+                )
+            try:
+                await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                Repository.cancelled = True
+                raise
+            with connect_app_write(settings) as conn:
+                assert self.outbox.finish_claimed(
+                    conn,
+                    job_id=self.jobs[1].id,
+                    worker_id=worker_id,
+                    status="succeeded",
+                )
+
+    _patch_gbrain_repository(monkeypatch, Repository, settings)
+    monkeypatch.setattr(projection_worker, "PROJECTION_LEASE_RENEW_SECONDS", 0.001)
+    worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
+
+    result = asyncio.run(worker.run_once("gbrain"))
+
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            "SELECT id,status FROM knowledge_projection_jobs ORDER BY id"
+        ).fetchall()
+    assert Repository.cancelled is False
+    assert result.succeeded == 2
+    assert {str(row["id"]): str(row["status"]) for row in rows} == {
+        job_id: "succeeded" for job_id in job_ids
+    }
+
+
+def test_gbrain_terminal_result_rejects_a_missing_claimed_row(settings):
+    outbox = ProjectionOutbox(settings)
+    worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
+    with connect_app_write(settings) as conn:
+        job_id = outbox.enqueue(
+            conn,
+            target="gbrain",
+            operation="upsert",
+            page_id="page-present",
+            revision_id="revision-present",
+            projection_epoch=1,
+            payload={"path": "wiki/present.md"},
+        )
+    present = outbox.claim(
+        target="gbrain",
+        worker_id=worker.worker_id,
+        limit=1,
+        lease_seconds=180,
+        now=NOW,
+    )[0]
+    assert outbox.mark_succeeded(job_id, worker.worker_id) is True
+
+    with pytest.raises(RuntimeError, match="missing.*gbrain-missing"):
+        worker._gbrain_terminal_result(
+            [present, _job("gbrain-missing", "gbrain")]
+        )
+
+
+def test_gbrain_terminal_result_rejects_a_non_terminal_claimed_row(settings):
+    outbox = ProjectionOutbox(settings)
+    worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
+    with connect_app_write(settings) as conn:
+        outbox.enqueue(
+            conn,
+            target="gbrain",
+            operation="upsert",
+            page_id="page-running",
+            revision_id="revision-running",
+            projection_epoch=1,
+            payload={"path": "wiki/running.md"},
+        )
+    running = outbox.claim(
+        target="gbrain",
+        worker_id=worker.worker_id,
+        limit=1,
+        lease_seconds=180,
+        now=NOW,
+    )[0]
+
+    with pytest.raises(RuntimeError, match="non-terminal.*running"):
+        worker._gbrain_terminal_result([running])
 
 
 def test_rag_renews_every_claimed_job_while_the_first_projection_is_active(
@@ -447,7 +706,7 @@ def test_job_enqueued_during_active_gbrain_batch_remains_pending(settings, monke
             started.set()
             await release.wait()
 
-    _patch_gbrain_repository(monkeypatch, Repository)
+    _patch_gbrain_repository(monkeypatch, Repository, settings)
     worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
 
     async def exercise() -> None:

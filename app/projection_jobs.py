@@ -207,6 +207,21 @@ class ProjectionOutbox:
         renewed_iso = _utc_iso(renewed_at)
         lease_expires_at = _utc_iso(renewed_at + timedelta(seconds=max(1, lease_seconds)))
         with connect_app_write(self.settings) as conn:
+            suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+            job = conn.execute(
+                """
+                SELECT status,lease_owner FROM knowledge_projection_jobs
+                WHERE id=?
+                """
+                + suffix,
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                return False
+            if str(job["status"]) in TERMINAL_STATUSES:
+                return True
+            if job["status"] != "running" or job["lease_owner"] != worker_id:
+                return False
             cursor = conn.execute(
                 """
                 UPDATE knowledge_projection_jobs
