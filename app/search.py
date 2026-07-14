@@ -468,10 +468,21 @@ def stream_ask_events(
             "retrieval_strategy": assembly.retrieval_strategy,
         }
     )
+    emitted_chunks: list[str] = []
     for chunk in chunks:
+        if assembly.answer_override is None:
+            citations_before = tuple(assembly.citations)
+            citations_valid = _refresh_assembly_citations(settings, assembly)
+            if not citations_valid or tuple(assembly.citations) != citations_before:
+                emitted_chunks = [CITATION_REFUSAL]
+                yield _ndjson_event(
+                    {"event": "answer_delta", "text": CITATION_REFUSAL}
+                )
+                break
+        emitted_chunks.append(chunk)
         yield _ndjson_event({"event": "answer_delta", "text": chunk})
 
-    response = finalize_ask_response(settings, assembly, "".join(chunks))
+    response = finalize_ask_response(settings, assembly, "".join(emitted_chunks))
     yield _ndjson_event({"event": "done", "response": response.model_dump()})
 
 

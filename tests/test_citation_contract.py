@@ -761,3 +761,38 @@ def test_stream_buffers_factual_chunks_until_post_generation_acl_gate(
     assert "STREAMED FACTUAL SECRET" not in "".join(deltas)
     assert any("没有找到足够依据" in delta for delta in deltas)
     assert events[-1]["response"]["citations"] == []
+
+
+def test_stream_revalidates_after_metadata_before_each_factual_delta(
+    settings, reader, monkeypatch
+):
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "app.search.query_gbrain",
+        lambda *args, **kwargs: [_valid_gbrain_hit()],
+    )
+    monkeypatch.setattr(
+        "app.search.stream_generate_answer",
+        lambda *args, **kwargs: iter(["BUFFERED FACT"]),
+    )
+
+    events = stream_ask_events(
+        settings,
+        AskRequest(question="Projected answer?", domain="product"),
+        reader,
+    )
+    metadata = json.loads(next(events))
+    assert metadata["event"] == "metadata"
+    assert len(metadata["citations"]) == 2
+
+    with connect_app_write(settings) as conn:
+        conn.execute("UPDATE sources SET status='inactive' WHERE id='src-b'")
+
+    remaining = [json.loads(line) for line in events]
+    deltas = [event["text"] for event in remaining if event["event"] == "answer_delta"]
+
+    assert "BUFFERED FACT" not in "".join(deltas)
+    assert deltas and "没有找到足够依据" in deltas[0]
+    assert remaining[-1]["event"] == "done"
+    assert "BUFFERED FACT" not in remaining[-1]["response"]["answer"]
+    assert remaining[-1]["response"]["citations"] == []
