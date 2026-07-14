@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import multiprocessing
 import os
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 
 from app import vault_writer as vault_writer_module
 from app import wiki_revisions as wiki_revisions_module
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db import connect_app, init_app_db
 from app.vault_writer import (
     AtomicVaultWriter,
@@ -25,6 +26,107 @@ from app.wiki_revisions import (
     RevisionConflict,
     WikiRevisionService,
 )
+
+
+def _claim_intent_process(
+    settings_data,
+    intent_id: str,
+    owner: str,
+    events,
+    start_event,
+) -> None:
+    try:
+        settings = Settings.model_validate(settings_data)
+        events.put((owner, "ready"))
+        if not start_event.wait(15):
+            raise TimeoutError("claim start event timed out")
+        claimed = IntentExecutor(settings, owner=owner).claim(
+            intent_id,
+            lease_seconds=120,
+        )
+        events.put((owner, "claim", claimed))
+    except BaseException as exc:
+        events.put((owner, "error", type(exc).__name__, str(exc)))
+        raise
+
+
+def _hold_intent_os_lock(
+    settings_data,
+    intent_id: str,
+    owner: str,
+    events,
+    held_event,
+    release_event,
+) -> None:
+    try:
+        settings = Settings.model_validate(settings_data)
+        executor = IntentExecutor(settings, owner=owner)
+        claimed = executor.claim(intent_id, lease_seconds=120)
+        events.put(("holder", "claim", claimed))
+        if not claimed:
+            raise RuntimeError("holder failed to claim intent")
+        lock_path = executor.writer.lock_path(intent_id)
+        with vault_writer_module.portalocker.Lock(
+            str(lock_path),
+            mode="a+",
+            timeout=0,
+        ):
+            events.put(("holder", "locked", str(lock_path)))
+            held_event.set()
+            if not release_event.wait(30):
+                raise TimeoutError("holder release event timed out")
+    except BaseException as exc:
+        events.put(("holder", "error", type(exc).__name__, str(exc)))
+        raise
+
+
+def _execute_with_os_lock_probe(
+    settings_data,
+    intent_id: str,
+    owner: str,
+    events,
+    held_event,
+) -> None:
+    real_lock = vault_writer_module.portalocker.Lock
+    try:
+        settings = Settings.model_validate(settings_data)
+        if not held_event.wait(15):
+            raise TimeoutError("holder did not acquire OS lock")
+
+        class ProbedLock:
+            def __init__(self, *args, **kwargs):
+                self.inner = real_lock(*args, **kwargs)
+                self.path = str(args[0])
+
+            def __enter__(self):
+                events.put(("contender", "lock_attempt", self.path))
+                value = self.inner.__enter__()
+                events.put(("contender", "lock_entered", self.path))
+                return value
+
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+
+        vault_writer_module.portalocker.Lock = ProbedLock
+        result = IntentExecutor(settings, owner=owner).execute(
+            intent_id,
+            lease_seconds=120,
+        )
+        events.put(("contender", "result", result))
+    except BaseException as exc:
+        events.put(("contender", "error", type(exc).__name__, str(exc)))
+        raise
+    finally:
+        vault_writer_module.portalocker.Lock = real_lock
+
+
+def _join_or_terminate(process, timeout: float = 10) -> None:
+    if process.pid is None and process.exitcode is None:
+        return
+    process.join(timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout)
 
 
 def test_writer_captures_old_inode_installs_without_replace_and_retains_backup(tmp_path: Path):
@@ -828,6 +930,221 @@ def test_only_lease_and_os_lock_owner_can_advance_intent(wiki_intent_fixture):
     assert second.claim(intent_id, now=now, lease_seconds=30) is False
     assert second.advance_phase(intent_id, expected_status="pending", status="captured") is False
     assert first.advance_phase(intent_id, expected_status="pending", status="captured") is True
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    ["intent_created", "captured", "installed"],
+)
+def test_reconcile_recovers_each_crash_point(
+    wiki_intent_fixture,
+    crash_point,
+):
+    settings, intent_id = wiki_intent_fixture
+    crashed = IntentExecutor(settings, owner=f"crash-{crash_point}")
+
+    stopped = crashed.execute(
+        intent_id,
+        stop_after=crash_point,
+        lease_seconds=1,
+    )
+
+    assert stopped is not None
+    assert stopped.intent_status == (
+        "pending" if crash_point == "intent_created" else crash_point
+    )
+    recovered = IntentExecutor(
+        settings,
+        owner=f"recover-{crash_point}",
+    ).reconcile_all(
+        now=datetime.now(timezone.utc) + timedelta(seconds=2),
+    )
+    with connect_app(settings) as conn:
+        page = conn.execute(
+            "SELECT pending_write_intent_id,current_revision_id FROM wiki_pages"
+        ).fetchone()
+        intent = conn.execute(
+            """
+            SELECT status,backup_retention_status
+            FROM vault_write_intents WHERE id=?
+            """,
+            (intent_id,),
+        ).fetchone()
+
+    assert recovered == [intent_id]
+    assert page["pending_write_intent_id"] is None
+    assert page["current_revision_id"] is not None
+    assert tuple(intent) == ("applied", "retained")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows spawn lease test")
+def test_spawn_processes_allow_exactly_one_database_lease_owner(
+    wiki_intent_fixture,
+):
+    settings, intent_id = wiki_intent_fixture
+    ctx = multiprocessing.get_context("spawn")
+    events = ctx.Queue()
+    start_event = ctx.Event()
+    owners = ("spawn-lease-a", "spawn-lease-b")
+    processes = [
+        ctx.Process(
+            target=_claim_intent_process,
+            args=(
+                settings.model_dump(mode="json"),
+                intent_id,
+                owner,
+                events,
+                start_event,
+            ),
+        )
+        for owner in owners
+    ]
+    messages = []
+    try:
+        for process in processes:
+            process.start()
+        messages.extend(events.get(timeout=15) for _ in processes)
+        start_event.set()
+        messages.extend(events.get(timeout=15) for _ in processes)
+    finally:
+        start_event.set()
+        for process in processes:
+            _join_or_terminate(process)
+        events.close()
+        events.join_thread()
+
+    assert all(process.exitcode == 0 for process in processes)
+    ready_messages = [message for message in messages if message[1] == "ready"]
+    claim_messages = [message for message in messages if message[1] == "claim"]
+    assert {message[0] for message in ready_messages} == set(owners)
+    assert len(claim_messages) == 2
+    assert sorted(message[2] for message in claim_messages) == [False, True]
+    winner = next(message[0] for message in claim_messages if message[2])
+    with connect_app(settings) as conn:
+        intent = conn.execute(
+            """
+            SELECT executor_owner,attempts,status,lease_expires_at
+            FROM vault_write_intents WHERE id=?
+            """,
+            (intent_id,),
+        ).fetchone()
+    assert intent["executor_owner"] == winner
+    assert intent["attempts"] == 1
+    assert intent["status"] == "pending"
+    assert intent["lease_expires_at"] is not None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows spawn OS lock test")
+def test_spawn_process_contender_reaches_and_loses_real_intent_os_lock(
+    wiki_intent_fixture,
+):
+    settings, intent_id = wiki_intent_fixture
+    owner = "shared-os-lock-owner"
+    settings_data = settings.model_dump(mode="json")
+    ctx = multiprocessing.get_context("spawn")
+    events = ctx.Queue()
+    held_event = ctx.Event()
+    release_event = ctx.Event()
+    holder = ctx.Process(
+        target=_hold_intent_os_lock,
+        args=(
+            settings_data,
+            intent_id,
+            owner,
+            events,
+            held_event,
+            release_event,
+        ),
+    )
+    contender = ctx.Process(
+        target=_execute_with_os_lock_probe,
+        args=(settings_data, intent_id, owner, events, held_event),
+    )
+    messages = []
+    contender_alive_before_release = True
+    contender_exitcode_before_release = None
+    writer = AtomicVaultWriter(settings.vault_path)
+    with connect_app(settings) as conn:
+        intent = conn.execute(
+            "SELECT target_path FROM vault_write_intents WHERE id=?",
+            (intent_id,),
+        ).fetchone()
+    target = settings.vault_path / intent["target_path"]
+    original_bytes = target.read_bytes()
+    database_state = None
+    try:
+        holder.start()
+        messages.append(events.get(timeout=15))
+        messages.append(events.get(timeout=15))
+        contender.start()
+        while not any(
+            message[0] == "contender"
+            and message[1] in {"result", "error"}
+            for message in messages
+        ):
+            messages.append(events.get(timeout=15))
+        contender.join(10)
+        contender_alive_before_release = contender.is_alive()
+        contender_exitcode_before_release = contender.exitcode
+        with connect_app(settings) as conn:
+            database_state = conn.execute(
+                """
+                SELECT executor_owner,attempts,status,lease_expires_at
+                FROM vault_write_intents WHERE id=?
+                """,
+                (intent_id,),
+            ).fetchone()
+    finally:
+        _join_or_terminate(contender)
+        release_event.set()
+        _join_or_terminate(holder)
+        events.close()
+        events.join_thread()
+
+    holder_claims = [
+        message
+        for message in messages
+        if message[:2] == ("holder", "claim")
+    ]
+    holder_locks = [
+        message
+        for message in messages
+        if message[:2] == ("holder", "locked")
+    ]
+    lock_attempts = [
+        message
+        for message in messages
+        if message[:2] == ("contender", "lock_attempt")
+    ]
+    lock_entries = [
+        message
+        for message in messages
+        if message[:2] == ("contender", "lock_entered")
+    ]
+    results = [
+        message
+        for message in messages
+        if message[:2] == ("contender", "result")
+    ]
+    errors = [message for message in messages if message[1] == "error"]
+    assert holder_claims == [("holder", "claim", True)]
+    assert len(holder_locks) == 1
+    assert len(lock_attempts) == 1
+    assert lock_attempts[0][2] == holder_locks[0][2]
+    assert lock_entries == []
+    assert results == [("contender", "result", None)]
+    assert errors == []
+    assert contender_alive_before_release is False
+    assert contender_exitcode_before_release == 0
+    assert contender.exitcode == holder.exitcode == 0
+    assert database_state["executor_owner"] == owner
+    assert database_state["attempts"] == 2
+    assert database_state["status"] == "pending"
+    assert database_state["lease_expires_at"] is not None
+    assert target.read_bytes() == original_bytes
+    assert not writer.backup_path(intent_id).exists()
+    assert not writer.capture_claim_path(intent_id).exists()
+    assert not writer.staged_path(intent_id).exists()
 
 
 def test_reconcile_finalizes_installed_intent_after_process_crash(wiki_intent_fixture):

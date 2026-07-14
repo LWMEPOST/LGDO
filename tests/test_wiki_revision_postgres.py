@@ -1,4 +1,3 @@
-import socket
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -16,22 +15,130 @@ from app.ingest import scan_sources
 from app.models import CompileRequest, ScanRequest
 from app.wiki import compile_wiki
 from app.wiki_markdown import capture_file_observation
-from app.wiki_revisions import RevisionConflict, WikiRevisionService
+from app.wiki_revisions import (
+    ManualSaveCommand,
+    MutationResult,
+    RevisionConflict,
+    WikiRevisionService,
+)
 
 
-def pg_available() -> bool:
+TEST_DATABASE_PREFIX = "lgdo_t16_"
+
+
+def postgres_capability() -> tuple[bool, str]:
+    admin = get_settings().model_copy(deep=True)
     try:
-        with socket.create_connection(("localhost", 5432), timeout=1):
-            return True
-    except OSError:
-        return False
+        with connect_postgres(
+            admin,
+            database="postgres",
+            autocommit=True,
+        ) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(rolsuper OR rolcreatedb, FALSE)
+                FROM pg_roles
+                WHERE rolname = current_user
+                """
+            )
+            role = cur.fetchone()
+    except Exception as exc:
+        return (
+            False,
+            "PostgreSQL maintenance connection failed for "
+            f"{admin.postgres_user}@{admin.postgres_host}:"
+            f"{admin.postgres_port}: {type(exc).__name__}: {exc}",
+        )
+    if role is None or not role[0]:
+        return (
+            False,
+            f"PostgreSQL role {admin.postgres_user!r} lacks SUPERUSER or CREATEDB",
+        )
+    return True, ""
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
-def test_postgres_revision_schema_uses_bigint_and_enforces_pending_conflict_uniqueness(monkeypatch):
-    settings = get_settings().model_copy()
-    settings.postgres_database = f"lgdo_revision_{uuid.uuid4().hex[:10]}"
-    init_postgres_schema(settings)
+def _create_test_database(admin, database_name: str) -> None:
+    from psycopg import sql
+
+    with connect_postgres(
+        admin,
+        database="postgres",
+        autocommit=True,
+    ) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s",
+            (database_name,),
+        )
+        if cur.fetchone() is not None:
+            raise AssertionError(f"refusing to reuse test database {database_name}")
+        cur.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
+        )
+
+
+def _drop_test_database(admin, database_name: str) -> None:
+    from psycopg import sql
+
+    with connect_postgres(
+        admin,
+        database="postgres",
+        autocommit=True,
+    ) as conn, conn.cursor() as cur:
+        identifier = sql.Identifier(database_name)
+        cur.execute(
+            sql.SQL("ALTER DATABASE {} WITH ALLOW_CONNECTIONS false").format(
+                identifier
+            )
+        )
+        cur.execute(
+            """
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = %s AND pid <> pg_backend_pid()
+            """,
+            (database_name,),
+        )
+        cur.execute(sql.SQL("DROP DATABASE {}").format(identifier))
+        cur.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s",
+            (database_name,),
+        )
+        assert cur.fetchone() is None, f"test database leaked: {database_name}"
+
+
+@pytest.fixture
+def postgres_settings(tmp_path):
+    available, reason = postgres_capability()
+    if not available:
+        pytest.skip(reason)
+
+    admin = get_settings().model_copy(deep=True)
+    database_name = f"{TEST_DATABASE_PREFIX}{uuid.uuid4().hex[:24]}"
+    settings = admin.model_copy(
+        deep=True,
+        update={
+            "database_backend": "postgres",
+            "postgres_database": database_name,
+            "vault_path": tmp_path / "vault",
+            "upload_path": tmp_path / "uploads",
+            "gbrain_import_on_compile": False,
+        },
+    )
+    created = False
+    try:
+        _create_test_database(admin, database_name)
+        created = True
+        init_postgres_schema(settings)
+        yield settings
+    finally:
+        if created:
+            _drop_test_database(admin, database_name)
+
+
+def test_postgres_revision_schema_uses_bigint_and_enforces_pending_conflict_uniqueness(
+    postgres_settings,
+):
+    settings = postgres_settings
 
     with connect_postgres(settings) as conn, conn.cursor() as cur:
         cur.execute(
@@ -49,18 +156,12 @@ def test_postgres_revision_schema_uses_bigint_and_enforces_pending_conflict_uniq
     assert "idx_review_pending_concurrent_conflict" in indexes
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
 def test_concurrent_first_compile_replays_the_winning_postgres_page(
     tmp_path,
     monkeypatch,
+    postgres_settings,
 ):
-    settings = get_settings().model_copy()
-    settings.database_backend = "postgres"
-    settings.postgres_database = f"lgdo_compile_{uuid.uuid4().hex[:10]}"
-    settings.vault_path = tmp_path / "vault"
-    settings.upload_path = tmp_path / "uploads"
-    settings.gbrain_import_on_compile = False
-    init_postgres_schema(settings)
+    settings = postgres_settings
 
     samples = tmp_path / "samples"
     samples.mkdir()
@@ -145,18 +246,12 @@ def test_concurrent_first_compile_replays_the_winning_postgres_page(
     assert pages[0]["current_revision_id"] == pages[0]["generated_revision_id"]
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
 def test_concurrent_external_events_share_one_postgres_observation(
     tmp_path,
     monkeypatch,
+    postgres_settings,
 ):
-    settings = get_settings().model_copy()
-    settings.database_backend = "postgres"
-    settings.postgres_database = f"lgdo_observation_{uuid.uuid4().hex[:10]}"
-    settings.vault_path = tmp_path / "vault"
-    settings.upload_path = tmp_path / "uploads"
-    settings.gbrain_import_on_compile = False
-    init_postgres_schema(settings)
+    settings = postgres_settings
 
     samples = tmp_path / "samples"
     samples.mkdir()
@@ -247,3 +342,94 @@ def test_concurrent_external_events_share_one_postgres_observation(
     assert len(observations) == 1
     assert [row["id"] for row in events] == sorted(event_ids)
     assert {row["observation_id"] for row in events} == {observations[0]["id"]}
+
+
+def test_concurrent_manual_saves_with_same_revision_have_one_postgres_winner(
+    monkeypatch,
+    postgres_settings,
+):
+    settings = postgres_settings
+    page_path = "wiki/product/faq/concurrent-manual.md"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "---\ntitle: Concurrent manual\nsource_ids: [src_manual]\n"
+        "review_status: draft\n---\n# Concurrent manual\n",
+        encoding="utf-8",
+    )
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                page_path,
+                "product",
+                "faq",
+                "Concurrent manual",
+                '["src_manual"]',
+                "draft",
+                "t0",
+                "t0",
+            ),
+        )
+    current = WikiRevisionService(settings).get_page(page_path)
+
+    barrier = threading.Barrier(2)
+    synchronized_threads: set[int] = set()
+    synchronized_threads_lock = threading.Lock()
+    thread_state = threading.local()
+    original_execute = PgCompatConnection.execute
+
+    def synchronized_execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        if (
+            normalized == "SELECT * FROM wiki_pages WHERE path=? FOR UPDATE"
+            and not getattr(thread_state, "manual_lock_synchronized", False)
+        ):
+            thread_state.manual_lock_synchronized = True
+            with synchronized_threads_lock:
+                synchronized_threads.add(threading.get_ident())
+            barrier.wait(timeout=10)
+        return original_execute(self, query, params)
+
+    monkeypatch.setattr(PgCompatConnection, "execute", synchronized_execute)
+
+    def save_once(request_id: str):
+        try:
+            return WikiRevisionService(settings).prepare_manual_save(
+                ManualSaveCommand(
+                    page_path=page_path,
+                    content=current.content + f"\nWriter {request_id}.\n",
+                    expected_revision_id=current.current_revision_id,
+                    request_id=request_id,
+                    actor="postgres-test",
+                    owner=None,
+                    note=None,
+                    review_status="draft",
+                ),
+                execute_intent=False,
+            )
+        except RevisionConflict as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(save_once, ("writer-a", "writer-b")))
+
+    mutations = [result for result in results if isinstance(result, MutationResult)]
+    conflicts = [result for result in results if isinstance(result, RevisionConflict)]
+    assert len(synchronized_threads) == 2
+    assert len(mutations) == 1
+    assert len(conflicts) == 1
+    assert mutations[0].status == "prepared"
+    assert mutations[0].write_intent_id is not None
+    assert conflicts[0].current_revision_id == current.current_revision_id
+    with connect_app(settings) as conn:
+        page = conn.execute(
+            "SELECT current_revision_id,pending_write_intent_id FROM wiki_pages"
+        ).fetchone()
+    assert page["current_revision_id"] == current.current_revision_id
+    assert page["pending_write_intent_id"] == mutations[0].write_intent_id
