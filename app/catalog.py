@@ -329,44 +329,151 @@ def _require_wiki_page_readable(
     page: PageReadResult,
     user_context: UserContext | None,
 ) -> None:
-    if user_context is None or user_context.is_admin:
-        return
-    metadata = page.metadata
-    if not can_read_metadata(
-        metadata,
-        user_context,
-        owner=metadata.get("owner"),
+    _require_wiki_artifact_readable(
+        settings,
+        artifact_path=page.page_path,
+        metadata=page.metadata,
+        source_ids=None,
+        owner=page.metadata.get("owner"),
+        user_context=user_context,
+    )
+
+
+def _artifact_source_ids(
+    metadata: dict,
+    source_ids: object | None,
+) -> list[str] | None:
+    values = (
+        metadata.get("source_ids") or []
+        if source_ids is None
+        else source_ids
+    )
+    if not isinstance(values, list) or not all(
+        isinstance(source_id, str) and source_id for source_id in values
     ):
-        raise PageNotFound(page.page_path)
-    source_ids = metadata.get("source_ids") or []
-    if not isinstance(source_ids, list) or not all(
-        isinstance(source_id, str) and source_id for source_id in source_ids
-    ):
-        raise PageNotFound(page.page_path)
+        return None
+    return list(dict.fromkeys(values))
+
+
+def _load_source_acl_rows(
+    settings: Settings,
+    source_ids: list[str],
+) -> dict[str, dict]:
     unique_source_ids = list(dict.fromkeys(source_ids))
     if not unique_source_ids:
-        return
+        return {}
     placeholders = ",".join("?" for _ in unique_source_ids)
     with connect_app(settings) as conn:
         rows = conn.execute(
             f"SELECT id,owner,metadata_json FROM sources WHERE id IN ({placeholders})",
             unique_source_ids,
         ).fetchall()
-    sources = {
+    return {
         source["id"]: source
         for row in rows
         if (source := row_to_dict(row)) is not None
     }
-    if any(
-        source_id not in sources
-        or not can_read_metadata(
+
+
+def _wiki_artifact_is_readable(
+    *,
+    metadata: dict,
+    source_ids: object | None,
+    owner: str | None,
+    user_context: UserContext | None,
+    sources: dict[str, dict],
+) -> bool:
+    if user_context is None or user_context.is_admin:
+        return True
+    if not can_read_metadata(metadata, user_context, owner=owner):
+        return False
+    artifact_source_ids = _artifact_source_ids(metadata, source_ids)
+    if artifact_source_ids is None:
+        return False
+    return all(
+        source_id in sources
+        and can_read_metadata(
             sources[source_id].get("metadata") or {},
             user_context,
             owner=sources[source_id].get("owner"),
         )
-        for source_id in unique_source_ids
+        for source_id in artifact_source_ids
+    )
+
+
+def _require_wiki_artifact_readable(
+    settings: Settings,
+    *,
+    artifact_path: str,
+    metadata: dict,
+    source_ids: object | None,
+    owner: str | None,
+    user_context: UserContext | None,
+) -> None:
+    if user_context is None or user_context.is_admin:
+        return
+    artifact_source_ids = _artifact_source_ids(metadata, source_ids)
+    sources = _load_source_acl_rows(settings, artifact_source_ids or [])
+    if not _wiki_artifact_is_readable(
+        metadata=metadata,
+        source_ids=source_ids,
+        owner=owner,
+        user_context=user_context,
+        sources=sources,
     ):
-        raise PageNotFound(page.page_path)
+        raise PageNotFound(artifact_path)
+
+
+def _load_revision_artifacts(
+    settings: Settings,
+    revision_ids: list[str],
+) -> dict[str, dict]:
+    unique_revision_ids = list(dict.fromkeys(revision_ids))
+    if not unique_revision_ids:
+        return {}
+    placeholders = ",".join("?" for _ in unique_revision_ids)
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id,source_ids_json,metadata_json
+            FROM wiki_page_revisions
+            WHERE id IN ({placeholders})
+            """,
+            unique_revision_ids,
+        ).fetchall()
+    return {
+        artifact["id"]: artifact
+        for row in rows
+        if (artifact := row_to_dict(row)) is not None
+    }
+
+
+def _conflict_artifacts_readable(
+    review: dict,
+    revisions: dict[str, dict],
+    sources: dict[str, dict],
+    user_context: UserContext | None,
+) -> bool:
+    if not _wiki_artifact_is_readable(
+        metadata=review.get("metadata") or {},
+        source_ids=review.get("source_ids"),
+        owner=review.get("owner"),
+        user_context=user_context,
+        sources=sources,
+    ):
+        return False
+    for field in ("base_revision_id", "candidate_revision_id"):
+        revision_id = review.get(field)
+        revision = revisions.get(revision_id) if isinstance(revision_id, str) else None
+        if revision is None or not _wiki_artifact_is_readable(
+            metadata=revision.get("metadata") or {},
+            source_ids=revision.get("source_ids"),
+            owner=(revision.get("metadata") or {}).get("owner"),
+            user_context=user_context,
+            sources=sources,
+        ):
+            return False
+    return True
 
 
 def _wiki_mutation_payload(
@@ -476,13 +583,34 @@ def list_wiki_page_revisions(
     service = _wiki_revision_service(settings)
     page = service.get_page(page_path)
     _require_wiki_page_readable(settings, page, user_context)
+    if user_context is None or user_context.is_admin:
+        with connect_app(settings) as conn:
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+                    (page.page_id,),
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                """
+                SELECT id,page_id,page_path,revision_number,file_hash,semantic_hash,
+                       origin,base_revision_id,source_ids_json,actor,note,
+                       metadata_json,idempotency_key,created_at
+                FROM wiki_page_revisions
+                WHERE page_id=?
+                ORDER BY revision_number DESC,id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (page.page_id, limit, offset),
+            ).fetchall()
+        return {
+            "items": [row_to_dict(row) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
     with connect_app(settings) as conn:
-        total = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
-                (page.page_id,),
-            ).fetchone()[0]
-        )
         rows = conn.execute(
             """
             SELECT id,page_id,page_path,revision_number,file_hash,semantic_hash,
@@ -491,13 +619,33 @@ def list_wiki_page_revisions(
             FROM wiki_page_revisions
             WHERE page_id=?
             ORDER BY revision_number DESC,id DESC
-            LIMIT ? OFFSET ?
             """,
-            (page.page_id, limit, offset),
+            (page.page_id,),
         ).fetchall()
+    revisions = [row_to_dict(row) or {} for row in rows]
+    source_ids: list[str] = []
+    for revision in revisions:
+        artifact_source_ids = _artifact_source_ids(
+            revision.get("metadata") or {},
+            revision.get("source_ids"),
+        )
+        if artifact_source_ids is not None:
+            source_ids.extend(artifact_source_ids)
+    sources = _load_source_acl_rows(settings, source_ids)
+    visible = [
+        revision
+        for revision in revisions
+        if _wiki_artifact_is_readable(
+            metadata=revision.get("metadata") or {},
+            source_ids=revision.get("source_ids"),
+            owner=(revision.get("metadata") or {}).get("owner"),
+            user_context=user_context,
+            sources=sources,
+        )
+    ]
     return {
-        "items": [row_to_dict(row) for row in rows],
-        "total": total,
+        "items": visible[offset : offset + limit],
+        "total": len(visible),
         "limit": limit,
         "offset": offset,
     }
@@ -525,6 +673,14 @@ def get_wiki_revision(
     current_page_path = revision.pop("current_page_path")
     page = service.get_page(current_page_path)
     _require_wiki_page_readable(settings, page, user_context)
+    _require_wiki_artifact_readable(
+        settings,
+        artifact_path=current_page_path,
+        metadata=revision.get("metadata") or {},
+        source_ids=revision.get("source_ids"),
+        owner=(revision.get("metadata") or {}).get("owner"),
+        user_context=user_context,
+    )
     return revision
 
 
@@ -536,7 +692,38 @@ def list_wiki_page_conflicts(
     service = _wiki_revision_service(settings)
     page = service.get_page(page_path)
     _require_wiki_page_readable(settings, page, user_context)
-    return service.list_conflicts(page_path, status="pending")
+    conflicts = service.list_conflicts(page_path, status="pending")
+    if user_context is None or user_context.is_admin:
+        return conflicts
+    revision_ids = [
+        revision_id
+        for conflict in conflicts
+        for revision_id in (
+            conflict.get("base_revision_id"),
+            conflict.get("candidate_revision_id"),
+        )
+        if isinstance(revision_id, str)
+    ]
+    revisions = _load_revision_artifacts(settings, revision_ids)
+    source_ids: list[str] = []
+    for artifact in [*conflicts, *revisions.values()]:
+        artifact_source_ids = _artifact_source_ids(
+            artifact.get("metadata") or {},
+            artifact.get("source_ids"),
+        )
+        if artifact_source_ids is not None:
+            source_ids.extend(artifact_source_ids)
+    sources = _load_source_acl_rows(settings, source_ids)
+    return [
+        conflict
+        for conflict in conflicts
+        if _conflict_artifacts_readable(
+            conflict,
+            revisions,
+            sources,
+            user_context,
+        )
+    ]
 
 
 def resolve_wiki_conflict(
@@ -549,12 +736,13 @@ def resolve_wiki_conflict(
 ) -> dict:
     service = _wiki_revision_service(settings)
     with connect_app(settings) as conn:
-        review = conn.execute(
-            "SELECT issue_type,page_path FROM review_items WHERE id=?",
+        review_row = conn.execute(
+            "SELECT * FROM review_items WHERE id=?",
             (review_id,),
         ).fetchone()
-    if review is None:
+    if review_row is None:
         raise PageNotFound(review_id)
+    review = row_to_dict(review_row) or {}
     page = service.get_page(review["page_path"])
     _require_wiki_page_readable(settings, page, user_context)
     if review["issue_type"] not in {
@@ -564,6 +752,32 @@ def resolve_wiki_conflict(
         raise WikiRevisionError(
             f"review item is not a resolvable conflict: {review_id}"
         )
+    if user_context is not None and not user_context.is_admin:
+        revision_ids = [
+            revision_id
+            for revision_id in (
+                review.get("base_revision_id"),
+                review.get("candidate_revision_id"),
+            )
+            if isinstance(revision_id, str)
+        ]
+        revisions = _load_revision_artifacts(settings, revision_ids)
+        source_ids: list[str] = []
+        for artifact in [review, *revisions.values()]:
+            artifact_source_ids = _artifact_source_ids(
+                artifact.get("metadata") or {},
+                artifact.get("source_ids"),
+            )
+            if artifact_source_ids is not None:
+                source_ids.extend(artifact_source_ids)
+        sources = _load_source_acl_rows(settings, source_ids)
+        if not _conflict_artifacts_readable(
+            review,
+            revisions,
+            sources,
+            user_context,
+        ):
+            raise PageNotFound(review["page_path"])
     result = service.resolve_conflict(
         ResolveConflictCommand(
             review_id=review_id,

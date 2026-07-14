@@ -634,3 +634,253 @@ def test_backup_hash_is_normalized_and_rejects_non_sha256(api_wiki_page):
     assert BackupReleaseRequest(
         expected_backup_hash="A" * 64
     ).expected_backup_hash == "a" * 64
+
+
+def _insert_public_source(settings: Settings) -> None:
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,owner,title,source_type,original_path,raw_path,
+              content_hash,size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "src_public",
+                "product",
+                None,
+                "Public Source",
+                "markdown",
+                "public-source.md",
+                "raw/public-source.md",
+                "public-source-hash",
+                1,
+                "active",
+                json.dumps({"acl_tags": ["public"]}),
+                "t0",
+                "t0",
+            ),
+        )
+
+
+@pytest.fixture
+def api_public_page_with_private_history(api_wiki_page):
+    client, api_page = api_wiki_page
+    _insert_public_source(api_page.settings)
+    service = WikiRevisionService(api_page.settings)
+    private_revision = service.get_page("wiki/product/faq/api.md")
+    service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=private_revision.page_path,
+            content=(
+                private_revision.content.replace("src_api", "src_public")
+                + "\nPublic current content.\n"
+            ),
+            expected_revision_id=private_revision.current_revision_id,
+            request_id="make-current-public",
+            actor="fixture",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        )
+    )
+    current = service.get_page(private_revision.page_path)
+    return client, api_page, private_revision, current
+
+
+def test_revision_history_filters_private_artifacts_before_pagination(
+    api_public_page_with_private_history,
+):
+    client, api_page, private_revision, current = (
+        api_public_page_with_private_history
+    )
+    public_viewer = {
+        "X-LGDO-User": "public_viewer",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "support",
+    }
+
+    page = client.get(
+        f"/api/internal/wiki/pages/{api_page.encoded_path}",
+        headers=public_viewer,
+    )
+    listing = client.get(
+        f"/api/internal/wiki/pages/{api_page.encoded_path}/revisions?limit=1&offset=0",
+        headers=public_viewer,
+    )
+    private_detail = client.get(
+        f"/api/internal/wiki/revisions/{private_revision.current_revision_id}",
+        headers=public_viewer,
+    )
+
+    assert page.status_code == 200
+    assert (
+        listing.json()["total"],
+        [item["id"] for item in listing.json()["items"]],
+        private_detail.status_code,
+    ) == (1, [current.current_revision_id], 404)
+    assert "source_ids" not in private_detail.text
+
+
+def test_finance_viewer_can_read_private_revision_history(
+    api_public_page_with_private_history,
+):
+    client, api_page, private_revision, _ = api_public_page_with_private_history
+    finance_viewer = {
+        "X-LGDO-User": "finance_user",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "finance",
+    }
+
+    listing = client.get(
+        f"/api/internal/wiki/pages/{api_page.encoded_path}/revisions",
+        headers=finance_viewer,
+    )
+    private_detail = client.get(
+        f"/api/internal/wiki/revisions/{private_revision.current_revision_id}",
+        headers=finance_viewer,
+    )
+
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 2
+    assert private_detail.status_code == 200
+    assert private_detail.json()["source_ids"] == ["src_api"]
+
+
+@dataclass(frozen=True)
+class ApiPrivateConflict:
+    review_id: str
+    encoded_path: str
+    current_revision_id: str
+    candidate_revision_id: str
+
+
+@pytest.fixture
+def api_public_page_with_private_conflict(api_wiki_page):
+    client, api_page = api_wiki_page
+    _insert_public_source(api_page.settings)
+    service = WikiRevisionService(api_page.settings)
+    page_path = "wiki/product/faq/api.md"
+    private_legacy = service.get_page(page_path)
+    service.apply_generated_candidate(
+        CompileCandidateCommand(
+            page_path=page_path,
+            content=private_legacy.content,
+            domain="product",
+            page_type="faq",
+            title="API",
+            source_ids=["src_api"],
+            owner=None,
+            source_hash="private-baseline",
+            compiler_version="wiki-revision-v1",
+            compile_job_id="private-baseline",
+        )
+    )
+    generated = service.get_page(page_path)
+    service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page_path,
+            content=(
+                generated.content.replace("src_api", "src_public")
+                + "\nPublic human edit.\n"
+            ),
+            expected_revision_id=generated.current_revision_id,
+            request_id="public-human-edit",
+            actor="fixture",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        )
+    )
+    current = service.get_page(page_path)
+    service.apply_generated_candidate(
+        CompileCandidateCommand(
+            page_path=page_path,
+            content=generated.content + "\nPrivate generated candidate.\n",
+            domain="product",
+            page_type="faq",
+            title="API",
+            source_ids=["src_api"],
+            owner=None,
+            source_hash="private-candidate",
+            compiler_version="wiki-revision-v1",
+            compile_job_id="private-candidate",
+        )
+    )
+    conflict = service.list_conflicts(page_path, status="pending")[0]
+    return client, ApiPrivateConflict(
+        review_id=conflict["id"],
+        encoded_path=quote(page_path, safe="/"),
+        current_revision_id=current.current_revision_id,
+        candidate_revision_id=conflict["candidate_revision_id"],
+    )
+
+
+def test_conflict_list_filters_private_review_and_candidate_artifacts(
+    api_public_page_with_private_conflict,
+):
+    client, conflict = api_public_page_with_private_conflict
+    public_viewer = {
+        "X-LGDO-User": "public_viewer",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "support",
+    }
+    finance_viewer = {
+        "X-LGDO-User": "finance_user",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "finance",
+    }
+
+    hidden = client.get(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}/conflicts",
+        headers=public_viewer,
+    )
+    visible = client.get(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}/conflicts",
+        headers=finance_viewer,
+    )
+
+    assert hidden.status_code == 200
+    assert hidden.json() == []
+    assert "expected_state" not in hidden.text
+    assert visible.status_code == 200
+    assert [item["id"] for item in visible.json()] == [conflict.review_id]
+
+
+def test_conflict_resolve_requires_review_candidate_and_base_acl(
+    api_public_page_with_private_conflict,
+):
+    client, conflict = api_public_page_with_private_conflict
+    public_editor = {
+        "X-LGDO-User": "public_editor",
+        "X-LGDO-Role": "editor",
+        "X-LGDO-ACL-Tags": "support",
+    }
+    finance_editor = {
+        "X-LGDO-User": "finance_editor",
+        "X-LGDO-Role": "editor",
+        "X-LGDO-ACL-Tags": "finance",
+    }
+    payload = {
+        "resolution": "keep_current",
+        "expected_current_revision_id": conflict.current_revision_id,
+        "expected_generated_revision_id": conflict.candidate_revision_id,
+        "request_id": "resolve-private-candidate",
+    }
+
+    hidden = client.post(
+        f"/api/internal/wiki/conflicts/{conflict.review_id}/resolve",
+        headers=public_editor,
+        json=payload,
+    )
+    visible = client.post(
+        f"/api/internal/wiki/conflicts/{conflict.review_id}/resolve",
+        headers=finance_editor,
+        json=payload,
+    )
+
+    assert hidden.status_code == 404
+    assert hidden.json()["detail"]["code"] == "wiki_page_not_found"
+    assert "expected_state" not in hidden.text
+    assert visible.status_code == 200
+    assert visible.json()["status"] == "resolved"
