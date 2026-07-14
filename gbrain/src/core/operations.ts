@@ -604,6 +604,8 @@ export interface Operation {
    * because the trust boundary there is the OS, not OAuth scopes.
    */
   scope?: 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin';
+  /** Restrict remote MCP discovery and dispatch to the OAuth transport. */
+  mcpExposure?: 'oauth-only';
   localOnly?: boolean;
   cliHints?: {
     name?: string;
@@ -2603,6 +2605,7 @@ const lgdo_vault_sync: Operation = {
   description: 'Synchronize a source-bound LGDO Vault from a trusted revision manifest.',
   mutating: true,
   scope: 'write',
+  mcpExposure: 'oauth-only',
   params: {
     source_id: { type: 'string', required: true },
     root: { type: 'string', required: true },

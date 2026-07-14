@@ -17,6 +17,7 @@ import type { BrainEngine } from './engine.ts';
 import { importFromContent, type ImportResult } from './import-file.ts';
 import { parseMarkdown } from './markdown.ts';
 import type { OperationContext } from './operations.ts';
+import { executeRawJsonb } from './sql-query.ts';
 import { fetchSource, parseSourceConfig } from './sources-load.ts';
 import { slugifyPath } from './sync.ts';
 
@@ -748,13 +749,15 @@ async function storeIdempotentResult(
   hash: string,
   result: LgdoVaultSyncResult,
 ): Promise<LgdoVaultSyncResult> {
-  const inserted = await engine.executeRaw<{ result_json: unknown }>(
+  const inserted = await executeRawJsonb<{ result_json: unknown }>(
+    engine,
     `INSERT INTO lgdo_vault_sync_runs
        (source_id, idempotency_key, request_hash, result_json)
      VALUES ($1, $2, $3, $4::jsonb)
      ON CONFLICT (source_id, idempotency_key) DO NOTHING
      RETURNING result_json`,
-    [input.source_id, input.idempotency_key, hash, JSON.stringify(result)],
+    [input.source_id, input.idempotency_key, hash],
+    [result],
   );
   if (inserted.length === 1) return result;
   const stored = await loadIdempotentResult(engine, input, hash);

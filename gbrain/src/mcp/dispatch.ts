@@ -10,6 +10,37 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { Operation, OperationContext, AuthInfo } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
+import { hasScope } from '../core/scope.ts';
+
+export type McpOperationSurface = 'oauth' | 'legacy-http' | 'stdio' | 'unauthenticated';
+
+function operationAvailableOnMcpSurface(
+  op: Operation,
+  surface: McpOperationSurface,
+): boolean {
+  return op.mcpExposure !== 'oauth-only' || surface === 'oauth';
+}
+
+export function operationsForMcpSurface(
+  candidates: Operation[],
+  surface: McpOperationSurface,
+): Operation[] {
+  return candidates.filter((op) => operationAvailableOnMcpSurface(op, surface));
+}
+
+export function authorizeMcpOperation(
+  auth: AuthInfo | undefined,
+  op: Operation,
+): { ok: true } | { ok: false; message: string } {
+  const required = op.scope ?? 'read';
+  if (!auth || !hasScope(auth.scopes, required)) {
+    return { ok: false, message: `requires '${required}'` };
+  }
+  if (op.name === 'lgdo_vault_sync' && (!auth.sourceId || !auth.clientId)) {
+    return { ok: false, message: 'projection token must be source-bound' };
+  }
+  return { ok: true };
+}
 
 export interface ToolResult {
   content: { type: 'text'; text: string }[];
@@ -30,6 +61,8 @@ export interface ToolResult {
 export interface DispatchOpts {
   /** Defaults to true (remote/untrusted). Local CLI callers (`gbrain call`) pass false. */
   remote?: boolean;
+  /** MCP transport boundary. Omitted callers are treated as unauthenticated. */
+  mcpSurface?: McpOperationSurface;
   /** Override the default stderr logger (e.g. CLI uses console.* directly). */
   logger?: OperationContext['logger'];
   /**
@@ -226,7 +259,8 @@ export async function dispatchToolCall(
   opts: DispatchOpts = {},
 ): Promise<ToolResult> {
   const op = operations.find(o => o.name === name);
-  if (!op) {
+  const mcpSurface = opts.mcpSurface ?? 'unauthenticated';
+  if (!op || !operationAvailableOnMcpSurface(op, mcpSurface)) {
     // Always return JSON-shaped error content. v0.31 e2e tests
     // (sources-remote-mcp.test.ts) parse content via JSON.parse so a
     // plain `Error: ...` string here breaks the contract on every
@@ -236,6 +270,23 @@ export async function dispatchToolCall(
       content: [{ type: 'text', text: JSON.stringify({ error: 'unknown_tool', message: `Unknown tool: ${name}` }, null, 2) }],
       isError: true,
     };
+  }
+
+  if (mcpSurface === 'oauth') {
+    const authorization = authorizeMcpOperation(opts.auth, op);
+    if (!authorization.ok) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            error: 'insufficient_scope',
+            message: `Operation ${name} ${authorization.message}`,
+            your_scopes: opts.auth?.scopes ?? [],
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
   }
 
   const safeParams = params || {};

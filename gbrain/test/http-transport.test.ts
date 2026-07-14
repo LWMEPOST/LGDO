@@ -212,7 +212,32 @@ describe('http-transport: auth', () => {
     const body = await r.json();
     expect(body.result.tools).toBeArray();
     expect(body.result.tools.length).toBeGreaterThan(0);
+    expect(body.result.tools.map((tool: { name: string }) => tool.name)).not.toContain('lgdo_vault_sync');
     expect(body.jsonrpc).toBe('2.0');
+  });
+
+  test('1b. legacy bearer cannot dispatch the OAuth-only LGDO projection operation', async () => {
+    const r = await fetch(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${VALID_TOKEN}`, 'Content-Type': 'application/json' },
+      body: rpc('tools/call', {
+        name: 'lgdo_vault_sync',
+        arguments: {
+          source_id: 'default',
+          root: 'C:/not-reached',
+          mode: 'reconcile',
+          expected_pages: [],
+          protected_mappings: [],
+          no_embed: true,
+          idempotency_key: 'legacy-http-rejected',
+        },
+      }),
+    });
+
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body.result.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ error: 'unknown_tool' });
   });
 
   test('2. missing Authorization header → 401', async () => {

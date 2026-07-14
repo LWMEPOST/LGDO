@@ -105,6 +105,26 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
       expect(names.has(core)).toBe(true);
     }
     expect(names.has('capture')).toBe(false); // CLI-only, must not be advertised as MCP
+    expect(names.has('lgdo_vault_sync')).toBe(false);
+  }, 30_000);
+
+  test('tools/call rejects the OAuth-only LGDO projection operation', async () => {
+    expect(connected).toBe(true);
+    const res = await client!.callTool({
+      name: 'lgdo_vault_sync',
+      arguments: {
+        source_id: 'default',
+        root: 'C:/not-reached',
+        mode: 'reconcile',
+        expected_pages: [],
+        protected_mappings: [],
+        no_embed: true,
+        idempotency_key: 'stdio-rejected',
+      },
+    });
+
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(textOf(res))).toMatchObject({ error: 'unknown_tool' });
   }, 30_000);
 
   test('tools/call get_brain_identity returns version + engine + a populated counter', async () => {

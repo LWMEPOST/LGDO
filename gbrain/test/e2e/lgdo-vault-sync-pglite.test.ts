@@ -14,6 +14,7 @@ import {
   type LgdoVaultSyncInput,
 } from '../../src/core/lgdo-vault-sync.ts';
 import { operationsByName, type OperationContext } from '../../src/core/operations.ts';
+import { dispatchToolCall } from '../../src/mcp/dispatch.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { awaitPendingSearchCacheWrites } from '../../src/core/search/hybrid.ts';
 
@@ -254,6 +255,37 @@ describe('LGDO import contracts against PGLite', () => {
 });
 
 describe('trusted LGDO Vault sync against PGLite', () => {
+  test('dispatches a source-bound projection identity through the OAuth MCP surface', async () => {
+    await resetTask4State();
+    const expected = writeTask4Page(
+      'oauth-dispatch.md',
+      'page-oauth-dispatch',
+      'rev-oauth-dispatch',
+      'oauth projection dispatch',
+    );
+    const context = task4Context();
+
+    const dispatched = await dispatchToolCall(
+      engine,
+      'lgdo_vault_sync',
+      task4Input('incremental', [expected], 'oauth-dispatch') as unknown as Record<string, unknown>,
+      {
+        remote: true,
+        sourceId: TASK4_SOURCE,
+        auth: context.auth,
+        mcpSurface: 'oauth',
+      },
+    );
+
+    expect(dispatched.isError).not.toBe(true);
+    const result = JSON.parse(dispatched.content[0].text);
+    expect(result).toMatchObject({
+      source_id: TASK4_SOURCE,
+      imported: 1,
+      errors: 0,
+    });
+  });
+
   test('rejects a legacy admin identity even when it is bound to the managed source', async () => {
     await resetTask4State();
     const expected = writeTask4Page(

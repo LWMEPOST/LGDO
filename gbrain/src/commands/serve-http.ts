@@ -28,7 +28,13 @@ import type { Operation, OperationContext, AuthInfo } from '../core/operations.t
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
-import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
+import {
+  authorizeMcpOperation,
+  dispatchToolCall,
+  operationsForMcpSurface,
+  summarizeMcpParams,
+} from '../mcp/dispatch.ts';
+export { authorizeMcpOperation } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
@@ -51,20 +57,6 @@ import {
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
-
-export function authorizeMcpOperation(
-  auth: AuthInfo,
-  op: Operation,
-): { ok: true } | { ok: false; message: string } {
-  const required = op.scope ?? 'read';
-  if (!hasScope(auth.scopes, required)) {
-    return { ok: false, message: `requires '${required}'` };
-  }
-  if (op.name === 'lgdo_vault_sync' && (!auth.sourceId || !auth.clientId)) {
-    return { ok: false, message: 'projection token must be source-bound' };
-  }
-  return { ok: true };
-}
 
 const parseMcpJson = express.json({ limit: '1mb' });
 
@@ -1459,7 +1451,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // MCP tool calls (bearer auth + scope enforcement)
   // ---------------------------------------------------------------------------
-  const mcpOperations = operations.filter(op => !op.localOnly);
+  const mcpOperations = operationsForMcpSurface(
+    operations.filter(op => !op.localOnly),
+    'oauth',
+  );
 
   // v0.36.x #1076: MCP Streamable HTTP spec — GET /mcp opens an optional SSE
   // backchannel for server-initiated messages. gbrain's transport is stateless
@@ -1639,6 +1634,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       try {
         toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
           remote: true,
+          mcpSurface: 'oauth',
           takesHoldersAllowList: tokenAllowList,
           sourceId: tokenSourceId,
           metaHook: getBrainHotMemoryMeta,

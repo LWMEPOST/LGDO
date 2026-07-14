@@ -3,6 +3,7 @@ import express from 'express';
 import type { RequestHandler } from 'express';
 import type { AddressInfo } from 'node:net';
 import * as serveHttp from '../src/commands/serve-http.ts';
+import { dispatchToolCall, operationsForMcpSurface } from '../src/mcp/dispatch.ts';
 import {
   operations,
   operationsByName,
@@ -53,6 +54,7 @@ describe('lgdo_vault_sync operation contract', () => {
 
     expect(op.mutating).toBe(true);
     expect(op.scope).toBe('write');
+    expect(op.mcpExposure).toBe('oauth-only');
     expect(op.localOnly).not.toBe(true);
     expect(op.cliHints).toBeUndefined();
 
@@ -81,6 +83,80 @@ describe('lgdo_vault_sync operation contract', () => {
 });
 
 describe('LGDO projection transport authorization', () => {
+  test('lists the projection operation only on the OAuth MCP surface', () => {
+    expect(operationsForMcpSurface(operations, 'oauth').map((op) => op.name)).toContain('lgdo_vault_sync');
+    for (const surface of ['legacy-http', 'stdio', 'unauthenticated'] as const) {
+      expect(operationsForMcpSurface(operations, surface).map((op) => op.name)).not.toContain('lgdo_vault_sync');
+    }
+  });
+
+  test('shared dispatch rejects legacy, stdio, and unauthenticated projection calls', async () => {
+    const params = {
+      source_id: 'lgdo-source',
+      root: 'C:/not-reached',
+      mode: 'reconcile',
+      expected_pages: [],
+      protected_mappings: [],
+      no_embed: true,
+      idempotency_key: 'surface-rejection',
+    };
+    const cases = [
+      {
+        surface: 'legacy-http' as const,
+        auth: auth({ scopes: [] }),
+      },
+      {
+        surface: 'stdio' as const,
+        auth: undefined,
+      },
+      {
+        surface: undefined,
+        auth: undefined,
+      },
+    ];
+
+    for (const candidate of cases) {
+      const result = await dispatchToolCall(
+        {} as OperationContext['engine'],
+        'lgdo_vault_sync',
+        params,
+        {
+          remote: true,
+          sourceId: 'lgdo-source',
+          ...(candidate.auth ? { auth: candidate.auth } : {}),
+          ...(candidate.surface ? { mcpSurface: candidate.surface } : {}),
+        },
+      );
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text)).toMatchObject({ error: 'unknown_tool' });
+    }
+  });
+
+  test('shared dispatch rejects an OAuth read token before the handler', async () => {
+    const result = await dispatchToolCall(
+      {} as OperationContext['engine'],
+      'lgdo_vault_sync',
+      {
+        source_id: 'lgdo-source',
+        root: 'C:/not-reached',
+        mode: 'reconcile',
+        expected_pages: [],
+        protected_mappings: [],
+        no_embed: true,
+        idempotency_key: 'oauth-read-rejection',
+      },
+      {
+        remote: true,
+        sourceId: 'lgdo-source',
+        auth: auth({ scopes: ['read'] }),
+        mcpSurface: 'oauth',
+      },
+    );
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ error: 'insufficient_scope' });
+  });
+
   test('rejects a read-only query token before dispatch', () => {
     const authorize = authorizeHelper();
     expect(typeof authorize, 'authorizeMcpOperation export').toBe('function');
