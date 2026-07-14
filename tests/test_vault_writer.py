@@ -123,10 +123,84 @@ def _execute_with_os_lock_probe(
 def _join_or_terminate(process, timeout: float = 10) -> None:
     if process.pid is None and process.exitcode is None:
         return
-    process.join(timeout)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout)
+
+    errors = []
+
+    def attempt(action) -> None:
+        try:
+            action()
+        except Exception as exc:
+            errors.append(exc)
+
+    def is_alive() -> bool:
+        try:
+            return process.is_alive()
+        except Exception as exc:
+            errors.append(exc)
+            return True
+
+    attempt(lambda: process.join(timeout))
+    if not is_alive():
+        if errors:
+            raise errors[0]
+        return
+
+    attempt(process.terminate)
+    attempt(lambda: process.join(timeout))
+    if is_alive():
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            attempt(kill)
+            attempt(lambda: process.join(timeout))
+    if is_alive():
+        survivor = AssertionError(
+            f"process {process.pid} is still alive after terminate/kill"
+        )
+        if errors:
+            raise survivor from errors[0]
+        raise survivor
+    if errors:
+        raise errors[0]
+
+
+@pytest.mark.parametrize("kill_succeeds", [True, False])
+def test_join_or_terminate_escalates_and_reports_survivor(kill_succeeds):
+    class FakeProcess:
+        pid = 42
+        exitcode = None
+
+        def __init__(self):
+            self.alive = True
+            self.calls = []
+
+        def join(self, timeout):
+            self.calls.append(("join", timeout))
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.calls.append(("terminate", None))
+
+        def kill(self):
+            self.calls.append(("kill", None))
+            if kill_succeeds:
+                self.alive = False
+
+    process = FakeProcess()
+    if kill_succeeds:
+        _join_or_terminate(process, timeout=3)
+    else:
+        with pytest.raises(AssertionError, match="process 42 is still alive"):
+            _join_or_terminate(process, timeout=3)
+
+    assert process.calls == [
+        ("join", 3),
+        ("terminate", None),
+        ("join", 3),
+        ("kill", None),
+        ("join", 3),
+    ]
 
 
 def test_writer_captures_old_inode_installs_without_replace_and_retains_backup(tmp_path: Path):
@@ -1007,11 +1081,20 @@ def test_spawn_processes_allow_exactly_one_database_lease_owner(
         start_event.set()
         messages.extend(events.get(timeout=15) for _ in processes)
     finally:
+        cleanup_errors = []
         start_event.set()
         for process in processes:
-            _join_or_terminate(process)
-        events.close()
-        events.join_thread()
+            try:
+                _join_or_terminate(process)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
+            events.close()
+            events.join_thread()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     assert all(process.exitcode == 0 for process in processes)
     ready_messages = [message for message in messages if message[1] == "ready"]
@@ -1095,11 +1178,23 @@ def test_spawn_process_contender_reaches_and_loses_real_intent_os_lock(
                 (intent_id,),
             ).fetchone()
     finally:
-        _join_or_terminate(contender)
+        cleanup_errors = []
+        try:
+            _join_or_terminate(contender)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         release_event.set()
-        _join_or_terminate(holder)
-        events.close()
-        events.join_thread()
+        try:
+            _join_or_terminate(holder)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            events.close()
+            events.join_thread()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     holder_claims = [
         message

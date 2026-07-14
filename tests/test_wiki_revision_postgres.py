@@ -45,19 +45,17 @@ def postgres_capability() -> tuple[bool, str]:
     except Exception as exc:
         return (
             False,
-            "PostgreSQL maintenance connection failed for "
-            f"{admin.postgres_user}@{admin.postgres_host}:"
-            f"{admin.postgres_port}: {type(exc).__name__}: {exc}",
+            f"PostgreSQL maintenance connection failed ({type(exc).__name__})",
         )
     if role is None or not role[0]:
         return (
             False,
-            f"PostgreSQL role {admin.postgres_user!r} lacks SUPERUSER or CREATEDB",
+            "PostgreSQL maintenance role lacks SUPERUSER or CREATEDB",
         )
     return True, ""
 
 
-def _create_test_database(admin, database_name: str) -> None:
+def _create_test_database(admin, database_name: str, mark_owned) -> None:
     from psycopg import sql
 
     with connect_postgres(
@@ -71,6 +69,7 @@ def _create_test_database(admin, database_name: str) -> None:
         )
         if cur.fetchone() is not None:
             raise AssertionError(f"refusing to reuse test database {database_name}")
+        mark_owned()
         cur.execute(
             sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
         )
@@ -79,31 +78,247 @@ def _create_test_database(admin, database_name: str) -> None:
 def _drop_test_database(admin, database_name: str) -> None:
     from psycopg import sql
 
-    with connect_postgres(
-        admin,
-        database="postgres",
-        autocommit=True,
-    ) as conn, conn.cursor() as cur:
-        identifier = sql.Identifier(database_name)
-        cur.execute(
+    identifier = sql.Identifier(database_name)
+    cleanup_stages = (
+        (
+            "alter",
             sql.SQL("ALTER DATABASE {} WITH ALLOW_CONNECTIONS false").format(
                 identifier
-            )
-        )
-        cur.execute(
+            ),
+            None,
+        ),
+        (
+            "terminate",
             """
             SELECT pg_terminate_backend(pid)
             FROM pg_stat_activity
             WHERE datname = %s AND pid <> pg_backend_pid()
             """,
             (database_name,),
+        ),
+        (
+            "drop",
+            sql.SQL("DROP DATABASE IF EXISTS {}").format(identifier),
+            None,
+        ),
+    )
+    errors: list[tuple[str, Exception]] = []
+    for stage, statement, params in cleanup_stages:
+        try:
+            with connect_postgres(
+                admin,
+                database="postgres",
+                autocommit=True,
+            ) as conn, conn.cursor() as cur:
+                if params is None:
+                    cur.execute(statement)
+                else:
+                    cur.execute(statement, params)
+        except Exception as exc:
+            errors.append((stage, exc))
+
+    database_exists = None
+    try:
+        with connect_postgres(
+            admin,
+            database="postgres",
+            autocommit=True,
+        ) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s",
+                (database_name,),
+            )
+            database_exists = cur.fetchone() is not None
+    except Exception as exc:
+        errors.append(("verify", exc))
+
+    failure_summary = ", ".join(
+        f"{stage}={type(error).__name__}" for stage, error in errors
+    )
+    if database_exists:
+        message = f"test database leaked: {database_name}"
+        if failure_summary:
+            message = f"{message}; cleanup failures: {failure_summary}"
+        leak = AssertionError(message)
+        if errors:
+            raise leak from errors[0][1]
+        raise leak
+    if errors:
+        failure = RuntimeError(
+            f"PostgreSQL test database cleanup failed: {failure_summary}"
         )
-        cur.execute(sql.SQL("DROP DATABASE {}").format(identifier))
-        cur.execute(
-            "SELECT 1 FROM pg_database WHERE datname = %s",
-            (database_name,),
+        raise failure from errors[0][1]
+
+
+def test_create_test_database_owns_name_before_create_connection_closes(
+    monkeypatch,
+):
+    events = []
+    owned = False
+
+    class FakeCursor:
+        created = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            if exc is None and self.created:
+                raise RuntimeError("connection close failed after CREATE")
+            return False
+
+        def execute(self, query, params=None):
+            if params is not None:
+                events.append("checked")
+                return
+            events.append(("create", owned))
+            self.created = True
+
+        @staticmethod
+        def fetchone():
+            return None
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        @staticmethod
+        def cursor():
+            return FakeCursor()
+
+    def mark_owned():
+        nonlocal owned
+        owned = True
+        events.append("owned")
+
+    monkeypatch.setitem(
+        globals(),
+        "connect_postgres",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+
+    with pytest.raises(RuntimeError, match="close failed after CREATE"):
+        _create_test_database(object(), "lgdo_t16_owned", mark_owned)
+
+    assert events == ["checked", "owned", ("create", True)]
+
+
+def test_create_test_database_does_not_own_preexisting_name(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, query, params=None):
+            events.append("checked" if params is not None else "create")
+
+        @staticmethod
+        def fetchone():
+            return (1,)
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        @staticmethod
+        def cursor():
+            return FakeCursor()
+
+    monkeypatch.setitem(
+        globals(),
+        "connect_postgres",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+
+    with pytest.raises(AssertionError, match="refusing to reuse"):
+        _create_test_database(
+            object(),
+            "lgdo_t16_existing",
+            lambda: events.append("owned"),
         )
-        assert cur.fetchone() is None, f"test database leaked: {database_name}"
+
+    assert events == ["checked"]
+
+
+def test_drop_test_database_runs_every_stage_before_reporting_leak(monkeypatch):
+    stages = []
+    connections = []
+    labels = ("alter", "terminate", "drop", "verify")
+
+    class CleanupFailure(RuntimeError):
+        pass
+
+    class FakeCursor:
+        def __init__(self, stage_index):
+            self.stage_index = stage_index
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, query, params=None):
+            label = labels[self.stage_index]
+            stages.append(label)
+            if label != "verify":
+                raise CleanupFailure(label)
+
+        @staticmethod
+        def fetchone():
+            return (1,)
+
+    class FakeConnection:
+        def __init__(self, stage_index):
+            self.stage_index = stage_index
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def cursor(self):
+            return FakeCursor(self.stage_index)
+
+    def fake_connect(admin, database, *, autocommit):
+        assert database == "postgres"
+        assert autocommit is True
+        connection = FakeConnection(len(connections))
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setitem(globals(), "connect_postgres", fake_connect)
+
+    with pytest.raises(AssertionError, match="test database leaked") as exc_info:
+        _drop_test_database(object(), "lgdo_t16_leaked")
+
+    assert stages == list(labels)
+    assert all(label in str(exc_info.value) for label in labels[:-1])
+    assert isinstance(exc_info.value.__cause__, CleanupFailure)
+    assert str(exc_info.value.__cause__) == "alter"
+
+
+def test_postgres_capability_redacts_connection_failure(monkeypatch):
+    def fail_connection(*args, **kwargs):
+        raise RuntimeError("secret-user:secret-password@internal-host")
+
+    monkeypatch.setitem(globals(), "connect_postgres", fail_connection)
+
+    available, reason = postgres_capability()
+
+    assert available is False
+    assert reason == "PostgreSQL maintenance connection failed (RuntimeError)"
 
 
 @pytest.fixture
@@ -124,14 +339,18 @@ def postgres_settings(tmp_path):
             "gbrain_import_on_compile": False,
         },
     )
-    created = False
+    owns_database = False
+
+    def mark_owned() -> None:
+        nonlocal owns_database
+        owns_database = True
+
     try:
-        _create_test_database(admin, database_name)
-        created = True
+        _create_test_database(admin, database_name, mark_owned)
         init_postgres_schema(settings)
         yield settings
     finally:
-        if created:
+        if owns_database:
             _drop_test_database(admin, database_name)
 
 
