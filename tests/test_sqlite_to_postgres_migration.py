@@ -86,6 +86,23 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
                 "migration:test:revision", "t0",
             ),
         )
+        source_revision_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions"
+        ).fetchone()[0]
+        source_revision_ids = {
+            row[0] for row in conn.execute("SELECT id FROM wiki_page_revisions").fetchall()
+        }
+        source_page = conn.execute(
+            """
+            SELECT page_id, path, current_revision_id, revision_number,
+                   projection_epoch, lifecycle_status
+            FROM wiki_pages
+            ORDER BY path
+            LIMIT 1
+            """
+        ).fetchone()
+        source_page_id, source_page_path = source_page[:2]
+        source_page_state = source_page[2:]
 
     answer_before = client.post(
         "/api/internal/ask",
@@ -139,16 +156,29 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     assert result["tables"]["document_chunks"] >= 2
     assert result["tables"]["entity_aliases"] == len(DEFAULT_ENTITY_ALIASES) + 1
     assert result["total_rows"] >= 6
-    assert result["tables"]["wiki_page_revisions"] == 1
 
     with connect_postgres(settings) as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM wiki_page_revisions")
+        target_revision_count = cur.fetchone()[0]
+        cur.execute("SELECT id FROM wiki_page_revisions")
+        target_revision_ids = {row[0] for row in cur.fetchall()}
         cur.execute(
-            "SELECT revision_number, projection_epoch, lifecycle_status FROM wiki_pages ORDER BY path LIMIT 1"
+            """
+            SELECT current_revision_id, revision_number, projection_epoch, lifecycle_status
+            FROM wiki_pages
+            WHERE page_id=%s AND path=%s
+            """,
+            (source_page_id, source_page_path),
         )
-        revision_number, projection_epoch, lifecycle_status = cur.fetchone()
-    assert revision_number == 0
-    assert projection_epoch == 0
-    assert lifecycle_status == "active"
+        target_page_state = cur.fetchone()
+    assert (
+        result["tables"]["wiki_page_revisions"]
+        == target_revision_count
+        == source_revision_count
+    )
+    assert target_revision_ids == source_revision_ids
+    assert target_page_state == source_page_state
+    assert target_page_state[0] in target_revision_ids
 
     monkeypatch.setattr(settings, "database_backend", "postgres")
     migrated_sources = client.get("/api/internal/sources?domain=product")
