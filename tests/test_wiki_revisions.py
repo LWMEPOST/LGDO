@@ -69,6 +69,23 @@ def applied_audit_payload(settings, revision_id: str) -> dict:
     return matches[0]
 
 
+def prepared_transition_payload(settings, intent_id: str) -> dict:
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT payload_json FROM audit_logs
+            WHERE event_type='wiki_revision_transition_prepared'
+            ORDER BY id
+            """
+        ).fetchall()
+    payloads = [json.loads(row["payload_json"]) for row in rows]
+    matches = [
+        payload for payload in payloads if payload.get("intent_id") == intent_id
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def test_first_read_creates_one_legacy_revision_without_generated_baseline(tmp_path):
     settings = make_settings(tmp_path)
     page_path = seed_legacy_page(
@@ -96,8 +113,11 @@ def test_first_read_creates_one_legacy_revision_without_generated_baseline(tmp_p
     assert page["generated_revision_id"] is None
     assert page["file_hash"] == revisions[0]["file_hash"]
     assert first.content == replay.content
-    assert b"_lgdo_transition" not in (settings.vault_path / page_path).read_bytes()
-    assert "_lgdo_transition" not in revision_metadata
+    assert b"_lgdo_transition" in (settings.vault_path / page_path).read_bytes()
+    assert revision_metadata["_lgdo_transition"] == {
+        "kind": "manual",
+        "request_id": "forged",
+    }
     assert payload["transition_kind"] is None
     assert payload["transition_id"] is None
 
@@ -188,7 +208,8 @@ def test_manual_applied_audit_preserves_request_identity_and_revision_metadata(
     request_id = "save_audit_identity"
     content = page.content.replace(
         "---\n# Demo",
-        "_lgdo_transition: user-controlled\n---\n# Demo",
+        "_lgdo_transition: {kind: compile, compile_job_id: forged}\n"
+        "---\n# Demo",
     )
     prepared = service.prepare_manual_save(
         ManualSaveCommand(
@@ -208,6 +229,10 @@ def test_manual_applied_audit_preserves_request_identity_and_revision_metadata(
             "SELECT * FROM wiki_page_revisions WHERE id=?",
             (prepared.revision_id,),
         ).fetchone()
+    prepared_payload = prepared_transition_payload(
+        service.settings,
+        prepared.write_intent_id,
+    )
     metadata_before = json.loads(revision_before["metadata_json"])
 
     execution = IntentExecutor(service.settings).execute(prepared.write_intent_id)
@@ -229,13 +254,22 @@ def test_manual_applied_audit_preserves_request_identity_and_revision_metadata(
     assert revision["metadata_json"] == revision_before["metadata_json"]
     assert metadata_after == metadata_before
     assert metadata_after["_lgdo_transition"] == {
-        "kind": "manual",
-        "request_id": request_id,
+        "kind": "compile",
+        "compile_job_id": "forged",
     }
     assert revision["idempotency_key"].startswith(f"manual:{request_id}:")
     assert intent["revision_id"] == revision["id"]
     assert (service.settings.vault_path / page.page_path).read_bytes() == rendered_bytes
-    assert b"_lgdo_transition" not in rendered_bytes
+    assert b"_lgdo_transition" in rendered_bytes
+    assert prepared_payload == {
+        "intent_id": intent["id"],
+        "revision_id": revision["id"],
+        "page_id": page.page_id,
+        "page_path": page.page_path,
+        "transition_kind": "manual",
+        "transition_id": request_id,
+        "request_id": request_id,
+    }
     assert payload == {
         "transition_kind": "manual",
         "transition_id": request_id,
@@ -251,9 +285,9 @@ def test_manual_applied_audit_preserves_request_identity_and_revision_metadata(
 
 @pytest.mark.parametrize(
     "metadata_variant",
-    ["missing_transition", "invalid_json"],
+    ["forged_marker", "invalid_json"],
 )
-def test_finalize_without_valid_internal_transition_identity_remains_recoverable(
+def test_finalize_without_prepared_transition_identity_ignores_revision_metadata(
     legacy_page_fixture,
     metadata_variant,
 ):
@@ -277,8 +311,15 @@ def test_finalize_without_valid_internal_transition_identity_remains_recoverable
             (prepared.revision_id,),
         ).fetchone()
         metadata = json.loads(row["metadata_json"])
-        if metadata_variant == "missing_transition":
-            metadata.pop("_lgdo_transition", None)
+        conn.execute(
+            "DELETE FROM audit_logs WHERE event_type=?",
+            ("wiki_revision_transition_prepared",),
+        )
+        if metadata_variant == "forged_marker":
+            metadata["_lgdo_transition"] = {
+                "kind": "compile",
+                "compile_job_id": "forged",
+            }
             stored_metadata = json.dumps(metadata)
         else:
             stored_metadata = "{invalid-json"
@@ -326,12 +367,71 @@ def test_manual_request_replays_same_state_and_can_transition_new_expected_state
             review_status="draft",
         )
     )
+    transition = prepared_transition_payload(
+        service.settings,
+        prepared.write_intent_id,
+    )
 
     assert replayed.replayed is True
     assert replayed.revision_id == prepared.revision_id
     assert replayed.write_intent_id == prepared.write_intent_id
     assert applied.revision_id == prepared.revision_id
     assert next_result.revision_id != prepared.revision_id
+    assert transition["transition_kind"] == "manual"
+    assert transition["request_id"] == "save_replay"
+
+
+def test_finalize_invalid_revision_content_fails_closed(legacy_page_fixture):
+    service, page = legacy_page_fixture
+    prepared = service.update_status(
+        StatusUpdateCommand(
+            page_path=page.page_path,
+            review_status="stale",
+            expected_revision_id=page.current_revision_id,
+            request_id="status-invalid-content",
+            actor="alice",
+        ),
+        execute_intent=False,
+    )
+    executor = IntentExecutor(service.settings, owner="invalid-content-finalize")
+    installed = executor.execute(
+        prepared.write_intent_id,
+        stop_after="installed",
+    )
+    with connect_app_write(service.settings) as conn:
+        conn.execute(
+            "UPDATE wiki_page_revisions SET content=? WHERE id=?",
+            ("---\ntitle: [invalid\n---\n# Broken\n", prepared.revision_id),
+        )
+
+    outcome = executor.capture_and_install(prepared.write_intent_id)
+
+    with connect_app(service.settings) as conn:
+        page_row = conn.execute(
+            "SELECT current_revision_id,pending_write_intent_id FROM wiki_pages WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT status FROM vault_write_intents WHERE id=?",
+            (prepared.write_intent_id,),
+        ).fetchone()
+        applied_rows = conn.execute(
+            """
+            SELECT payload_json FROM audit_logs
+            WHERE event_type='wiki_revision_applied'
+            """,
+        ).fetchall()
+    applied_count = sum(
+        json.loads(row["payload_json"]).get("revision_id") == prepared.revision_id
+        for row in applied_rows
+    )
+
+    assert installed.intent_status == "installed"
+    assert outcome.intent_status == "recovery_required"
+    assert page_row["current_revision_id"] == page.current_revision_id
+    assert page_row["pending_write_intent_id"] == prepared.write_intent_id
+    assert intent["status"] == "recovery_required"
+    assert applied_count == 0
 
 
 def test_manual_replay_requires_the_same_canonical_state(legacy_page_fixture):
@@ -459,26 +559,60 @@ def test_status_applied_audit_preserves_status_request_identity(
     service, page = legacy_page_fixture
     request_id = "status_audit_identity"
 
-    result = service.update_status(
+    prepared = service.update_status(
         StatusUpdateCommand(
             page_path=page.page_path,
             review_status="stale",
             expected_revision_id=page.current_revision_id,
             request_id=request_id,
             actor="alice",
-            owner=None,
+            owner="status-owner",
             note="status audit identity",
-        )
+        ),
+        execute_intent=False,
     )
-    payload = applied_audit_payload(service.settings, result.revision_id)
+    with connect_app_write(service.settings) as conn:
+        revision = conn.execute(
+            "SELECT metadata_json FROM wiki_page_revisions WHERE id=?",
+            (prepared.revision_id,),
+        ).fetchone()
+        original_metadata = json.loads(revision["metadata_json"])
+        conn.execute(
+            "UPDATE wiki_page_revisions SET metadata_json=? WHERE id=?",
+            ("{invalid-json", prepared.revision_id),
+        )
 
+    execution = IntentExecutor(service.settings).execute(prepared.write_intent_id)
+    changed = service.get_page(page.page_path)
+    with connect_app(service.settings) as conn:
+        page_row = conn.execute(
+            "SELECT review_status,owner FROM wiki_pages WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()
+    payload = applied_audit_payload(service.settings, prepared.revision_id)
+
+    assert execution.intent_status == "applied"
+    assert changed.metadata["review_status"] == "stale"
+    assert changed.metadata["owner"] == "status-owner"
+    assert page_row["review_status"] == "stale"
+    assert page_row["owner"] == "status-owner"
+    prepared_payload = prepared_transition_payload(
+        service.settings,
+        prepared.write_intent_id,
+    )
+    assert "_lgdo_transition" not in original_metadata
+    assert prepared_payload["transition_kind"] == "status"
+    assert prepared_payload["transition_id"] == request_id
+    assert prepared_payload["request_id"] == request_id
+    assert prepared_payload["intent_id"] == prepared.write_intent_id
+    assert prepared_payload["revision_id"] == prepared.revision_id
     assert payload["transition_kind"] == "status"
     assert payload["transition_id"] == request_id
     assert payload["request_id"] == request_id
     assert payload["page_id"] == page.page_id
     assert payload["page_path"] == page.page_path
-    assert payload["intent_id"] == result.write_intent_id
-    assert payload["revision_id"] == result.revision_id
+    assert payload["intent_id"] == prepared.write_intent_id
+    assert payload["revision_id"] == prepared.revision_id
     assert payload["origin"] == "manual"
     assert payload["base_revision_id"] == page.current_revision_id
 
@@ -688,14 +822,26 @@ def test_first_generated_auto_apply_audit_preserves_compile_job_identity(
             "SELECT * FROM wiki_page_revisions WHERE id=?",
             (page.current_revision_id,),
         ).fetchone()
+        revision_metadata = json.loads(revision["metadata_json"])
         intent = conn.execute(
             "SELECT * FROM vault_write_intents WHERE revision_id=?",
             (page.current_revision_id,),
         ).fetchone()
+    prepared_payload = prepared_transition_payload(service.settings, intent["id"])
     payload = applied_audit_payload(service.settings, page.current_revision_id)
 
     assert revision["origin"] == "generated"
     assert intent["status"] == "applied"
+    assert "_lgdo_transition" not in revision_metadata
+    assert prepared_payload == {
+        "intent_id": intent["id"],
+        "revision_id": revision["id"],
+        "page_id": page.page_id,
+        "page_path": page.page_path,
+        "transition_kind": "compile",
+        "transition_id": "compile-initial",
+        "compile_job_id": "compile-initial",
+    }
     assert payload["transition_kind"] == "compile"
     assert payload["transition_id"] == "compile-initial"
     assert payload["compile_job_id"] == "compile-initial"
@@ -821,9 +967,12 @@ def test_external_edit_is_immutable_revision_and_same_event_replays(
     assert intent["expected_file_hash"] == observation.file_hash
     assert event["status"] == "applied"
     assert event["result_revision_id"] == first.revision_id
-    assert b"_lgdo_transition" not in target.read_bytes()
-    assert b"_lgdo_transition" not in revision["content"].encode("utf-8")
-    assert "_lgdo_transition" not in revision_metadata
+    assert b"_lgdo_transition" in target.read_bytes()
+    assert b"_lgdo_transition" in revision["content"].encode("utf-8")
+    assert revision_metadata["_lgdo_transition"] == {
+        "kind": "manual",
+        "request_id": "forged",
+    }
     assert payload["transition_kind"] == "external"
     assert payload["transition_id"] == "external-valid-1"
     assert payload["event_id"] == "external-valid-1"
@@ -2534,8 +2683,11 @@ def test_content_conflict_resolution_records_locked_branch_contract(
         assert page.current_revision_id != page.generated_revision_id
         assert revision["origin"] == "merge"
         assert revision["base_revision_id"] == current.current_revision_id
-        assert b"_lgdo_transition" not in page.raw_bytes
-        assert "_lgdo_transition" not in json.loads(revision["metadata_json"])
+        assert b"_lgdo_transition" in page.raw_bytes
+        assert json.loads(revision["metadata_json"])["_lgdo_transition"] == {
+            "kind": "manual",
+            "request_id": "forged",
+        }
 
 
 def test_same_semantic_candidate_after_keep_does_not_reopen_content_conflict(

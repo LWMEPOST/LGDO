@@ -17,7 +17,6 @@ from app.timeutil import now_iso
 from app.wiki_markdown import (
     FileObservationInput,
     MarkdownParseError,
-    ParsedWikiDocument,
     compute_file_hash,
     compute_semantic_hash,
     parse_wiki_bytes,
@@ -37,13 +36,6 @@ MutationStatus = Literal[
 ]
 
 VALID_REVIEW_STATUSES = frozenset({"draft", "reviewed", "stale", "rejected"})
-_TRANSITION_METADATA_KEY = "_lgdo_transition"
-
-
-def _strip_transition_marker(document: ParsedWikiDocument) -> bool:
-    had_marker = _TRANSITION_METADATA_KEY in document.frontmatter
-    document.frontmatter.pop(_TRANSITION_METADATA_KEY, None)
-    return had_marker
 
 
 def _copy_file_no_replace(
@@ -425,7 +417,6 @@ class WikiRevisionService:
                     source_document = parse_wiki_bytes(
                         command.content.encode("utf-8")
                     )
-                    _strip_transition_marker(source_document)
                     source_semantic_hash = compute_semantic_hash(source_document)
                     if (
                         pending["origin"] == "generated"
@@ -501,7 +492,6 @@ class WikiRevisionService:
                 revision_id = f"wrev_{uuid.uuid4().hex}"
                 write_token = f"write_{uuid.uuid4().hex}"
                 document = parse_wiki_bytes(original)
-                _strip_transition_marker(document)
                 rendered = render_managed_frontmatter(
                     document,
                     page_id=page_id,
@@ -2308,7 +2298,6 @@ class WikiRevisionService:
                     else:
                         try:
                             document = parse_wiki_bytes(content)
-                            _strip_transition_marker(document)
                             source_ids = _source_ids(_plain(document.frontmatter))
                             status_value = document.frontmatter.get(
                                 "review_status",
@@ -2503,10 +2492,6 @@ class WikiRevisionService:
         if existing is not None:
             return RevisionRecord.from_row(existing)
         document = parse_wiki_bytes(content)
-        if _strip_transition_marker(document):
-            raise WikiRevisionError(
-                "reserved transition marker reached revision creation"
-            )
         old_number = int(page["revision_number"] or 0)
         next_number = old_number + 1
         record = RevisionRecord(
@@ -2753,7 +2738,6 @@ class WikiRevisionService:
             )
         try:
             document = parse_wiki_bytes(content)
-            _strip_transition_marker(document)
             _source_ids(_plain(document.frontmatter))
             _review_status(document.frontmatter.get("review_status"))
         except MarkdownParseError as exc:
@@ -2831,7 +2815,6 @@ class WikiRevisionService:
             document.frontmatter.get("review_status")
             or page.get("review_status")
         )
-        _strip_transition_marker(document)
         rendered = render_managed_frontmatter(
             document,
             page_id=page["page_id"],
@@ -4468,7 +4451,6 @@ class WikiRevisionService:
                     document.frontmatter[key] = value
                 if owner is not None:
                     document.frontmatter["owner"] = owner
-                _strip_transition_marker(document)
                 if review_status_required:
                     status_value = review_status
                 elif "review_status" in document.frontmatter:
@@ -4487,10 +4469,6 @@ class WikiRevisionService:
                 )
                 final_document = parse_wiki_bytes(rendered)
                 metadata = _plain(final_document.frontmatter)
-                metadata[_TRANSITION_METADATA_KEY] = {
-                    "kind": transition_prefix,
-                    "request_id": request_id,
-                }
                 revision = self._create_revision_locked(
                     locked.conn,
                     locked.page,
@@ -4511,6 +4489,15 @@ class WikiRevisionService:
                     expected_revision_id=expected_revision_id,
                     expected_file_hash=locked.page.get("file_hash"),
                     write_token=write_token,
+                )
+                self._record_prepared_transition_locked(
+                    locked.conn,
+                    locked.page,
+                    intent_id=intent_id,
+                    revision=revision,
+                    transition_kind=transition_prefix,
+                    transition_id=request_id,
+                    request_id=request_id,
                 )
                 prepared = MutationResult(
                     page_id=locked.page["page_id"],
@@ -4693,7 +4680,6 @@ class WikiRevisionService:
                 f"{command.source_hash}:{command.compiler_version}:"
             )
             source_document = parse_wiki_bytes(command.content.encode("utf-8"))
-            _strip_transition_marker(source_document)
             candidate_semantic_hash = compute_semantic_hash(source_document)
             latest_generated = locked.conn.execute(
                 """
@@ -4737,10 +4723,6 @@ class WikiRevisionService:
                 revision_metadata = _plain(final_document.frontmatter)
                 revision_metadata["source_hash"] = command.source_hash
                 revision_metadata["compiler_version"] = command.compiler_version
-                revision_metadata[_TRANSITION_METADATA_KEY] = {
-                    "kind": "compile",
-                    "compile_job_id": command.compile_job_id,
-                }
                 candidate = self._create_revision_locked(
                     locked.conn,
                     locked.page,
@@ -4842,6 +4824,15 @@ class WikiRevisionService:
                     expected_revision_id=old_current,
                     expected_file_hash=disk_hash,
                     write_token=write_token,
+                )
+                self._record_prepared_transition_locked(
+                    locked.conn,
+                    locked.page,
+                    intent_id=intent_id,
+                    revision=candidate,
+                    transition_kind="compile",
+                    transition_id=command.compile_job_id,
+                    compile_job_id=command.compile_job_id,
                 )
                 prepared = MutationResult(
                     page_id=locked.page["page_id"],
@@ -5020,6 +5011,62 @@ class WikiRevisionService:
                 continue
             if isinstance(payload, dict):
                 yield payload
+
+    def _record_prepared_transition_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        *,
+        intent_id: str,
+        revision: RevisionRecord,
+        transition_kind: str,
+        transition_id: str,
+        request_id: str | None = None,
+        compile_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        if transition_kind == "compile":
+            if compile_job_id != transition_id or request_id is not None:
+                raise ValueError("compile transition identity is inconsistent")
+            specific_identity = {"compile_job_id": compile_job_id}
+        elif transition_kind in {"manual", "human", "status", "metadata"}:
+            if request_id != transition_id or compile_job_id is not None:
+                raise ValueError("human transition identity is inconsistent")
+            specific_identity = {"request_id": request_id}
+        else:
+            raise ValueError(f"unsupported transition kind: {transition_kind}")
+        if not transition_id:
+            raise ValueError("transition identity must be nonblank")
+
+        payload = {
+            "intent_id": intent_id,
+            "revision_id": revision.id,
+            "page_id": page["page_id"],
+            "page_path": page["path"],
+            "transition_kind": transition_kind,
+            "transition_id": transition_id,
+            **specific_identity,
+        }
+        existing = [
+            item
+            for item in self._audit_payloads_locked(
+                conn,
+                "wiki_revision_transition_prepared",
+            )
+            if item.get("intent_id") == intent_id
+        ]
+        if any(item != payload for item in existing):
+            raise WikiRevisionError(
+                "prepared revision transition identity changed"
+            )
+        if existing:
+            return existing[0]
+        audit(
+            conn,
+            "wiki_revision_transition_prepared",
+            payload,
+            now_iso(),
+        )
+        return payload
 
     def _resolution_payload_for_command_locked(
         self,
@@ -5574,7 +5621,6 @@ class WikiRevisionService:
                     document = parse_wiki_bytes(
                         command.merged_content.encode("utf-8")
                     )
-                    _strip_transition_marker(document)
                     effective_status = _review_status(
                         document.frontmatter.get("review_status")
                         or locked.page.get("review_status")
@@ -5958,12 +6004,77 @@ class WikiRevisionService:
                 return payload
         return None
 
+    def _prepared_transition_for_intent_locked(
+        self,
+        conn: Any,
+        intent: Any,
+        revision: Any,
+    ) -> dict[str, Any] | None:
+        matching = [
+            payload
+            for payload in self._audit_payloads_locked(
+                conn,
+                "wiki_revision_transition_prepared",
+            )
+            if payload.get("intent_id") == intent["id"]
+            and payload.get("revision_id") == revision["id"]
+        ]
+        if not matching:
+            return None
+        payload = matching[0]
+        if any(item != payload for item in matching[1:]):
+            raise WikiRevisionError(
+                "prepared revision transition audits are inconsistent"
+            )
+        required = (
+            "intent_id",
+            "revision_id",
+            "page_id",
+            "page_path",
+            "transition_kind",
+            "transition_id",
+        )
+        if any(
+            not isinstance(payload.get(key), str) or not payload[key]
+            for key in required
+        ):
+            raise WikiRevisionError("prepared revision transition audit is invalid")
+        if (
+            payload["page_id"] != intent["page_id"]
+            or payload["page_id"] != revision["page_id"]
+            or payload["page_path"] != intent["target_path"]
+            or payload["page_path"] != revision["page_path"]
+        ):
+            raise WikiRevisionError(
+                "prepared revision transition page identity changed"
+            )
+
+        kind = payload["transition_kind"]
+        transition_id = payload["transition_id"]
+        if kind == "compile":
+            valid = (
+                revision["origin"] == "generated"
+                and payload.get("compile_job_id") == transition_id
+            )
+        else:
+            valid = (
+                kind in {"manual", "human", "status", "metadata"}
+                and revision["origin"] == "manual"
+                and payload.get("request_id") == transition_id
+            )
+        if not valid:
+            raise WikiRevisionError(
+                "prepared revision transition origin is inconsistent"
+            )
+        return payload
+
     @staticmethod
     def _applied_transition_identity(
         *,
         origin: str,
         metadata: dict[str, Any],
         resolution_payload: dict[str, Any] | None,
+        prepared_transition_payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
         identity: dict[str, Any] = {
             "transition_kind": None,
@@ -5993,30 +6104,19 @@ class WikiRevisionService:
                 )
             return identity
 
-        transition = metadata.get(_TRANSITION_METADATA_KEY)
-        if not isinstance(transition, dict):
-            return identity
-        kind = transition.get("kind")
-        if kind in {"manual", "human", "status", "metadata", "resolve"}:
-            request_id = transition.get("request_id")
-            if isinstance(request_id, str) and request_id:
-                identity.update(
-                    {
-                        "transition_kind": kind,
-                        "transition_id": request_id,
-                        "request_id": request_id,
-                    }
-                )
-        elif kind == "compile":
-            compile_job_id = transition.get("compile_job_id")
-            if isinstance(compile_job_id, str) and compile_job_id:
-                identity.update(
-                    {
-                        "transition_kind": "compile",
-                        "transition_id": compile_job_id,
-                        "compile_job_id": compile_job_id,
-                    }
-                )
+        if prepared_transition_payload is not None:
+            kind = prepared_transition_payload["transition_kind"]
+            transition_id = prepared_transition_payload["transition_id"]
+            identity.update(
+                {
+                    "transition_kind": kind,
+                    "transition_id": transition_id,
+                }
+            )
+            if kind == "compile":
+                identity["compile_job_id"] = transition_id
+            else:
+                identity["request_id"] = transition_id
         return identity
 
     def _validate_prepared_resolution_locked(
@@ -6129,6 +6229,15 @@ class WikiRevisionService:
                     revision,
                     resolution_payload,
                 )
+            prepared_transition_payload = None
+            if resolution_payload is None and revision["origin"] != "external":
+                prepared_transition_payload = (
+                    self._prepared_transition_for_intent_locked(
+                        locked.conn,
+                        intent,
+                        revision,
+                    )
+                )
             if (
                 intent["status"] != "installed"
                 or intent["executor_owner"] != executor_owner
@@ -6151,6 +6260,20 @@ class WikiRevisionService:
                 else (intent["expected_revision_id"],)
             )
             next_epoch = int(locked.page["projection_epoch"] or 0) + 1
+            try:
+                content_document = parse_wiki_bytes(
+                    revision["content"].encode("utf-8")
+                )
+            except (AttributeError, UnicodeEncodeError, MarkdownParseError) as exc:
+                raise WikiRevisionError(
+                    f"write revision content is invalid: {revision['id']}"
+                ) from exc
+            content_metadata = _plain(content_document.frontmatter)
+            content_review_status = _review_status(
+                content_metadata.get("review_status")
+                or locked.page["review_status"]
+            )
+            content_owner = content_metadata.get("owner")
             try:
                 loaded_metadata = json.loads(revision["metadata_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
@@ -6177,8 +6300,8 @@ class WikiRevisionService:
                     intent["write_token"],
                     next_epoch,
                     observed_file_hash,
-                    metadata.get("review_status") or locked.page["review_status"],
-                    metadata.get("owner"),
+                    content_review_status,
+                    content_owner,
                     now_iso(),
                     intent["page_id"],
                     intent_id,
@@ -6268,8 +6391,11 @@ class WikiRevisionService:
                     "lifecycle_status": "active",
                     "sync_error": None,
                     "observed_file_hash": observed_file_hash,
+                    "review_status": content_review_status,
                 }
             )
+            if content_owner is not None:
+                locked.page["owner"] = content_owner
             displaced_candidate = None
             displaced_expected_state_extra = None
             displaced_lineage = self._recovery_displaced_lineage_locked(
@@ -6337,6 +6463,7 @@ class WikiRevisionService:
                         origin=revision["origin"],
                         metadata=metadata,
                         resolution_payload=resolution_payload,
+                        prepared_transition_payload=prepared_transition_payload,
                     ),
                 },
                 now_iso(),
