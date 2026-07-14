@@ -101,7 +101,8 @@ def test_query_gbrain_merges_candidates_and_reranks_domain_hits(monkeypatch):
 
     hits = query_gbrain(settings, "专业套餐的用户生成图片时积分不够了，有哪些补充积分的办法？", limit=2)
 
-    assert hits[0].source_id == "KB-0045"
+    assert hits[0].source_id == "default"
+    assert hits[0].gbrain_source_id == "default"
     assert hits[0].slug.endswith("kb-0045_kb_积分系统完全指南")
     assert ("search", "补充积分") in calls
 
@@ -142,8 +143,10 @@ def test_query_gbrain_uses_explicit_domain_phrases_as_candidates(monkeypatch):
     pricing_hits = query_gbrain(settings, "日均 500 次文生图调用应该选择什么套餐组合？", limit=2)
     dependency_hits = query_gbrain(settings, "哪些子系统或 API 直接依赖内容安全审核引擎？", limit=2)
 
-    assert pricing_hits[0].source_id == "TBL-0063"
-    assert dependency_hits[0].source_id == "API-0010"
+    assert pricing_hits[0].source_id == "default"
+    assert pricing_hits[0].gbrain_source_id == "default"
+    assert dependency_hits[0].source_id == "default"
+    assert dependency_hits[0].gbrain_source_id == "default"
     assert ("search", "套餐组合") in calls
     assert ("search", "内容安全审核引擎") in calls
 
@@ -222,8 +225,10 @@ def test_query_gbrain_uses_short_ttl_cache(monkeypatch):
     first = query_gbrain(settings, "积分不够怎么办？", limit=1)
     second = query_gbrain(settings, "积分不够怎么办？", limit=1)
 
-    assert first[0].source_id == "KB-0045"
-    assert second[0].source_id == "KB-0045"
+    assert first[0].source_id == "default"
+    assert first[0].gbrain_source_id == "default"
+    assert second[0].source_id == "default"
+    assert second[0].gbrain_source_id == "default"
     assert calls.count("query") == 1
 
 

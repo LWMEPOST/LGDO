@@ -15,6 +15,7 @@ from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
 from app.config import Settings
+from app.db import connect_app
 from app.vault import ensure_vault
 
 
@@ -40,10 +41,22 @@ class GBrainHit:
     snippet: str
     score: float
     source_id: str | None = None
+    gbrain_source_id: str | None = None
+    source_path: str | None = None
+    content_hash: str | None = None
+    page_generation: int | None = None
     page_type: str | None = None
     chunk_id: int | None = None
     relational_path: list[str] | None = None
     relational_via_link_types: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_id is not None and self.gbrain_source_id is not None:
+            if self.source_id != self.gbrain_source_id:
+                raise ValueError("GBrain source namespace aliases must match")
+        namespace = self.gbrain_source_id if self.gbrain_source_id is not None else self.source_id
+        object.__setattr__(self, "source_id", namespace)
+        object.__setattr__(self, "gbrain_source_id", namespace)
 
 
 @dataclass(frozen=True)
@@ -584,10 +597,7 @@ def normalize_gbrain_hits(result: Any) -> list[GBrainHit]:
             or item.get("snippet")
             or ""
         ).strip()
-        inferred_source_id = _optional_str(item.get("source_id"))
-        doc_code = infer_gbrain_doc_code(slug, title, snippet, inferred_source_id)
-        if doc_code:
-            inferred_source_id = doc_code
+        gbrain_source_id = _optional_str(item.get("gbrain_source_id") or item.get("source_id"))
         if not slug and not snippet:
             continue
         hits.append(
@@ -596,7 +606,11 @@ def normalize_gbrain_hits(result: Any) -> list[GBrainHit]:
                 title=title,
                 snippet=clip_gbrain_text(snippet),
                 score=_as_float(item.get("score")),
-                source_id=inferred_source_id,
+                source_id=gbrain_source_id,
+                gbrain_source_id=gbrain_source_id,
+                source_path=_optional_str(item.get("source_path")),
+                content_hash=_optional_str(item.get("content_hash")),
+                page_generation=_optional_int(item.get("page_generation")),
                 page_type=_optional_str(item.get("type") or item.get("page_type")),
                 chunk_id=_optional_int(item.get("chunk_id")),
                 relational_path=_optional_str_list(item.get("relational_path")),
@@ -623,9 +637,14 @@ def rank_gbrain_hits(hits: list[GBrainHit], question: str, limit: int) -> list[G
     query = _normalize_match(question)
     ranked: list[tuple[float, GBrainHit]] = []
     for hit in hits:
-        haystack = _normalize_match(f"{hit.slug}\n{hit.title}\n{hit.snippet}\n{hit.source_id or ''}")
+        doc_code = infer_gbrain_doc_code(hit.slug, hit.title, hit.snippet)
+        haystack = _normalize_match(
+            f"{hit.slug}\n{hit.title}\n{hit.snippet}\n{hit.gbrain_source_id or ''}\n{doc_code or ''}"
+        )
         score = hit.score
-        if hit.source_id and _normalize_match(hit.source_id) in query:
+        if hit.gbrain_source_id and _normalize_match(hit.gbrain_source_id) in query:
+            score += 4.0
+        if doc_code and _normalize_match(doc_code) in query:
             score += 4.0
         for phrase in _domain_query_phrases(question):
             if _normalize_match(phrase) in haystack:
@@ -673,9 +692,26 @@ def _query_cache_key(settings: Settings, question: str, limit: int) -> tuple[Any
         settings.gbrain_source_id or "",
         settings.gbrain_query_detail,
         settings.gbrain_query_expand,
+        _gbrain_projection_generation(settings),
         limit,
         question.strip(),
     )
+
+
+def _gbrain_projection_generation(settings: Settings) -> int:
+    if settings.database_backend != "postgres" and not settings.database_path.exists():
+        return 0
+    try:
+        with connect_app(settings) as conn:
+            row = conn.execute(
+                "SELECT value FROM projection_state WHERE key = ?",
+                ("gbrain_projection_generation",),
+            ).fetchone()
+    except Exception:
+        return 0
+    if row is None:
+        return 0
+    return int(row["value"])
 
 
 def _get_cached_query(cache_key: tuple[Any, ...], ttl_seconds: int) -> list[GBrainHit] | None:
@@ -710,7 +746,7 @@ def call_gbrain_tool(
     if settings.gbrain_endpoint:
         return _call_http_mcp(
             settings.gbrain_endpoint,
-            settings.gbrain_api_key,
+            settings.gbrain_query_token,
             tool_name,
             arguments or {},
             timeout or settings.gbrain_query_timeout_seconds,
