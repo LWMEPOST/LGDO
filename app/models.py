@@ -2,11 +2,25 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 DOMAIN_PATTERN = "^(product|customer_service|administration)$"
+BoundedWikiIdentifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
+Sha256Hex = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        to_lower=True,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    ),
+]
 
 
 class ScanRequest(BaseModel):
@@ -196,8 +210,8 @@ class ReviewUpdateRequest(BaseModel):
 
 class WikiStatusUpdateRequest(BaseModel):
     review_status: str = Field(pattern="^(draft|reviewed|stale|rejected)$")
-    expected_revision_id: str | None = None
-    request_id: str
+    expected_revision_id: BoundedWikiIdentifier | None = None
+    request_id: BoundedWikiIdentifier
     owner: str | None = None
     note: str | None = None
 
@@ -218,8 +232,8 @@ class WikiPageContentResponse(BaseModel):
 
 class WikiPageSaveRequest(BaseModel):
     content: str
-    expected_revision_id: str | None = None
-    request_id: str
+    expected_revision_id: BoundedWikiIdentifier | None = None
+    request_id: BoundedWikiIdentifier
     review_status: str = Field(default="draft", pattern="^(draft|reviewed|stale|rejected)$")
     owner: str | None = None
     note: str | None = None
@@ -228,9 +242,9 @@ class WikiPageSaveRequest(BaseModel):
 class ConflictResolveRequest(BaseModel):
     resolution: Literal["keep_current", "accept_candidate", "merged_content"]
     merged_content: str | None = None
-    expected_current_revision_id: str
-    expected_generated_revision_id: str | None = None
-    request_id: str
+    expected_current_revision_id: BoundedWikiIdentifier
+    expected_generated_revision_id: BoundedWikiIdentifier | None = None
+    request_id: BoundedWikiIdentifier
     note: str | None = None
 
 
@@ -298,7 +312,7 @@ class WikiConflictResponse(BaseModel):
 
 
 class BackupReleaseRequest(BaseModel):
-    expected_backup_hash: str
+    expected_backup_hash: Sha256Hex
 
 
 class BackupReleaseResponse(BaseModel):

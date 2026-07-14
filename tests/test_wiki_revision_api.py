@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings, get_settings
 from app.db import connect_app, init_app_db
 from app.main import app
+from app.models import BackupReleaseRequest
 from app.vault_writer import IntentExecutor
 from app.wiki_revisions import (
     CompileCandidateCommand,
@@ -49,6 +50,29 @@ def api_wiki_page(tmp_path, monkeypatch):
     )
     init_app_db(settings)
     with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,owner,title,source_type,original_path,raw_path,
+              content_hash,size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "src_api",
+                "product",
+                "finance_owner",
+                "API Source",
+                "markdown",
+                "api-source.md",
+                "raw/api-source.md",
+                "source-hash",
+                1,
+                "active",
+                json.dumps({"acl_tags": ["finance"]}),
+                "t0",
+                "t0",
+            ),
+        )
         conn.execute(
             """
             INSERT INTO wiki_pages(
@@ -417,3 +441,196 @@ def test_specific_wiki_routes_are_registered_before_greedy_page_routes():
     for path, method in specific_routes:
         assert route_index(path, method) < greedy_get
         assert route_index(path, method) < greedy_put
+
+
+def test_wiki_reads_require_page_and_all_source_acl(api_content_conflict):
+    client, conflict = api_content_conflict
+    admin_revisions = client.get(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}/revisions"
+    ).json()
+    revision_id = admin_revisions["items"][0]["id"]
+    outsider = {
+        "X-LGDO-User": "outsider",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "support",
+    }
+    finance = {
+        "X-LGDO-User": "finance_user",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "finance",
+    }
+
+    hidden = [
+        client.get(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}",
+            headers=outsider,
+        ),
+        client.get(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}/revisions",
+            headers=outsider,
+        ),
+        client.get(
+            f"/api/internal/wiki/revisions/{revision_id}",
+            headers=outsider,
+        ),
+        client.get(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}/conflicts",
+            headers=outsider,
+        ),
+    ]
+    assert [response.status_code for response in hidden] == [404, 404, 404, 404]
+    assert all(
+        response.json()["detail"]["code"] == "wiki_page_not_found"
+        for response in hidden
+    )
+    assert all("expected_state" not in response.text for response in hidden)
+    outsider_pages = client.get("/api/internal/wiki/pages", headers=outsider)
+    assert outsider_pages.status_code == 200
+    assert outsider_pages.json() == []
+
+    visible = [
+        client.get(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}",
+            headers=finance,
+        ),
+        client.get(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}/revisions",
+            headers=finance,
+        ),
+        client.get(
+            f"/api/internal/wiki/revisions/{revision_id}",
+            headers=finance,
+        ),
+        client.get(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}/conflicts",
+            headers=finance,
+        ),
+    ]
+    assert [response.status_code for response in visible] == [200, 200, 200, 200]
+    finance_pages = client.get("/api/internal/wiki/pages", headers=finance)
+    assert finance_pages.status_code == 200
+    assert [page["path"] for page in finance_pages.json()] == [
+        "wiki/product/faq/api.md"
+    ]
+
+
+def test_editor_wiki_mutations_require_target_acl(api_content_conflict):
+    client, conflict = api_content_conflict
+    admin_page = client.get(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}"
+    ).json()
+    outsider_editor = {
+        "X-LGDO-User": "outside_editor",
+        "X-LGDO-Role": "editor",
+        "X-LGDO-ACL-Tags": "support",
+    }
+
+    save = client.put(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}",
+        headers=outsider_editor,
+        json={
+            "content": admin_page["content"] + "\nUnauthorized edit.\n",
+            "expected_revision_id": admin_page["current_revision_id"],
+            "request_id": "unauthorized-save",
+        },
+    )
+    status = client.patch(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}/status",
+        headers=outsider_editor,
+        json={
+            "review_status": "stale",
+            "expected_revision_id": admin_page["current_revision_id"],
+            "request_id": "unauthorized-status",
+        },
+    )
+    resolve = client.post(
+        f"/api/internal/wiki/conflicts/{conflict.review_id}/resolve",
+        headers=outsider_editor,
+        json={
+            "resolution": "keep_current",
+            "expected_current_revision_id": conflict.current_revision_id,
+            "request_id": "unauthorized-resolve",
+        },
+    )
+
+    assert [save.status_code, status.status_code, resolve.status_code] == [
+        404,
+        404,
+        404,
+    ]
+    after = client.get(f"/api/internal/wiki/pages/{conflict.encoded_path}").json()
+    assert after["content"] == admin_page["content"]
+    assert "expected_state" not in resolve.text
+
+
+def test_wiki_request_identifiers_are_bounded(api_content_conflict):
+    client, conflict = api_content_conflict
+    page = client.get(f"/api/internal/wiki/pages/{conflict.encoded_path}").json()
+
+    responses = [
+        client.put(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}",
+            json={
+                "content": page["content"],
+                "expected_revision_id": "   ",
+                "request_id": "bounded-save",
+            },
+        ),
+        client.put(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}",
+            json={
+                "content": page["content"],
+                "expected_revision_id": page["current_revision_id"],
+                "request_id": "r" * 129,
+            },
+        ),
+        client.patch(
+            f"/api/internal/wiki/pages/{conflict.encoded_path}/status",
+            json={
+                "review_status": "stale",
+                "expected_revision_id": "w" * 129,
+                "request_id": "bounded-status",
+            },
+        ),
+        client.post(
+            f"/api/internal/wiki/conflicts/{conflict.review_id}/resolve",
+            json={
+                "resolution": "keep_current",
+                "expected_current_revision_id": " ",
+                "request_id": "bounded-conflict",
+            },
+        ),
+        client.post(
+            f"/api/internal/wiki/conflicts/{conflict.review_id}/resolve",
+            json={
+                "resolution": "keep_current",
+                "expected_current_revision_id": conflict.current_revision_id,
+                "expected_generated_revision_id": "g" * 129,
+                "request_id": "bounded-conflict",
+            },
+        ),
+        client.post(
+            f"/api/internal/wiki/conflicts/{conflict.review_id}/resolve",
+            json={
+                "resolution": "keep_current",
+                "expected_current_revision_id": conflict.current_revision_id,
+                "request_id": "r" * 129,
+            },
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [422] * len(responses)
+
+
+def test_backup_hash_is_normalized_and_rejects_non_sha256(api_wiki_page):
+    client, _ = api_wiki_page
+
+    invalid = client.post(
+        "/api/internal/wiki/write-intents/wint_fake/release-backup",
+        json={"expected_backup_hash": "not-a-sha256"},
+    )
+
+    assert invalid.status_code == 422
+    assert BackupReleaseRequest(
+        expected_backup_hash="A" * 64
+    ).expected_backup_hash == "a" * 64

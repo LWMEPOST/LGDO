@@ -279,7 +279,11 @@ def get_wiki_revision_endpoint(
     user: UserContext = Depends(current_user),
 ) -> dict:
     try:
-        return get_wiki_revision(get_settings(), revision_id)
+        return get_wiki_revision(
+            get_settings(),
+            revision_id,
+            user_context=user,
+        )
     except Exception as exc:
         raise_wiki_http(exc)
 
@@ -300,6 +304,7 @@ def resolve_wiki_conflict_endpoint(
             review_id,
             request,
             actor=user.user_id,
+            user_context=user,
         )
     except Exception as exc:
         raise_wiki_http(exc)
@@ -332,7 +337,11 @@ def list_wiki_pages_endpoint(
     user: UserContext = Depends(current_user),
 ) -> list[dict]:
     try:
-        return list_wiki_pages(get_settings(), domain)
+        return list_wiki_pages(
+            get_settings(),
+            domain,
+            user_context=user,
+        )
     except Exception as exc:
         raise_wiki_http(exc)
 
@@ -353,6 +362,7 @@ def list_wiki_page_revisions_endpoint(
             page_path,
             limit=limit,
             offset=offset,
+            user_context=user,
         )
     except Exception as exc:
         raise_wiki_http(exc)
@@ -367,7 +377,11 @@ def list_wiki_page_conflicts_endpoint(
     user: UserContext = Depends(current_user),
 ) -> list[dict]:
     try:
-        return list_wiki_page_conflicts(get_settings(), page_path)
+        return list_wiki_page_conflicts(
+            get_settings(),
+            page_path,
+            user_context=user,
+        )
     except Exception as exc:
         raise_wiki_http(exc)
 
@@ -388,6 +402,7 @@ def update_wiki_status_endpoint(
             page_path,
             request,
             actor=user.user_id,
+            user_context=user,
         )
     except Exception as exc:
         raise_wiki_http(exc)
@@ -399,7 +414,13 @@ def read_wiki_page_endpoint(
     user: UserContext = Depends(current_user),
 ) -> WikiPageContentResponse:
     try:
-        return WikiPageContentResponse(**read_wiki_page(get_settings(), page_path))
+        return WikiPageContentResponse(
+            **read_wiki_page(
+                get_settings(),
+                page_path,
+                user_context=user,
+            )
+        )
     except Exception as exc:
         raise_wiki_http(exc)
 
@@ -420,6 +441,7 @@ def save_wiki_page_endpoint(
             page_path,
             request,
             actor=user.user_id,
+            user_context=user,
         )
     except Exception as exc:
         raise_wiki_http(exc)

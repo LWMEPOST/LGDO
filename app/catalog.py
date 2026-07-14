@@ -20,6 +20,7 @@ from app.vault import append_log, ensure_vault
 from app.wiki_revisions import (
     ManualSaveCommand,
     PageNotFound,
+    PageReadResult,
     PreconditionRequired,
     ResolveConflictCommand,
     StatusUpdateCommand,
@@ -223,7 +224,11 @@ def rag_status(settings: Settings) -> dict:
     }
 
 
-def list_wiki_pages(settings: Settings, domain: str | None = None) -> list[dict]:
+def list_wiki_pages(
+    settings: Settings,
+    domain: str | None = None,
+    user_context: UserContext | None = None,
+) -> list[dict]:
     init_app_db(settings)
     query = "SELECT * FROM wiki_pages"
     params: list[object] = []
@@ -232,7 +237,19 @@ def list_wiki_pages(settings: Settings, domain: str | None = None) -> list[dict]
         params.append(domain)
     query += " ORDER BY updated_at DESC"
     with connect_app(settings) as conn:
-        return rows_to_dicts(conn.execute(query, params).fetchall())
+        rows = rows_to_dicts(conn.execute(query, params).fetchall())
+    if user_context is None or user_context.is_admin:
+        return rows
+    service = _wiki_revision_service(settings)
+    visible: list[dict] = []
+    for row in rows:
+        try:
+            page = service.get_page(row["path"])
+            _require_wiki_page_readable(settings, page, user_context)
+        except PageNotFound:
+            continue
+        visible.append(row)
+    return visible
 
 
 def list_review_items(settings: Settings, status: str | None = None) -> list[dict]:
@@ -307,6 +324,51 @@ def _wiki_revision_service(settings: Settings) -> WikiRevisionService:
     return WikiRevisionService(settings)
 
 
+def _require_wiki_page_readable(
+    settings: Settings,
+    page: PageReadResult,
+    user_context: UserContext | None,
+) -> None:
+    if user_context is None or user_context.is_admin:
+        return
+    metadata = page.metadata
+    if not can_read_metadata(
+        metadata,
+        user_context,
+        owner=metadata.get("owner"),
+    ):
+        raise PageNotFound(page.page_path)
+    source_ids = metadata.get("source_ids") or []
+    if not isinstance(source_ids, list) or not all(
+        isinstance(source_id, str) and source_id for source_id in source_ids
+    ):
+        raise PageNotFound(page.page_path)
+    unique_source_ids = list(dict.fromkeys(source_ids))
+    if not unique_source_ids:
+        return
+    placeholders = ",".join("?" for _ in unique_source_ids)
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            f"SELECT id,owner,metadata_json FROM sources WHERE id IN ({placeholders})",
+            unique_source_ids,
+        ).fetchall()
+    sources = {
+        source["id"]: source
+        for row in rows
+        if (source := row_to_dict(row)) is not None
+    }
+    if any(
+        source_id not in sources
+        or not can_read_metadata(
+            sources[source_id].get("metadata") or {},
+            user_context,
+            owner=sources[source_id].get("owner"),
+        )
+        for source_id in unique_source_ids
+    ):
+        raise PageNotFound(page.page_path)
+
+
 def _wiki_mutation_payload(
     service: WikiRevisionService,
     result,
@@ -326,10 +388,16 @@ def update_wiki_page_status(
     request: WikiStatusUpdateRequest,
     *,
     actor: str,
+    user_context: UserContext | None = None,
 ) -> dict:
     if request.expected_revision_id is None:
         raise PreconditionRequired("expected_revision_id is required")
     service = _wiki_revision_service(settings)
+    _require_wiki_page_readable(
+        settings,
+        service.get_page(page_path),
+        user_context,
+    )
     result = service.update_status(
         StatusUpdateCommand(
             page_path=page_path,
@@ -344,8 +412,13 @@ def update_wiki_page_status(
     return _wiki_mutation_payload(service, result)
 
 
-def read_wiki_page(settings: Settings, page_path: str) -> dict:
+def read_wiki_page(
+    settings: Settings,
+    page_path: str,
+    user_context: UserContext | None = None,
+) -> dict:
     page = _wiki_revision_service(settings).get_page(page_path)
+    _require_wiki_page_readable(settings, page, user_context)
     return {
         "path": page.page_path,
         "page_id": page.page_id,
@@ -367,10 +440,16 @@ def save_wiki_page(
     request: WikiPageSaveRequest,
     *,
     actor: str,
+    user_context: UserContext | None = None,
 ) -> dict:
     if request.expected_revision_id is None:
         raise PreconditionRequired("expected_revision_id is required")
     service = _wiki_revision_service(settings)
+    _require_wiki_page_readable(
+        settings,
+        service.get_page(page_path),
+        user_context,
+    )
     result = service.prepare_manual_save(
         ManualSaveCommand(
             page_path=page_path,
@@ -392,9 +471,11 @@ def list_wiki_page_revisions(
     *,
     limit: int,
     offset: int,
+    user_context: UserContext | None = None,
 ) -> dict:
     service = _wiki_revision_service(settings)
     page = service.get_page(page_path)
+    _require_wiki_page_readable(settings, page, user_context)
     with connect_app(settings) as conn:
         total = int(
             conn.execute(
@@ -422,7 +503,11 @@ def list_wiki_page_revisions(
     }
 
 
-def get_wiki_revision(settings: Settings, revision_id: str) -> dict:
+def get_wiki_revision(
+    settings: Settings,
+    revision_id: str,
+    user_context: UserContext | None = None,
+) -> dict:
     service = _wiki_revision_service(settings)
     with connect_app(settings) as conn:
         row = conn.execute(
@@ -438,13 +523,19 @@ def get_wiki_revision(settings: Settings, revision_id: str) -> dict:
         raise PageNotFound(revision_id)
     revision = row_to_dict(row) or {}
     current_page_path = revision.pop("current_page_path")
-    service.get_page(current_page_path)
+    page = service.get_page(current_page_path)
+    _require_wiki_page_readable(settings, page, user_context)
     return revision
 
 
-def list_wiki_page_conflicts(settings: Settings, page_path: str) -> list[dict]:
+def list_wiki_page_conflicts(
+    settings: Settings,
+    page_path: str,
+    user_context: UserContext | None = None,
+) -> list[dict]:
     service = _wiki_revision_service(settings)
-    service.get_page(page_path)
+    page = service.get_page(page_path)
+    _require_wiki_page_readable(settings, page, user_context)
     return service.list_conflicts(page_path, status="pending")
 
 
@@ -454,15 +545,18 @@ def resolve_wiki_conflict(
     request: ConflictResolveRequest,
     *,
     actor: str,
+    user_context: UserContext | None = None,
 ) -> dict:
     service = _wiki_revision_service(settings)
     with connect_app(settings) as conn:
         review = conn.execute(
-            "SELECT issue_type FROM review_items WHERE id=?",
+            "SELECT issue_type,page_path FROM review_items WHERE id=?",
             (review_id,),
         ).fetchone()
     if review is None:
         raise PageNotFound(review_id)
+    page = service.get_page(review["page_path"])
+    _require_wiki_page_readable(settings, page, user_context)
     if review["issue_type"] not in {
         "content_conflict",
         "concurrent_write_conflict",
