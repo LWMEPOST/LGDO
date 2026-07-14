@@ -522,6 +522,14 @@ def gbrain_pglite_server(
 import { loadConfig, toEngineConfig } from './src/core/config.ts';
 import { createEngine } from './src/core/engine-factory.ts';
 import { readContentChunksEmbeddingDim } from './src/core/embedding-dim-check.ts';
+import {
+  applyOpenAICompatConfig,
+  configureGateway,
+  diagnoseEmbedding,
+  isAvailable,
+} from './src/core/ai/gateway.ts';
+import { resolveRecipe } from './src/core/ai/model-resolver.ts';
+import { isCacheSafe, resolveEmbeddingColumn } from './src/core/search/embedding-column.ts';
 const config = loadConfig();
 if (!config) throw new Error('missing isolated GBrain config');
 if (config.embedding_disabled === true) throw new Error('embedding remained disabled');
@@ -534,6 +542,22 @@ if (config.embedding_dimensions !== Number(process.env.LGDO_EMBEDDING_DIMENSIONS
 if (config.provider_base_urls?.[process.env.LGDO_EMBEDDING_PROVIDER!] !== process.env.LGDO_EMBEDDING_BASE_URL) {
   throw new Error(`embedding base URL mismatch: ${config.provider_base_urls?.[process.env.LGDO_EMBEDDING_PROVIDER!]}`);
 }
+const gatewayConfig = {
+  embedding_model: config.embedding_model,
+  embedding_dimensions: config.embedding_dimensions,
+  base_urls: config.provider_base_urls,
+  env: process.env,
+};
+configureGateway(gatewayConfig);
+const embeddingDiagnosis = diagnoseEmbedding(config.embedding_model);
+const embeddingAvailable = isAvailable('embedding', config.embedding_model);
+const embeddingColumn = resolveEmbeddingColumn(undefined, config);
+const embeddingCacheSafe = isCacheSafe(embeddingColumn, config);
+const { recipe: embeddingRecipe } = resolveRecipe(config.embedding_model!);
+const effectiveEmbeddingBaseUrl = applyOpenAICompatConfig(
+  embeddingRecipe,
+  gatewayConfig,
+).baseURL;
 const engineConfig = toEngineConfig(config);
 const engine = await createEngine(engineConfig);
 try {
@@ -567,6 +591,11 @@ try {
     db_embedding_model: dbEmbeddingModel,
     db_embedding_dimensions: Number(dbEmbeddingDimensions),
     schema_embedding_dimensions: schemaDim.dims,
+    embedding_diagnosis: embeddingDiagnosis,
+    embedding_available: embeddingAvailable,
+    embedding_column: embeddingColumn,
+    embedding_cache_safe: embeddingCacheSafe,
+    effective_embedding_base_url: effectiveEmbeddingBaseUrl,
   }));
 } finally {
   await engine.disconnect();
@@ -613,6 +642,27 @@ try {
         raise AssertionError(f"DB embedding dimensions mismatch: {source_row!r}")
     if source_row.get("schema_embedding_dimensions") != EMBEDDING_DIMENSIONS:
         raise AssertionError(f"schema embedding dimensions mismatch: {source_row!r}")
+    expected_embedding_model = f"{EMBEDDING_PROVIDER}:{EMBEDDING_MODEL}"
+    if source_row.get("embedding_diagnosis") != {
+        "ok": True,
+        "model": expected_embedding_model,
+        "provider": EMBEDDING_PROVIDER,
+        "recipeId": EMBEDDING_PROVIDER,
+    }:
+        raise AssertionError(f"embedding runtime diagnosis mismatch: {source_row!r}")
+    if source_row.get("embedding_available") is not True:
+        raise AssertionError(f"embedding runtime unavailable: {source_row!r}")
+    if source_row.get("embedding_column") != {
+        "name": "embedding",
+        "type": "vector",
+        "dimensions": EMBEDDING_DIMENSIONS,
+        "embeddingModel": expected_embedding_model,
+    }:
+        raise AssertionError(f"embedding column resolution mismatch: {source_row!r}")
+    if source_row.get("embedding_cache_safe") is not True:
+        raise AssertionError(f"embedding cache is not runtime-safe: {source_row!r}")
+    if source_row.get("effective_embedding_base_url") != f"{fake_llama_server.base_url}/v1":
+        raise AssertionError(f"effective embedding URL mismatch: {source_row!r}")
 
     port = _free_loopback_port()
     base_url = f"http://127.0.0.1:{port}"

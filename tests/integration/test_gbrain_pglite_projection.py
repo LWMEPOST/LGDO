@@ -580,6 +580,7 @@ def test_oauth_tokens_cannot_cross_scope_or_source(
         )
     )
     assert source_error["is_error"] is True
+    assert source_error["error"] == "internal_error"
     assert (
         source_error["message"]
         == "operation context source does not match input source_id"
