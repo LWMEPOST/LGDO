@@ -168,6 +168,7 @@ def test_answer_modes_change_local_answer_and_use_query_memory(tmp_path, monkeyp
     assert draft_body["retrieval_strategy"]["context_limit"] == 5
     assert "您好" in draft_body["answer"]
     assert draft_body["answer"] != short_body["answer"]
+    assert "相似历史口径：" not in draft_body["answer"]
 
 
 def test_configured_bge_m3_embedding_provider_is_used(monkeypatch):

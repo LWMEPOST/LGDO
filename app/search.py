@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+import json
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any
 
 from app.aliases import build_alias_context, expand_query_with_aliases
 from app.answer_modes import AnswerModeConfig, get_answer_mode_config
 from app.auth import UserContext, apply_request_user_override, can_read_metadata
 from app.citations import (
+    MappedEvidence,
+    all_sources_readable,
     dedupe_citations,
     map_gbrain_hit,
     map_local_hit,
@@ -28,18 +30,20 @@ from app.vault import append_log
 
 query_gbrain = _query_gbrain
 
+CITATION_REFUSAL = (
+    "当前用户权限范围内没有找到足够依据回答这个问题。"
+    "请确认资料 ACL 标签或补充授权资料。"
+)
+NO_EVIDENCE_REFUSAL = (
+    "当前知识库没有找到足够依据回答这个问题。"
+    "建议补充相关产品/客服资料后重新编译知识库。"
+)
+
 
 def _query_gbrain_for_search(settings: Settings, question: str, limit: int) -> GBrainQueryResult:
     if query_gbrain is not _query_gbrain:
         return GBrainQueryResult(query_gbrain(settings, question, limit))
     return query_gbrain_with_diagnostics(settings, question, limit)
-
-
-
-def load_page_text(vault_path: Path, rel_path: str) -> str:
-    path = vault_path / rel_path
-    return path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
-
 
 def find_wiki_page_by_source(conn, source_id: str, domain: str | None = None) -> dict | None:
     params: list[object] = [f'%"{source_id}"%']
@@ -125,9 +129,7 @@ def build_ask_assembly(
     external_diagnostics: dict[str, Any] | None = None
 
     with connect_app(settings) as conn:
-        citations: list[Citation] = []
-        answer_parts: list[str] = []
-        context_blocks: list[str] = []
+        mapped_evidence: list[MappedEvidence] = []
         memory_hits = search_query_memory(conn, request, tokens, mode_config, resolved_user)
         gbrain_diagnostics = {
             "mapped": 0,
@@ -135,7 +137,7 @@ def build_ask_assembly(
             "unauthorized": 0,
             "unmapped": 0,
         }
-        mapped_gbrain = []
+        mapped_gbrain: list[tuple[GBrainHit, MappedEvidence]] = []
         for hit in raw_gbrain_hits:
             evidence = map_gbrain_hit(conn, hit, resolved_user)
             gbrain_diagnostics[evidence.diagnostic] += 1
@@ -158,52 +160,65 @@ def build_ask_assembly(
         mapped_chunk_hits: list[dict[str, Any]] = []
         for item in chunk_hits[: mode_config.context_limit]:
             evidence = map_local_hit(conn, item, resolved_user)
-            if evidence.diagnostic != "mapped":
+            if evidence.diagnostic != "mapped" or not evidence.citations:
                 continue
             mapped_chunk_hits.append(item)
-            citations.extend(evidence.citations)
-            answer_parts.append(evidence.answer_part)
-            context_blocks.append(evidence.context)
+            mapped_evidence.append(evidence)
 
         visible_gbrain = mapped_gbrain[: mode_config.context_limit]
         gbrain_context_blocks = [evidence.context for _, evidence in visible_gbrain]
         for _, evidence in visible_gbrain:
-            citations.extend(evidence.citations)
-        context_blocks.extend(gbrain_context_blocks)
-        answer_parts.extend(evidence.answer_part for _, evidence in visible_gbrain)
+            if evidence.citations:
+                mapped_evidence.append(evidence)
 
-        if not citations:
-            citations, answer_parts, context_blocks = fallback_wiki_search(
+        if not mapped_evidence:
+            mapped_evidence.extend(fallback_wiki_search(
                 conn,
-                settings,
                 request,
                 tokens,
                 mode_config,
                 resolved_user,
-            )
-            context_blocks.extend(gbrain_context_blocks)
-            answer_parts.extend(build_gbrain_answer_parts(gbrain_hits, mode_config.context_limit))
+            ))
+
+        citations = dedupe_citations(
+            [
+                citation
+                for evidence in mapped_evidence
+                if evidence.diagnostic == "mapped" and evidence.citations
+                for citation in evidence.citations
+            ]
+        )
+        citations = dedupe_citations(
+            filter_authorized_citations(conn, citations, resolved_user)
+        )
+        answer_parts = [
+            evidence.answer_part
+            for evidence in mapped_evidence
+            if evidence.diagnostic == "mapped" and evidence.citations
+        ]
+        context_blocks = [
+            evidence.context
+            for evidence in mapped_evidence
+            if evidence.diagnostic == "mapped" and evidence.citations
+        ]
 
         missing_info: list[str] = []
         answer_override: str | None = None
-        if not citations and not gbrain_context_blocks:
-            answer_override = "当前知识库没有找到足够依据回答这个问题。建议补充相关产品/客服资料后重新编译知识库。"
+        if request.require_citations and not citations:
+            answer_override = CITATION_REFUSAL
             confidence = "low"
-            missing_info.append(request.question)
+            missing_info = [request.question]
+        elif not citations and not memory_hits:
+            answer_override = NO_EVIDENCE_REFUSAL
+            confidence = "low"
+            missing_info = [request.question]
         else:
             best_score = chunk_hits[0]["score"] if chunk_hits else 0
             confidence = "high" if best_score >= mode_config.confidence_high else "medium"
             if not chunk_hits and citations:
                 confidence = "medium"
-            if not chunk_hits and gbrain_context_blocks:
+            if not chunk_hits and memory_hits:
                 confidence = "medium"
-        citations = dedupe_citations(
-            filter_authorized_citations(conn, citations, resolved_user)
-        )
-        if request.require_citations and not citations and not gbrain_context_blocks:
-            answer_override = "当前用户权限范围内没有找到足够依据回答这个问题。请确认资料 ACL 标签或补充授权资料。"
-            confidence = "low"
-            missing_info = [request.question]
 
         retrieval_strategy = {
             "answer_mode": mode_config.key,
@@ -212,6 +227,13 @@ def build_ask_assembly(
             "authorized_chunk_hits": len(mapped_chunk_hits),
             "context_limit": mode_config.context_limit,
             "memory_hits": len(memory_hits),
+            "memory_origin": (
+                "query_expansion_only"
+                if request.require_citations and memory_hits
+                else "authorized_history"
+                if memory_hits
+                else None
+            ),
             "gbrain_hits": len(gbrain_hits),
             "gbrain_raw_hits": len(raw_gbrain_hits),
             "gbrain_mapped": gbrain_diagnostics["mapped"],
@@ -291,10 +313,35 @@ def build_ask_assembly(
 
 
 def _memory_blocks_for_assembly(assembly: AskAssembly) -> list[str]:
+    if assembly.request.require_citations:
+        return []
     return build_memory_context(assembly.memory_hits)
 
 
+def _memory_hits_for_answer(assembly: AskAssembly) -> list[MemoryHit]:
+    return [] if assembly.request.require_citations else assembly.memory_hits
+
+
+def _refresh_assembly_citations(settings: Settings, assembly: AskAssembly) -> bool:
+    with connect_app(settings) as conn:
+        assembly.citations = revalidate_citations(
+            conn,
+            assembly.citations,
+            assembly.resolved_user,
+        )
+    assembly.retrieval_strategy["post_generation_citations"] = len(assembly.citations)
+    if assembly.request.require_citations and not assembly.citations:
+        assembly.answer_override = CITATION_REFUSAL
+        assembly.confidence = "low"
+        assembly.missing_info = [assembly.request.question]
+        return False
+    return True
+
+
 def finalize_ask_response(settings: Settings, assembly: AskAssembly, answer: str) -> AskResponse:
+    citations_valid = _refresh_assembly_citations(settings, assembly)
+    if not citations_valid:
+        answer = CITATION_REFUSAL
     request = assembly.request
     mode_config = assembly.mode_config
     resolved_user = assembly.resolved_user
@@ -369,7 +416,11 @@ def ask(settings: Settings, request: AskRequest, user_context: UserContext | Non
             assembly.mode_config.key,
             memory_blocks=_memory_blocks_for_assembly(assembly),
         )
-        answer = generated or build_local_answer(assembly.mode_config, assembly.answer_parts, assembly.memory_hits)
+        answer = generated or build_local_answer(
+            assembly.mode_config,
+            assembly.answer_parts,
+            _memory_hits_for_answer(assembly),
+        )
     return finalize_ask_response(settings, assembly, answer)
 
 
@@ -383,20 +434,9 @@ def stream_ask_events(
     user_context: UserContext | None = None,
 ) -> Iterator[str]:
     assembly = build_ask_assembly(settings, request, user_context)
-    yield _ndjson_event(
-        {
-            "event": "metadata",
-            "query_id": assembly.query_id,
-            "confidence": assembly.confidence,
-            "citations": [citation.model_dump() for citation in assembly.citations],
-            "retrieval_strategy": assembly.retrieval_strategy,
-        }
-    )
-
     chunks: list[str] = []
     if assembly.answer_override:
         chunks.append(assembly.answer_override)
-        yield _ndjson_event({"event": "answer_delta", "text": assembly.answer_override})
     else:
         for chunk in stream_generate_answer(
             settings,
@@ -408,11 +448,28 @@ def stream_ask_events(
             if not chunk:
                 continue
             chunks.append(chunk)
-            yield _ndjson_event({"event": "answer_delta", "text": chunk})
         if not chunks:
-            fallback = build_local_answer(assembly.mode_config, assembly.answer_parts, assembly.memory_hits)
+            fallback = build_local_answer(
+                assembly.mode_config,
+                assembly.answer_parts,
+                _memory_hits_for_answer(assembly),
+            )
             chunks.append(fallback)
-            yield _ndjson_event({"event": "answer_delta", "text": fallback})
+
+    if not _refresh_assembly_citations(settings, assembly):
+        chunks = [CITATION_REFUSAL]
+
+    yield _ndjson_event(
+        {
+            "event": "metadata",
+            "query_id": assembly.query_id,
+            "confidence": assembly.confidence,
+            "citations": [citation.model_dump() for citation in assembly.citations],
+            "retrieval_strategy": assembly.retrieval_strategy,
+        }
+    )
+    for chunk in chunks:
+        yield _ndjson_event({"event": "answer_delta", "text": chunk})
 
     response = finalize_ask_response(settings, assembly, "".join(chunks))
     yield _ndjson_event({"event": "done", "response": response.model_dump()})
@@ -420,43 +477,59 @@ def stream_ask_events(
 
 def fallback_wiki_search(
     conn,
-    settings: Settings,
     request: AskRequest,
     tokens: list[str],
     mode_config: AnswerModeConfig,
     user_context: UserContext | None = None,
-):
+) -> list[MappedEvidence]:
     params: list[object] = []
-    query = "SELECT * FROM wiki_pages"
+    query = """
+        SELECT wp.*, wr.content AS revision_content
+        FROM wiki_pages wp
+        JOIN wiki_page_revisions wr
+          ON wr.id = wp.current_revision_id AND wr.page_id = wp.page_id
+        WHERE wp.lifecycle_status = 'active'
+          AND wp.rag_visible_revision_id = wp.current_revision_id
+          AND wp.rag_visible_epoch = wp.projection_epoch
+    """
     if request.domain:
-        query += " WHERE domain = ?"
+        query += " AND wp.domain = ?"
         params.append(request.domain)
     pages = conn.execute(query, params).fetchall()
     ranked: list[dict] = []
     for page in pages:
-        text = load_page_text(settings.vault_path, page["path"])
-        source_ids = __import__("json").loads(page["source_ids_json"] or "[]")
-        active_ids = active_source_ids(conn, source_ids, user_context)
-        if not active_ids:
-            continue
+        text = str(page["revision_content"] or "")
         score = score_text(tokens, text, title=page["title"])
         if score <= 0 and tokens:
             continue
-        ranked.append({"page": dict(page), "text": text, "source_ids": active_ids, "score": score})
+        ranked.append({"page": dict(page), "text": text, "score": score})
 
     ranked.sort(key=lambda item: item["score"], reverse=True)
-    citations: list[Citation] = []
-    answer_parts: list[str] = []
-    context_blocks: list[str] = []
+    evidence_rows: list[MappedEvidence] = []
     for item in ranked[: mode_config.context_limit]:
-        source_id = item["source_ids"][0] if item["source_ids"] else ""
         snippet = clip_snippet(item["text"], tokens)
-        citations.append(Citation(source_id=source_id, wiki_page=item["page"]["path"], snippet=snippet))
-        answer_parts.append(f"- {item['page']['title']}: {snippet}")
-        context_blocks.append(
-            f"标题：{item['page']['title']}\n页面：{item['page']['path']}\n来源：{source_id}\n片段：{snippet}"
+        evidence = map_local_hit(
+            conn,
+            {
+                "origin": "wiki",
+                "id": (
+                    f"fallback:{item['page']['page_id']}:"
+                    f"{item['page']['current_revision_id']}:"
+                    f"{item['page']['projection_epoch']}"
+                ),
+                "page_id": item["page"]["page_id"],
+                "revision_id": item["page"]["current_revision_id"],
+                "projection_epoch": item["page"]["projection_epoch"],
+                "page_path": item["page"]["path"],
+                "title": item["page"]["title"],
+                "snippet": snippet,
+                "text": item["text"],
+            },
+            user_context,
         )
-    return citations, answer_parts, context_blocks
+        if evidence.diagnostic == "mapped" and evidence.citations:
+            evidence_rows.append(evidence)
+    return evidence_rows
 
 
 def search_query_memory(
@@ -534,16 +607,123 @@ def filter_authorized_gbrain_hits(
     ]
 
 
-def query_log_is_authorized(conn, citations_json: str, user_context: UserContext | None = None) -> bool:
-    if user_context is None or user_context.is_admin:
-        return True
-    try:
-        citations = __import__("json").loads(citations_json or "[]")
-    except Exception:
-        return False
+def revalidate_citations(
+    conn,
+    citations: list[Citation],
+    user_context: UserContext | None = None,
+) -> list[Citation]:
     if not citations:
+        return []
+
+    valid_indexes: set[int] = set()
+    page_groups: dict[tuple[str | None, ...], list[tuple[int, Citation]]] = {}
+    for index, citation in enumerate(citations):
+        if citation.origin not in {"wiki", "gbrain"}:
+            if all_sources_readable(conn, (citation.source_id,), user_context):
+                valid_indexes.add(index)
+            continue
+        key = (
+            citation.origin,
+            citation.wiki_page,
+            citation.page_id,
+            citation.revision_id,
+            citation.chunk_id,
+            citation.snippet,
+        )
+        page_groups.setdefault(key, []).append((index, citation))
+
+    for group in page_groups.values():
+        if _page_citation_group_is_current(conn, group, user_context):
+            valid_indexes.update(index for index, _ in group)
+    return [
+        citation
+        for index, citation in enumerate(citations)
+        if index in valid_indexes
+    ]
+
+
+def _page_citation_group_is_current(
+    conn,
+    group: list[tuple[int, Citation]],
+    user_context: UserContext | None,
+) -> bool:
+    first = group[0][1]
+    if not first.page_id or not first.revision_id or not first.wiki_page:
         return False
-    return all(can_read_source_id(conn, citation.get("source_id"), user_context) for citation in citations)
+    pages = conn.execute(
+        "SELECT * FROM wiki_pages WHERE page_id = ?",
+        (first.page_id,),
+    ).fetchall()
+    if len(pages) != 1:
+        return False
+    page = dict(pages[0])
+    if (
+        page.get("lifecycle_status") != "active"
+        or page.get("current_revision_id") != first.revision_id
+        or page.get("path") != first.wiki_page
+    ):
+        return False
+
+    revision = conn.execute(
+        """
+        SELECT source_ids_json FROM wiki_page_revisions
+        WHERE id = ? AND page_id = ?
+        """,
+        (first.revision_id, first.page_id),
+    ).fetchone()
+    if revision is None:
+        return False
+    try:
+        stored_source_ids = json.loads(revision["source_ids_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(stored_source_ids, list):
+        return False
+    expected_sources = tuple(
+        dict.fromkeys(str(source_id) for source_id in stored_source_ids if source_id)
+    )
+    actual_sources = tuple(
+        dict.fromkeys(citation.source_id for _, citation in group if citation.source_id)
+    )
+    if (
+        not expected_sources
+        or set(actual_sources) != set(expected_sources)
+        or not all_sources_readable(conn, expected_sources, user_context)
+    ):
+        return False
+
+    if first.origin == "wiki":
+        return bool(
+            page.get("rag_visible_revision_id") == first.revision_id
+            and page.get("rag_visible_epoch") is not None
+            and int(page["rag_visible_epoch"]) == int(page["projection_epoch"])
+        )
+
+    mapping = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM gbrain_page_projections
+        WHERE page_id = ? AND revision_id = ? AND projection_epoch = ?
+          AND page_path = ? AND status = 'current'
+        """,
+        (
+            first.page_id,
+            first.revision_id,
+            page["projection_epoch"],
+            first.wiki_page,
+        ),
+    ).fetchone()
+    return bool(mapping is not None and int(mapping["count"]) >= 1)
+
+
+def query_log_is_authorized(conn, citations_json: str, user_context: UserContext | None = None) -> bool:
+    try:
+        payload = json.loads(citations_json or "[]")
+        if not isinstance(payload, list) or not payload:
+            return False
+        citations = [Citation.model_validate(item) for item in payload]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return len(revalidate_citations(conn, citations, user_context)) == len(citations)
 
 
 def build_memory_context(memory_hits: list[MemoryHit]) -> list[str]:

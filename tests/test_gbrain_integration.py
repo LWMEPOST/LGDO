@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+
 from app.config import Settings
-from app.db import init_app_db
+from app.db import connect_app_write, init_app_db
 from app.gbrain import (
     GBrainError,
     GBrainHit,
@@ -13,6 +15,122 @@ from app.gbrain import (
 )
 from app.models import AskRequest
 from app.search import ask
+
+
+NOW = "2099-01-01T12:00:00+00:00"
+
+
+def _seed_source(settings: Settings, source_id: str) -> None:
+    init_app_db(settings)
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,owner,title,source_type,original_path,raw_path,
+              content_hash,size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                source_id,
+                "product",
+                "tester",
+                source_id,
+                "markdown",
+                f"{source_id}.md",
+                f"raw/{source_id}.md",
+                f"hash-{source_id}",
+                100,
+                "active",
+                "{}",
+                NOW,
+                NOW,
+            ),
+        )
+
+
+def _seed_current_gbrain_mapping(settings: Settings) -> None:
+    _seed_source(settings, "source-refund")
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_page_revisions(
+              id,page_id,page_path,revision_number,file_hash,semantic_hash,
+              content,origin,base_revision_id,source_ids_json,actor,note,
+              metadata_json,idempotency_key,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wrev-refund",
+                "page-refund",
+                "wiki/product/policies/refund.md",
+                1,
+                "file-refund",
+                "semantic-refund",
+                "用户在 7 天内可以申请退款。",
+                "manual",
+                None,
+                json.dumps(["source-refund"]),
+                "tester",
+                None,
+                "{}",
+                "gbrain-test:wrev-refund",
+                NOW,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,revision_number,file_hash,
+              semantic_hash,projection_epoch,lifecycle_status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/policies/refund.md",
+                "page-refund",
+                "product",
+                "policy",
+                "退款政策",
+                json.dumps(["source-refund"]),
+                "approved",
+                NOW,
+                NOW,
+                "wrev-refund",
+                1,
+                "file-refund",
+                "semantic-refund",
+                3,
+                "active",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO gbrain_page_projections(
+              id,page_id,revision_id,projection_epoch,page_path,file_hash,
+              semantic_hash,gbrain_source_id,slug,source_path,
+              gbrain_content_hash,gbrain_page_generation,status,imported_at,
+              invalidated_at,last_job_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "gproj-refund",
+                "page-refund",
+                "wrev-refund",
+                3,
+                "wiki/product/policies/refund.md",
+                "file-refund",
+                "semantic-refund",
+                "managed-test",
+                "product/policies/refund",
+                "product/policies/refund.md",
+                "gbrain-refund",
+                9,
+                "current",
+                NOW,
+                None,
+                "pjob-refund",
+            ),
+        )
 
 
 def test_normalize_gbrain_hits_maps_search_results():
@@ -275,6 +393,7 @@ def test_ask_includes_gbrain_context_when_enabled(tmp_path, monkeypatch):
         deepseek_model=None,
         gbrain_enabled=True,
     )
+    _seed_current_gbrain_mapping(settings)
 
     monkeypatch.setattr(
         "app.search.search_chunks",
@@ -288,8 +407,13 @@ def test_ask_includes_gbrain_context_when_enabled(tmp_path, monkeypatch):
                 title="退款政策",
                 snippet="用户在 7 天内可以申请退款。",
                 score=2.0,
-                source_id="default",
+                source_id="managed-test",
+                gbrain_source_id="managed-test",
+                source_path="product/policies/refund.md",
+                content_hash="gbrain-refund",
+                page_generation=9,
                 page_type="policy",
+                chunk_id=12,
             )
         ],
     )
@@ -403,6 +527,8 @@ def test_ask_uses_dashscope_rerank_when_gbrain_has_no_hits(tmp_path, monkeypatch
         dashscope_api_key="secret",
         dashscope_embedding_dimension=3,
     )
+    _seed_source(settings, "source-invoice")
+    _seed_source(settings, "source-refund")
     rows = [
         {
             "id": "invoice",
@@ -437,9 +563,6 @@ def test_ask_uses_dashscope_rerank_when_gbrain_has_no_hits(tmp_path, monkeypatch
         return EmbeddingBatch([vectors[text] for text in texts], "text-embedding-v3", False, 8)
 
     monkeypatch.setattr("app.external_embedding.embed_texts", fake_embed)
-    monkeypatch.setattr("app.search.find_wiki_page_by_source", lambda *args, **kwargs: None)
-    monkeypatch.setattr("app.search.can_read_source_id", lambda *args, **kwargs: True)
-
     result = ask(settings, AskRequest(question="怎么取消已经购买的服务"))
 
     assert result.retrieval_strategy["fallback_retrieval"]["channel"] == "dashscope_embedding"

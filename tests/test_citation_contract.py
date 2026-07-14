@@ -16,7 +16,12 @@ from app.config import Settings
 from app.db import connect_app, connect_app_write, init_app_db
 from app.gbrain import GBrainHit
 from app.models import AskRequest, Citation
-from app.search import build_ask_assembly
+from app.search import (
+    ask,
+    build_ask_assembly,
+    query_log_is_authorized,
+    stream_ask_events,
+)
 
 
 NOW = "2099-01-01T12:00:00+00:00"
@@ -183,6 +188,42 @@ def _valid_gbrain_hit() -> GBrainHit:
         page_type="faq",
         chunk_id=42,
     )
+
+
+def _insert_memory(
+    settings: Settings,
+    *,
+    query_id: str = "memory-1",
+    citations: list[Citation] | None = None,
+    answer: str = "HISTORICAL AUTHORIZED ANSWER",
+) -> None:
+    stored_citations = citations or [
+        Citation(
+            source_id="src-a",
+            snippet="Historical source.",
+            chunk_id="history-chunk",
+            origin="document",
+        )
+    ]
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO query_logs(
+              id,question,domain,answer,citations_json,confidence,
+              missing_info_json,created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                query_id,
+                "How was the historical refund handled?",
+                "product",
+                answer,
+                json.dumps([citation.model_dump() for citation in stored_citations]),
+                "high",
+                "[]",
+                NOW,
+            ),
+        )
 
 
 def test_exact_current_gbrain_mapping_emits_one_citation_per_lgdo_source(
@@ -456,3 +497,267 @@ def test_ask_assembly_maps_local_wiki_hit_without_treating_page_id_as_source(
 
     assert [citation.source_id for citation in assembly.citations] == ["src-a", "src-b"]
     assert PAGE_ID not in {citation.source_id for citation in assembly.citations}
+
+
+def test_invalid_gbrain_only_refuses_without_calling_llm(settings, reader, monkeypatch):
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "app.search.query_gbrain",
+        lambda *args, **kwargs: [
+            replace(_valid_gbrain_hit(), content_hash="stale-content")
+        ],
+    )
+
+    def forbidden_generate(*args, **kwargs):
+        raise AssertionError("citation-empty request must not call generate_answer")
+
+    monkeypatch.setattr("app.search.generate_answer", forbidden_generate)
+
+    response = ask(
+        settings,
+        AskRequest(question="Projected-only secret?", domain="product"),
+        reader,
+    )
+
+    assert response.citations == []
+    assert response.confidence == "low"
+    assert "没有找到足够依据" in response.answer
+
+
+def test_memory_only_refuses_without_calling_llm_when_citations_required(
+    settings, reader, monkeypatch
+):
+    _insert_memory(settings)
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr("app.search.query_gbrain", lambda *args, **kwargs: [])
+
+    def forbidden_generate(*args, **kwargs):
+        raise AssertionError("memory-only request must not call generate_answer")
+
+    monkeypatch.setattr("app.search.generate_answer", forbidden_generate)
+
+    response = ask(
+        settings,
+        AskRequest(question="Historical refund answer?", domain="product"),
+        reader,
+    )
+
+    assert response.memory_hits
+    assert response.citations == []
+    assert "HISTORICAL AUTHORIZED ANSWER" not in response.answer
+    assert "没有找到足够依据" in response.answer
+
+
+def test_required_citations_keep_memory_out_of_llm_and_local_fallback(
+    settings, reader, monkeypatch
+):
+    _insert_memory(settings)
+    monkeypatch.setattr(
+        "app.search.search_chunks",
+        lambda *args, **kwargs: [
+            {
+                "origin": "document",
+                "id": "current-document",
+                "source_id": "src-a",
+                "title": "Current source",
+                "snippet": "Current refund evidence.",
+                "text": "Current refund evidence.",
+                "score": 4.0,
+            }
+        ],
+    )
+    monkeypatch.setattr("app.search.query_gbrain", lambda *args, **kwargs: [])
+    captured: dict[str, object] = {}
+
+    def fake_generate(*args, **kwargs):
+        captured["memory_blocks"] = kwargs["memory_blocks"]
+        captured["context_blocks"] = args[2]
+        return ""
+
+    def fake_local(mode_config, answer_parts, memory_hits):
+        captured["local_memory"] = memory_hits
+        return "CURRENT LOCAL ANSWER"
+
+    monkeypatch.setattr("app.search.generate_answer", fake_generate)
+    monkeypatch.setattr("app.search.build_local_answer", fake_local)
+
+    response = ask(
+        settings,
+        AskRequest(question="Historical refund answer?", domain="product"),
+        reader,
+    )
+
+    assert response.memory_hits
+    assert captured["memory_blocks"] == []
+    assert captured["local_memory"] == []
+    assert "HISTORICAL AUTHORIZED ANSWER" not in "\n".join(captured["context_blocks"])
+
+
+def test_optional_citations_use_only_authorized_history_and_report_origin(
+    settings, reader, monkeypatch
+):
+    _insert_memory(settings)
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr("app.search.query_gbrain", lambda *args, **kwargs: [])
+    captured: dict[str, object] = {}
+
+    def fake_generate(*args, **kwargs):
+        captured["memory_blocks"] = kwargs["memory_blocks"]
+        return "AUTHORIZED HISTORY ANSWER"
+
+    monkeypatch.setattr("app.search.generate_answer", fake_generate)
+
+    response = ask(
+        settings,
+        AskRequest(
+            question="Historical refund answer?",
+            domain="product",
+            require_citations=False,
+        ),
+        reader,
+    )
+
+    assert response.memory_hits
+    assert captured["memory_blocks"]
+    assert response.answer == "AUTHORIZED HISTORY ANSWER"
+    assert response.retrieval_strategy["memory_origin"] == "authorized_history"
+
+
+def test_query_memory_rejects_empty_or_malformed_citations_even_for_admin(settings):
+    admin = UserContext(user_id="admin", role="admin", acl_tags=("*",))
+    with connect_app(settings) as conn:
+        assert query_log_is_authorized(conn, "[]", admin) is False
+        assert query_log_is_authorized(conn, "not-json", admin) is False
+        assert query_log_is_authorized(conn, '[{"source_id":"src-a"}]', admin) is False
+
+
+def test_database_fallback_uses_visible_revision_content_not_vault(
+    settings, reader, monkeypatch
+):
+    vault_page = settings.vault_path / PAGE_PATH
+    vault_page.parent.mkdir(parents=True, exist_ok=True)
+    vault_page.write_text("VAULT CONTENT MUST NOT BE READ", encoding="utf-8")
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr("app.search.query_gbrain", lambda *args, **kwargs: [])
+
+    assembly = build_ask_assembly(
+        settings,
+        AskRequest(question="Current immutable revision", domain="product"),
+        reader,
+    )
+
+    assert [citation.source_id for citation in assembly.citations] == ["src-a", "src-b"]
+    assert any("Current immutable revision" in block for block in assembly.context_blocks)
+    assert all("VAULT CONTENT MUST NOT BE READ" not in block for block in assembly.context_blocks)
+
+
+def test_current_revision_without_visible_epoch_refuses_without_calling_llm(
+    settings, reader, monkeypatch
+):
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE wiki_pages SET rag_visible_epoch=NULL WHERE page_id=?",
+            (PAGE_ID,),
+        )
+    vault_page = settings.vault_path / PAGE_PATH
+    vault_page.parent.mkdir(parents=True, exist_ok=True)
+    vault_page.write_text("Current immutable revision", encoding="utf-8")
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr("app.search.query_gbrain", lambda *args, **kwargs: [])
+
+    def forbidden_generate(*args, **kwargs):
+        raise AssertionError("invisible Wiki revision must not call generate_answer")
+
+    monkeypatch.setattr("app.search.generate_answer", forbidden_generate)
+
+    response = ask(
+        settings,
+        AskRequest(question="Current immutable revision", domain="product"),
+        reader,
+    )
+
+    assert response.citations == []
+    assert "没有找到足够依据" in response.answer
+
+
+def test_valid_gbrain_only_evidence_calls_llm_with_citations(
+    settings, reader, monkeypatch
+):
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "app.search.query_gbrain",
+        lambda *args, **kwargs: [_valid_gbrain_hit()],
+    )
+    captured: dict[str, object] = {}
+
+    def fake_generate(*args, **kwargs):
+        captured["context_blocks"] = args[2]
+        return "MAPPED GBRAIN ANSWER"
+
+    monkeypatch.setattr("app.search.generate_answer", fake_generate)
+
+    response = ask(
+        settings,
+        AskRequest(question="Projected answer?", domain="product"),
+        reader,
+    )
+
+    assert response.answer == "MAPPED GBRAIN ANSWER"
+    assert [citation.source_id for citation in response.citations] == ["src-a", "src-b"]
+    assert any("Authorized projected answer" in block for block in captured["context_blocks"])
+
+
+def test_acl_revoked_after_generation_discards_generated_answer(
+    settings, reader, monkeypatch
+):
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "app.search.query_gbrain",
+        lambda *args, **kwargs: [_valid_gbrain_hit()],
+    )
+
+    def revoke_then_generate(*args, **kwargs):
+        with connect_app_write(settings) as conn:
+            conn.execute("UPDATE sources SET status='inactive' WHERE id='src-b'")
+        return "FACTUAL ANSWER MUST BE DISCARDED"
+
+    monkeypatch.setattr("app.search.generate_answer", revoke_then_generate)
+
+    response = ask(
+        settings,
+        AskRequest(question="Projected answer?", domain="product"),
+        reader,
+    )
+
+    assert response.citations == []
+    assert response.confidence == "low"
+    assert "FACTUAL ANSWER MUST BE DISCARDED" not in response.answer
+    assert "没有找到足够依据" in response.answer
+
+
+def test_stream_buffers_factual_chunks_until_post_generation_acl_gate(
+    settings, reader, monkeypatch
+):
+    monkeypatch.setattr("app.search.search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "app.search.query_gbrain",
+        lambda *args, **kwargs: [_valid_gbrain_hit()],
+    )
+
+    def revoke_while_streaming(*args, **kwargs):
+        with connect_app_write(settings) as conn:
+            conn.execute("UPDATE sources SET status='inactive' WHERE id='src-b'")
+        yield "STREAMED FACTUAL SECRET"
+
+    monkeypatch.setattr("app.search.stream_generate_answer", revoke_while_streaming)
+
+    events = [json.loads(line) for line in stream_ask_events(
+        settings,
+        AskRequest(question="Projected answer?", domain="product"),
+        reader,
+    )]
+    deltas = [event["text"] for event in events if event["event"] == "answer_delta"]
+
+    assert "STREAMED FACTUAL SECRET" not in "".join(deltas)
+    assert any("没有找到足够依据" in delta for delta in deltas)
+    assert events[-1]["response"]["citations"] == []
