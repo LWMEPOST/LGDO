@@ -777,6 +777,96 @@ def test_page_success_and_error_are_attributed_independently(settings):
 
 
 @pytest.mark.parametrize(
+    ("status", "expected_job_status"),
+    [
+        ("error", "failed"),
+        ("recovery_required", "failed"),
+        ("superseded", "superseded"),
+    ],
+)
+def test_deterministic_page_failure_allows_non_success_raw_hashes(
+    settings,
+    status,
+    expected_job_status,
+):
+    page = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    def failed_result(request: GBrainSyncRequest) -> GBrainSyncResponse:
+        response = _response(
+            request,
+            statuses={page.page_id: (status, (), "deterministic failure")},
+        )
+        failed_page = replace(
+            response.pages[0],
+            raw_file_hash_before=None,
+            raw_file_hash_after=_hash("observed-mutated-bytes"),
+        )
+        return replace(response, pages=(failed_page,))
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(failed_result),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    assert _job_statuses(settings, job_id) == {job_id: expected_job_status}
+
+
+@pytest.mark.parametrize(
+    ("identity_field", "wrong_value"),
+    [
+        ("revision_id", "wrev_wrong"),
+        ("projection_epoch", 999),
+        ("path", "wrong/path.md"),
+        ("source_id", "wrong-source"),
+        ("source_path", "wrong/path.md"),
+    ],
+)
+def test_deterministic_page_failure_still_requires_request_identity(
+    settings,
+    identity_field,
+    wrong_value,
+):
+    page = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    def wrong_identity(request: GBrainSyncRequest) -> GBrainSyncResponse:
+        response = _response(
+            request,
+            statuses={page.page_id: ("error", (), "deterministic failure")},
+        )
+        failed_page = replace(
+            response.pages[0],
+            **{identity_field: wrong_value},
+        )
+        return replace(response, pages=(failed_page,))
+
+    with pytest.raises(ProjectionProtocolError, match="mismatch"):
+        asyncio.run(
+            GBrainBatchRepository(settings).execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(wrong_identity),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    assert _job_statuses(settings, job_id) == {job_id: "running"}
+
+
+@pytest.mark.parametrize(
     "mismatch_field",
     ["file_hash", "raw_file_hash_before", "raw_file_hash_after"],
 )
@@ -977,6 +1067,133 @@ def test_unique_delete_marks_mapping_deleted_bumps_generation_and_finishes_owner
     assert _generation(settings) == 1
 
 
+@pytest.mark.parametrize(
+    ("changed_column", "changed_value"),
+    [
+        ("page_id", "page_concurrent"),
+        ("revision_id", "wrev_concurrent"),
+        ("projection_epoch", 999),
+        ("status", "stale"),
+        ("gbrain_page_generation", 999),
+    ],
+)
+def test_unique_delete_rejects_mapping_changed_since_batch_snapshot(
+    settings,
+    monkeypatch,
+    changed_column,
+    changed_value,
+):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    with connect_app(settings) as conn:
+        mapping_id = conn.execute(
+            "SELECT id FROM gbrain_page_projections WHERE slug=?",
+            (slug,),
+        ).fetchone()["id"]
+    repository = GBrainBatchRepository(settings)
+    persist_protections = repository._persist_segment_protections
+
+    def mutate_after_protection_check(batch_id, segment_id, **kwargs):
+        persist_protections(batch_id, segment_id, **kwargs)
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                f"UPDATE gbrain_page_projections SET {changed_column}=? WHERE id=?",
+                (changed_value, mapping_id),
+            )
+
+    monkeypatch.setattr(
+        repository,
+        "_persist_segment_protections",
+        mutate_after_protection_check,
+    )
+
+    with pytest.raises(ProjectionLeaseLost, match=mapping_id):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        deleted=(
+                            GBrainDeletedResult(source_id="lgdo-managed", slug=slug),
+                        ),
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    assert _job_statuses(settings, job_id) == {job_id: "running"}
+    assert _generation(settings) == 0
+
+
+@pytest.mark.parametrize("nullable_column", ["imported_at", "invalidated_at"])
+def test_unique_delete_cas_distinguishes_null_from_empty_text(
+    settings,
+    monkeypatch,
+    nullable_column,
+):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            f"UPDATE gbrain_page_projections SET {nullable_column}=NULL WHERE slug=?",
+            (slug,),
+        )
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    with connect_app(settings) as conn:
+        mapping_id = conn.execute(
+            "SELECT id FROM gbrain_page_projections WHERE slug=?",
+            (slug,),
+        ).fetchone()["id"]
+    repository = GBrainBatchRepository(settings)
+    persist_protections = repository._persist_segment_protections
+
+    def mutate_after_protection_check(batch_id, segment_id, **kwargs):
+        persist_protections(batch_id, segment_id, **kwargs)
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                f"UPDATE gbrain_page_projections SET {nullable_column}='' WHERE id=?",
+                (mapping_id,),
+            )
+
+    monkeypatch.setattr(
+        repository,
+        "_persist_segment_protections",
+        mutate_after_protection_check,
+    )
+
+    with pytest.raises(ProjectionLeaseLost, match=mapping_id):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        deleted=(
+                            GBrainDeletedResult(source_id="lgdo-managed", slug=slug),
+                        ),
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    assert _job_statuses(settings, job_id) == {job_id: "running"}
+    assert _generation(settings) == 0
+
+
 def test_orphan_mapping_and_unmanaged_ghost_deletions_are_legal(settings):
     orphan = _seed_page(settings, 1, lifecycle_status="deleted")
     orphan_slug = _seed_mapping(settings, orphan)
@@ -1113,6 +1330,79 @@ def test_legacy_duplicate_delete_candidates_are_all_staled_and_protected(setting
     assert _generation(settings) == 1
 
 
+def test_ambiguous_delete_rejects_mapping_changed_since_batch_snapshot(
+    settings,
+    monkeypatch,
+):
+    first = _seed_page(settings, 1, lifecycle_status="deleted")
+    second = _seed_page(settings, 2, lifecycle_status="deleted")
+    shared_slug = _seed_mapping(settings, first, slug="legacy/shared-cas")
+    with connect_app_write(settings) as conn:
+        conn.execute("DROP INDEX idx_gbrain_projection_slug_unique")
+    _seed_mapping(settings, second, slug=shared_slug)
+    job_id = _enqueue(settings, operation="delete", page=first)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    with connect_app(settings) as conn:
+        changed_mapping_id = conn.execute(
+            """
+            SELECT id FROM gbrain_page_projections
+            WHERE slug=? ORDER BY page_id LIMIT 1
+            """,
+            (shared_slug,),
+        ).fetchone()["id"]
+    repository = GBrainBatchRepository(settings)
+    persist_protections = repository._persist_segment_protections
+
+    def mutate_after_protection_check(batch_id, segment_id, **kwargs):
+        persist_protections(batch_id, segment_id, **kwargs)
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                """
+                UPDATE gbrain_page_projections
+                SET gbrain_content_hash=? WHERE id=?
+                """,
+                (_hash("concurrent-content"), changed_mapping_id),
+            )
+
+    monkeypatch.setattr(
+        repository,
+        "_persist_segment_protections",
+        mutate_after_protection_check,
+    )
+
+    with pytest.raises(ProjectionLeaseLost, match=changed_mapping_id):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        deleted=(
+                            GBrainDeletedResult(
+                                source_id="lgdo-managed",
+                                slug=shared_slug,
+                            ),
+                        ),
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    with connect_app(settings) as conn:
+        statuses = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE slug=? ORDER BY page_id",
+            (shared_slug,),
+        ).fetchall()
+    assert [row["status"] for row in statuses] == ["current", "current"]
+    assert _job_statuses(settings, job_id) == {job_id: "running"}
+    assert _generation(settings) == 0
+
+
 def test_empty_vault_reconcile_completes_each_unique_delete_job(settings):
     pages = [
         _seed_page(settings, index, lifecycle_status="deleted")
@@ -1154,6 +1444,275 @@ def test_empty_vault_reconcile_completes_each_unique_delete_job(settings):
         ).fetchall()
     assert [row["status"] for row in statuses] == ["deleted", "deleted"]
     assert _generation(settings) == 2
+
+
+def test_terminal_page_batch_member_is_not_treated_as_ownerless_repair(
+    settings,
+    monkeypatch,
+):
+    page = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    repository = GBrainBatchRepository(settings)
+    persist_protections = repository._persist_segment_protections
+
+    def terminalize_after_protection_check(batch_id, segment_id, **kwargs):
+        persist_protections(batch_id, segment_id, **kwargs)
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                """
+                UPDATE knowledge_projection_jobs
+                SET status='failed',lease_owner=NULL,lease_expires_at=NULL
+                WHERE id=?
+                """,
+                (job_id,),
+            )
+
+    monkeypatch.setattr(
+        repository,
+        "_persist_segment_protections",
+        terminalize_after_protection_check,
+    )
+
+    with pytest.raises(ProjectionLeaseLost, match=job_id):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        statuses={page.page_id: ("imported", (), None)},
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    with connect_app(settings) as conn:
+        mapping_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_page_projections"
+        ).fetchone()["count"]
+    assert mapping_count == 0
+
+
+def test_terminal_delete_batch_member_is_not_treated_as_orphan_cleanup(
+    settings,
+    monkeypatch,
+):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    repository = GBrainBatchRepository(settings)
+    persist_protections = repository._persist_segment_protections
+
+    def terminalize_after_protection_check(batch_id, segment_id, **kwargs):
+        persist_protections(batch_id, segment_id, **kwargs)
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                """
+                UPDATE knowledge_projection_jobs
+                SET status='failed',lease_owner=NULL,lease_expires_at=NULL
+                WHERE id=?
+                """,
+                (job_id,),
+            )
+
+    monkeypatch.setattr(
+        repository,
+        "_persist_segment_protections",
+        terminalize_after_protection_check,
+    )
+
+    with pytest.raises(ProjectionLeaseLost, match=job_id):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        deleted=(
+                            GBrainDeletedResult(source_id="lgdo-managed", slug=slug),
+                        ),
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    with connect_app(settings) as conn:
+        mapping_status = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()["status"]
+    assert mapping_status == "current"
+
+
+def test_member_lease_lost_before_protection_persistence_writes_nothing(
+    settings,
+    monkeypatch,
+):
+    page = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    protection = ProtectedMapping(
+        source_id="lgdo-managed",
+        slug=page.expected().path.removesuffix(".md"),
+        source_path=page.expected().path,
+        reason="deterministic failure",
+    )
+    repository = GBrainBatchRepository(settings)
+    validate_result = repository._validate_result_hashes
+
+    def steal_after_validation(request, response):
+        validate_result(request, response)
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                """
+                UPDATE knowledge_projection_jobs SET lease_owner='other'
+                WHERE id=?
+                """,
+                (job_id,),
+            )
+
+    monkeypatch.setattr(repository, "_validate_result_hashes", steal_after_validation)
+
+    with pytest.raises(ProjectionLeaseLost, match=job_id):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        statuses={
+                            page.page_id: (
+                                "error",
+                                (protection,),
+                                "deterministic failure",
+                            )
+                        },
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    with connect_app(settings) as conn:
+        protection_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_projection_protections"
+        ).fetchone()["count"]
+        job_owner = conn.execute(
+            "SELECT lease_owner FROM knowledge_projection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()["lease_owner"]
+    assert protection_count == 0
+    assert job_owner == "other"
+
+
+@pytest.mark.parametrize("lost_lease", ["batch", "segment", "job"])
+def test_lease_lost_during_protection_persistence_rolls_back_write(
+    settings,
+    monkeypatch,
+    lost_lease,
+):
+    page = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    protection = ProtectedMapping(
+        source_id="lgdo-managed",
+        slug=page.expected().path.removesuffix(".md"),
+        source_path=page.expected().path,
+        reason="deterministic failure",
+    )
+    repository = GBrainBatchRepository(settings)
+    persist_protections = repository._persist_protections
+
+    def steal_during_persistence(conn, protections, timestamp, page_id=None):
+        persist_protections(conn, protections, timestamp, page_id)
+        if lost_lease == "batch":
+            conn.execute(
+                """
+                UPDATE gbrain_projection_batches SET lease_owner='other'
+                WHERE id=?
+                """,
+                (batch.id,),
+            )
+        elif lost_lease == "segment":
+            conn.execute(
+                """
+                UPDATE gbrain_projection_segments SET lease_owner='other'
+                WHERE batch_id=? AND segment_index=0
+                """,
+                (batch.id,),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE knowledge_projection_jobs SET lease_owner='other'
+                WHERE id=?
+                """,
+                (job_id,),
+            )
+
+    monkeypatch.setattr(repository, "_persist_protections", steal_during_persistence)
+
+    with pytest.raises(ProjectionLeaseLost):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        statuses={
+                            page.page_id: (
+                                "error",
+                                (protection,),
+                                "deterministic failure",
+                            )
+                        },
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    with connect_app(settings) as conn:
+        protection_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_projection_protections"
+        ).fetchone()["count"]
+        batch_owner = conn.execute(
+            "SELECT lease_owner FROM gbrain_projection_batches WHERE id=?",
+            (batch.id,),
+        ).fetchone()["lease_owner"]
+        segment_owner = conn.execute(
+            """
+            SELECT lease_owner FROM gbrain_projection_segments
+            WHERE batch_id=? AND segment_index=0
+            """,
+            (batch.id,),
+        ).fetchone()["lease_owner"]
+        job_owner = conn.execute(
+            "SELECT lease_owner FROM knowledge_projection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()["lease_owner"]
+    assert protection_count == 0
+    assert (batch_owner, segment_owner, job_owner) == (WORKER, WORKER, WORKER)
 
 
 @pytest.mark.parametrize("lost_lease", ["batch", "segment", "job"])

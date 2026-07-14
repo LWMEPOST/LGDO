@@ -500,7 +500,7 @@ class GBrainBatchRepository:
             )
             try:
                 response = await client.sync(request)
-                self._renew_execution_leases(
+                member_job_ids = self._renew_execution_leases(
                     batch_id,
                     segment_id,
                     worker_id=worker_id,
@@ -537,6 +537,7 @@ class GBrainBatchRepository:
                 segment_id,
                 worker_id=worker_id,
                 protections=response_protections,
+                member_job_ids=member_job_ids,
                 timestamp=timestamp,
             )
             self._attribute_segment(
@@ -608,7 +609,7 @@ class GBrainBatchRepository:
         lease_seconds: int,
         instant: datetime,
         start_segment: bool,
-    ) -> None:
+    ) -> tuple[str, ...]:
         timestamp = instant.isoformat()
         lease_expires_at = (instant + timedelta(seconds=lease_seconds)).isoformat()
         with connect_app_write(self.settings) as conn:
@@ -645,6 +646,7 @@ class GBrainBatchRepository:
                 """,
                 (batch_id,),
             ).fetchall()
+            renewed_member_ids: list[str] = []
             for member in members:
                 if member["status"] != "running":
                     continue
@@ -658,6 +660,8 @@ class GBrainBatchRepository:
                 )
                 if renewed_job.rowcount != 1:
                     raise ProjectionLeaseLost("job", str(member["id"]))
+                renewed_member_ids.append(str(member["id"]))
+        return tuple(renewed_member_ids)
 
     def _record_transport_failure(
         self,
@@ -696,18 +700,17 @@ class GBrainBatchRepository:
         request: GBrainSyncRequest,
         response: GBrainSyncResponse,
     ) -> None:
+        GBrainProjectionClient._validate_response(request, response)
         expected_by_id = {page.page_id: page for page in request.expected_pages}
-        actual_by_id = {page.page_id: page for page in response.pages}
-        if set(actual_by_id) != set(expected_by_id):
-            raise ProjectionProtocolError("GBrain segment page results do not match expected pages")
-        for page_id, expected in expected_by_id.items():
-            actual = actual_by_id[page_id]
-            if (
-                actual.file_hash != expected.file_hash
-                or actual.raw_file_hash_before != expected.file_hash
+        for actual in response.pages:
+            expected = expected_by_id[actual.page_id]
+            if actual.status in {"imported", "skipped"} and (
+                actual.raw_file_hash_before != expected.file_hash
                 or actual.raw_file_hash_after != expected.file_hash
             ):
-                raise ProjectionProtocolError(f"GBrain page result hash mismatch for {page_id}")
+                raise ProjectionProtocolError(
+                    f"GBrain page result hash mismatch for {actual.page_id}"
+                )
 
     def _persist_segment_protections(
         self,
@@ -716,13 +719,27 @@ class GBrainBatchRepository:
         *,
         worker_id: str,
         protections: Sequence[ProtectedMapping],
+        member_job_ids: Sequence[str],
         timestamp: str,
     ) -> None:
         if not protections:
             return
         with connect_app_write(self.settings) as conn:
-            self._require_batch_segment(conn, batch_id, segment_id, worker_id)
+            self._require_persistence_owners(
+                conn,
+                batch_id,
+                segment_id,
+                worker_id,
+                member_job_ids,
+            )
             self._persist_protections(conn, protections, timestamp)
+            self._require_persistence_owners(
+                conn,
+                batch_id,
+                segment_id,
+                worker_id,
+                member_job_ids,
+            )
 
     def _finish_segment(
         self,
@@ -801,6 +818,37 @@ class GBrainBatchRepository:
         ).fetchone()
         if segment is None:
             raise ProjectionLeaseLost("segment", segment_id)
+
+    def _require_persistence_owners(
+        self,
+        conn: Any,
+        batch_id: str,
+        segment_id: str,
+        worker_id: str,
+        member_job_ids: Sequence[str],
+    ) -> None:
+        self._require_batch_segment(conn, batch_id, segment_id, worker_id)
+        if not member_job_ids:
+            return
+        rows = conn.execute(
+            """
+            SELECT j.* FROM gbrain_projection_batch_jobs bj
+            JOIN knowledge_projection_jobs j ON j.id=bj.job_id
+            WHERE bj.batch_id=?
+            ORDER BY j.id
+            """,
+            (batch_id,),
+        ).fetchall()
+        members = {
+            str(row["id"]): ProjectionJob.from_row(dict(row))
+            for row in rows
+            if str(row["id"]) in member_job_ids
+        }
+        for job_id in member_job_ids:
+            job = members.get(job_id)
+            if job is None:
+                raise ProjectionLeaseLost("job", job_id)
+            self._require_job_owners((job,), worker_id)
 
     def _load_active_protections(self, source_id: str) -> tuple[ProtectedMapping, ...]:
         with connect_app_write(self.settings) as conn:
@@ -1200,21 +1248,13 @@ class GBrainBatchRepository:
                     continue
                 if len(candidates) == 1 and len(owners) <= 1:
                     mapping = candidates[0]
-                    updated = conn.execute(
-                        """
-                        UPDATE gbrain_page_projections
-                        SET status='deleted',invalidated_at=?
-                        WHERE id=? AND gbrain_source_id=? AND slug=?
-                        """,
-                        (
-                            timestamp,
-                            mapping["id"],
-                            deletion.source_id,
-                            deletion.slug,
-                        ),
+                    self._set_mapping_status_from_snapshot(
+                        conn,
+                        mapping,
+                        status="deleted",
+                        timestamp=timestamp,
                     )
-                    if updated.rowcount == 1:
-                        bump_gbrain_projection_generation(conn, timestamp)
+                    bump_gbrain_projection_generation(conn, timestamp)
                     if owners:
                         owner = owners[0]
                         if not self.outbox.finish_claimed(
@@ -1226,19 +1266,14 @@ class GBrainBatchRepository:
                             raise ProjectionLeaseLost("job", owner.id)
                     continue
 
-                mapping_ids = [str(mapping["id"]) for mapping in candidates]
-                changed = 0
-                for mapping_id in mapping_ids:
-                    changed += conn.execute(
-                        """
-                        UPDATE gbrain_page_projections
-                        SET status='stale',invalidated_at=?
-                        WHERE id=? AND status<>'deleted'
-                        """,
-                        (timestamp, mapping_id),
-                    ).rowcount
-                if changed:
-                    bump_gbrain_projection_generation(conn, timestamp)
+                for mapping in candidates:
+                    self._set_mapping_status_from_snapshot(
+                        conn,
+                        mapping,
+                        status="stale",
+                        timestamp=timestamp,
+                    )
+                bump_gbrain_projection_generation(conn, timestamp)
                 first = candidates[0]
                 reason = "ambiguous GBrain delete attribution"
                 self._persist_protections(
@@ -1265,6 +1300,59 @@ class GBrainBatchRepository:
                         raise ProjectionLeaseLost("job", owner.id)
 
     @staticmethod
+    def _set_mapping_status_from_snapshot(
+        conn: Any,
+        mapping: Mapping[str, Any],
+        *,
+        status: Literal["deleted", "stale"],
+        timestamp: str,
+    ) -> None:
+        updated = conn.execute(
+            """
+            UPDATE gbrain_page_projections
+            SET status=?,invalidated_at=?
+            WHERE id=? AND page_id=? AND revision_id=? AND projection_epoch=?
+              AND page_path=? AND file_hash=? AND semantic_hash=?
+              AND gbrain_source_id=? AND slug=? AND source_path=?
+              AND gbrain_content_hash=? AND gbrain_page_generation=?
+              AND status=?
+              AND (
+                imported_at=?
+                OR (imported_at IS NULL AND CAST(? AS TEXT) IS NULL)
+              )
+              AND (
+                invalidated_at=?
+                OR (invalidated_at IS NULL AND CAST(? AS TEXT) IS NULL)
+              )
+              AND last_job_id=?
+            """,
+            (
+                status,
+                timestamp,
+                mapping["id"],
+                mapping["page_id"],
+                mapping["revision_id"],
+                mapping["projection_epoch"],
+                mapping["page_path"],
+                mapping["file_hash"],
+                mapping["semantic_hash"],
+                mapping["gbrain_source_id"],
+                mapping["slug"],
+                mapping["source_path"],
+                mapping["gbrain_content_hash"],
+                mapping["gbrain_page_generation"],
+                mapping["status"],
+                mapping.get("imported_at"),
+                mapping.get("imported_at"),
+                mapping.get("invalidated_at"),
+                mapping.get("invalidated_at"),
+                mapping["last_job_id"],
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ProjectionLeaseLost("mapping snapshot", str(mapping["id"]))
+
+    @staticmethod
     def _page_member_jobs(
         conn: Any,
         batch_id: str,
@@ -1280,7 +1368,7 @@ class GBrainBatchRepository:
             """,
             (batch_id, page_id),
         ).fetchall()
-        return [ProjectionJob.from_row(dict(row)) for row in rows if row["status"] == "running"]
+        return [ProjectionJob.from_row(dict(row)) for row in rows]
 
     @staticmethod
     def _delete_member_jobs(
@@ -1302,7 +1390,7 @@ class GBrainBatchRepository:
         return [
             ProjectionJob.from_row(dict(row))
             for row in rows
-            if row["status"] == "running" and str(row["page_id"]) in page_ids
+            if str(row["page_id"]) in page_ids
         ]
 
     @staticmethod
