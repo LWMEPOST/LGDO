@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import { api, getAuthToken, setAuthToken } from "./api/client";
+import { api, ApiError, getAuthToken, setAuthToken } from "./api/client";
 import { Layout } from "./components/Layout";
 import type { SectionId } from "./constants";
 import { AccountsTask, type AccountPayload } from "./features/AccountsTask";
@@ -26,6 +26,8 @@ import type {
   SourceRecord,
   SpaceFilter,
   WikiPage,
+  WikiMutationResponse,
+  WikiPageContentResponse,
 } from "./types";
 import { encodePath, filterRows, safeJson, splitTags, translateGapStatus, translateReviewItemStatus } from "./utils/format";
 import {
@@ -70,10 +72,19 @@ export function App() {
   const [feedback, setFeedback] = useState({ rating: "partial", comment: "" });
   const [editor, setEditor] = useState<EditorState>({
     path: "",
+    page_id: "",
     content: "",
+    current_revision_id: "",
+    generated_revision_id: null,
+    accepted_generated_revision_id: null,
+    lifecycle_status: "active",
+    projection_epoch: 0,
+    write_in_progress: false,
+    write_intent_id: null,
     review_status: "draft",
     owner: "",
   });
+  const wikiMutationInFlight = useRef(false);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [sourcePreview, setSourcePreview] = useState<SourcePreview | null>(null);
   const [sourcePreviewLoading, setSourcePreviewLoading] = useState(false);
@@ -284,39 +295,140 @@ export function App() {
   }
 
   async function loadPage(path: string) {
-    const page = await api<{ path: string; content: string; metadata: Record<string, any> }>(`/api/internal/wiki/pages/${encodePath(path)}`);
+    const page = await api<WikiPageContentResponse>(`/api/internal/wiki/pages/${encodePath(path)}`);
     setEditor({
       path: page.path,
+      page_id: page.page_id,
       content: page.content,
+      current_revision_id: page.current_revision_id,
+      generated_revision_id: page.generated_revision_id,
+      accepted_generated_revision_id: page.accepted_generated_revision_id,
+      lifecycle_status: page.lifecycle_status,
+      projection_epoch: page.projection_epoch,
+      write_in_progress: page.write_in_progress,
+      write_intent_id: page.write_intent_id,
       review_status: page.metadata.review_status || "draft",
       owner: page.metadata.owner || "",
     });
     setActiveSection("wiki");
   }
 
+  async function reconcilePageConflict(attemptedPath: string, attemptedContent: string) {
+    const latestPage = await api<WikiPageContentResponse>(`/api/internal/wiki/pages/${encodePath(attemptedPath)}`);
+    setEditor((prev) => {
+      if (prev.path !== attemptedPath) return prev;
+      return {
+        ...prev,
+        page_id: latestPage.page_id,
+        content: prev.content,
+        current_revision_id: latestPage.current_revision_id,
+        generated_revision_id: latestPage.generated_revision_id,
+        accepted_generated_revision_id: latestPage.accepted_generated_revision_id,
+        lifecycle_status: latestPage.lifecycle_status,
+        projection_epoch: latestPage.projection_epoch,
+        write_in_progress: latestPage.write_in_progress,
+        write_intent_id: latestPage.write_intent_id,
+      };
+    });
+    const localContent = attemptedContent ? "本地未保存内容" : "本地空白内容";
+    showToast(`检测到知识页版本冲突，已同步最新版本号；${localContent}已保留，请核对后再次保存`);
+  }
+
   async function savePage() {
     if (!editor.path) return showToast("请先选择知识页");
-    await api(`/api/internal/wiki/pages/${encodePath(editor.path)}`, {
-      method: "PUT",
-      body: JSON.stringify({
-        content: editor.content,
-        review_status: editor.review_status,
-        owner: editor.owner || null,
-        note: "管理端保存",
-      }),
-    });
-    showToast("知识页已保存");
-    await refresh();
+    if (wikiMutationInFlight.current) return showToast("知识页操作正在进行，请稍候");
+    wikiMutationInFlight.current = true;
+    const attemptedPath = editor.path;
+    const attemptedContent = editor.content;
+    try {
+      let result: WikiMutationResponse;
+      try {
+        result = await api<WikiMutationResponse>(`/api/internal/wiki/pages/${encodePath(attemptedPath)}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            content: attemptedContent,
+            expected_revision_id: editor.current_revision_id,
+            request_id: crypto.randomUUID(),
+            review_status: editor.review_status,
+            owner: editor.owner || null,
+            note: "管理端保存",
+          }),
+        });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 409) {
+          await reconcilePageConflict(attemptedPath, attemptedContent);
+          return;
+        }
+        throw error;
+      }
+      setEditor((prev) => {
+        if (prev.path !== attemptedPath) return prev;
+        return {
+          ...prev,
+          page_id: result.page_id,
+          content: prev.content,
+          current_revision_id: result.current_revision_id ?? prev.current_revision_id,
+          generated_revision_id: result.generated_revision_id ?? prev.generated_revision_id,
+          review_status: result.review_status ?? prev.review_status,
+          write_in_progress: false,
+          write_intent_id: result.write_intent_id,
+        };
+      });
+      showToast("知识页已保存");
+      await refresh();
+    } finally {
+      wikiMutationInFlight.current = false;
+    }
   }
 
   async function markPageStale(path = editor.path) {
     if (!path) return showToast("请先选择知识页");
-    await api(`/api/internal/wiki/pages/${encodePath(path)}/status`, {
-      method: "PATCH",
-      body: JSON.stringify({ review_status: "stale", note: "管理端标记过期" }),
-    });
-    showToast("已标记过期");
-    await refresh();
+    if (wikiMutationInFlight.current) return showToast("知识页操作正在进行，请稍候");
+    wikiMutationInFlight.current = true;
+    const attemptedPath = path;
+    const attemptedContent = editor.content;
+    try {
+      const listedPage = pages.find((page) => page.path === path);
+      const targetRevisionId = path === editor.path ? editor.current_revision_id : listedPage?.current_revision_id;
+      const targetPage = targetRevisionId
+        ? { current_revision_id: targetRevisionId }
+        : await api<WikiPageContentResponse>(`/api/internal/wiki/pages/${encodePath(path)}`);
+      let result: WikiMutationResponse;
+      try {
+        result = await api<WikiMutationResponse>(`/api/internal/wiki/pages/${encodePath(path)}/status`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            review_status: "stale",
+            expected_revision_id: targetPage.current_revision_id,
+            request_id: crypto.randomUUID(),
+            note: "管理端标记过期",
+          }),
+        });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 409) {
+          await reconcilePageConflict(attemptedPath, attemptedContent);
+          return;
+        }
+        throw error;
+      }
+      setEditor((prev) => {
+        if (prev.path !== attemptedPath) return prev;
+        return {
+          ...prev,
+          page_id: result.page_id,
+          content: prev.content,
+          current_revision_id: result.current_revision_id ?? prev.current_revision_id,
+          generated_revision_id: result.generated_revision_id ?? prev.generated_revision_id,
+          review_status: result.review_status ?? "stale",
+          write_in_progress: false,
+          write_intent_id: result.write_intent_id,
+        };
+      });
+      showToast("已标记过期");
+      await refresh();
+    } finally {
+      wikiMutationInFlight.current = false;
+    }
   }
 
   async function updateReview(id: string, status: string) {

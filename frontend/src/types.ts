@@ -33,20 +33,68 @@ export interface IngestReport {
 
 export interface WikiPage {
   path: string;
+  page_id?: string | null;
   domain: string;
   page_type: string;
   title: string;
   source_ids?: string[];
   review_status: string;
   owner?: string | null;
+  current_revision_id?: string | null;
+  generated_revision_id?: string | null;
+  accepted_generated_revision_id?: string | null;
+  lifecycle_status?: string | null;
+  projection_epoch?: number | null;
+  pending_write_intent_id?: string | null;
+  write_in_progress?: boolean;
+  write_intent_id?: string | null;
 }
 
 export interface ReviewItem {
   id: string;
   page_path: string;
+  page_id?: string | null;
   issue_type: string;
   status: string;
   owner?: string | null;
+  source_ids?: string[];
+  base_revision_id?: string | null;
+  candidate_revision_id?: string | null;
+  resolution_revision_id?: string | null;
+  expected_state?: Record<string, unknown>;
+  resolved_at?: string | null;
+}
+
+export interface WikiPageContentResponse {
+  path: string;
+  page_id: string;
+  content: string;
+  current_revision_id: string;
+  generated_revision_id: string | null;
+  accepted_generated_revision_id: string | null;
+  lifecycle_status: string;
+  projection_epoch: number;
+  write_in_progress: boolean;
+  write_intent_id: string | null;
+  metadata: Metadata;
+}
+
+export interface WikiMutationResponse {
+  path: string;
+  page_path: string;
+  page_id: string;
+  status: string;
+  revision_id: string | null;
+  current_revision_id: string | null;
+  generated_revision_id: string | null;
+  candidate_revision_id: string | null;
+  write_intent_id: string | null;
+  conflict_review_id: string | null;
+  observation_id: string | null;
+  audit_revision_id: string | null;
+  projection_job_ids: string[];
+  replayed: boolean;
+  review_status: string | null;
 }
 
 export interface KnowledgeGap {
@@ -160,7 +208,15 @@ export interface AccountRecord {
 
 export interface EditorState {
   path: string;
+  page_id: string;
   content: string;
+  current_revision_id: string;
+  generated_revision_id: string | null;
+  accepted_generated_revision_id: string | null;
+  lifecycle_status: string;
+  projection_epoch: number;
+  write_in_progress: boolean;
+  write_intent_id: string | null;
   review_status: string;
   owner: string;
 }
