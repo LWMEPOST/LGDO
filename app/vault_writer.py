@@ -12,6 +12,15 @@ import portalocker
 
 from app.config import Settings
 from app.db import connect_app, connect_app_write
+from app.wiki_markdown import (
+    FileObservationInput,
+    FrontmatterLimits,
+    ObservationChanged,
+    capture_file_observation,
+)
+
+
+RECOVERY_OBSERVATION_LIMITS = FrontmatterLimits()
 
 
 def _utc_iso(value: datetime | None = None) -> str:
@@ -69,12 +78,82 @@ class IntentReconcileResult:
     observation_ids: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _RecoveryFile:
+    kind: Literal["expected", "intended", "unknown", "missing"]
+    observation: FileObservationInput | None
+
+
 def _fsync_file(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as handle:
         handle.write(content)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _sync_directory_posix(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_directory_windows(path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    flush_file_buffers = kernel32.FlushFileBuffers
+    flush_file_buffers.argtypes = (wintypes.HANDLE,)
+    flush_file_buffers.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    generic_write = 0x40000000
+    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    handle = create_file(
+        str(path),
+        generic_write,
+        share_read_write_delete,
+        None,
+        open_existing,
+        file_flag_backup_semantics,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    flush_error = (
+        0 if flush_file_buffers(handle) else ctypes.get_last_error()
+    )
+    close_error = 0 if close_handle(handle) else ctypes.get_last_error()
+    error_code = flush_error or close_error
+    if error_code:
+        raise ctypes.WinError(error_code)
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        _sync_directory_windows(path)
+    else:
+        _sync_directory_posix(path)
 
 
 class AtomicVaultWriter:
@@ -90,7 +169,7 @@ class AtomicVaultWriter:
             path.relative_to(self.pending_root)
         except ValueError as exc:
             raise VaultWriteError("write intent path escapes pending root") from exc
-        path.mkdir(parents=True, exist_ok=True)
+        self._ensure_directory_durable(path)
         return path
 
     def _safe_target(self, target_path: str) -> Path:
@@ -112,6 +191,9 @@ class AtomicVaultWriter:
     def backup_path(self, intent_id: str) -> Path:
         return self._intent_dir(intent_id) / "backup.md"
 
+    def capture_claim_path(self, intent_id: str) -> Path:
+        return self._intent_dir(intent_id) / "capture-claim.md"
+
     def lock_path(self, intent_id: str) -> Path:
         return self._intent_dir(intent_id) / "executor.lock"
 
@@ -124,17 +206,47 @@ class AtomicVaultWriter:
         return digest.hexdigest()
 
     @staticmethod
-    def _fsync_directory(path: Path) -> None:
+    def _fsync_directory(path: Path, *, strict: bool = False) -> None:
         try:
-            descriptor = os.open(path, os.O_RDONLY)
+            _sync_directory(path)
         except OSError:
-            return
+            if strict:
+                raise
+
+    @staticmethod
+    def _fsync_existing_file(path: Path) -> None:
+        with path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+
+    def _ensure_directory_durable(self, path: Path) -> None:
+        missing: list[Path] = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        if current.exists() and not current.is_dir():
+            raise NotADirectoryError(current)
+        for directory in reversed(missing):
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                if not directory.is_dir():
+                    raise
+            self._fsync_directory(directory.parent, strict=True)
+
+    def _sync_existing_path(self, path: Path) -> None:
+        self._fsync_existing_file(path)
+        self._fsync_directory(path.parent, strict=True)
+
+    @staticmethod
+    def _same_file(first: Path, second: Path) -> bool:
         try:
-            os.fsync(descriptor)
+            return os.path.samefile(first, second)
         except OSError:
-            pass
-        finally:
-            os.close(descriptor)
+            return False
 
     def capture(
         self,
@@ -144,18 +256,82 @@ class AtomicVaultWriter:
     ) -> CapturedFile:
         target = self._safe_target(target_path)
         backup = self.backup_path(intent_id)
+        claim = self.capture_claim_path(intent_id)
+        claim_duplicates_backup = (
+            claim.exists()
+            and backup.exists()
+            and self._same_file(claim, backup)
+        )
+        claim_duplicates_target = (
+            claim.exists()
+            and target.exists()
+            and self._same_file(claim, target)
+        )
+        if claim.exists() and not (
+            claim_duplicates_backup or claim_duplicates_target
+        ):
+            self._sync_existing_path(claim)
+            claim_hash = self._stream_hash(claim)
+            if not target.exists():
+                try:
+                    os.link(claim, target)
+                except FileExistsError as exc:
+                    observed = self._stream_hash(target)
+                    raise TargetChanged(target_path, observed) from exc
+                except OSError as exc:
+                    raise TargetChanged(target_path, claim_hash) from exc
+                self._sync_existing_path(target)
+            raise TargetChanged(target_path, claim_hash)
         if backup.exists():
+            self._sync_existing_path(backup)
             observed = self._stream_hash(backup)
             if expected_file_hash is not None and observed != expected_file_hash:
                 raise TargetChanged(target_path, observed)
-            return CapturedFile(backup, observed)
+            if not target.exists():
+                if claim_duplicates_backup and claim.exists():
+                    self._fsync_directory(target.parent, strict=True)
+                    claim.unlink()
+                    self._fsync_directory(claim.parent, strict=True)
+                return CapturedFile(backup, observed)
+            if not self._same_file(target, backup):
+                return CapturedFile(backup, observed)
         if not target.exists():
             if expected_file_hash is not None:
                 raise TargetMissing(target_path)
             return CapturedFile(backup, None)
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(target, backup)
-        self._fsync_directory(target.parent)
+        self._ensure_directory_durable(backup.parent)
+        if not backup.exists():
+            try:
+                os.link(target, backup)
+            except FileExistsError as exc:
+                observed = self._stream_hash(backup)
+                raise TargetChanged(str(backup), observed) from exc
+            self._sync_existing_path(backup)
+        if claim.exists():
+            raise TargetChanged(str(claim), self._stream_hash(claim))
+        try:
+            os.rename(target, claim)
+        except FileExistsError as exc:
+            observed = self._stream_hash(claim)
+            raise TargetChanged(str(claim), observed) from exc
+        self._sync_existing_path(claim)
+        self._fsync_directory(target.parent, strict=True)
+
+        if not self._same_file(claim, backup):
+            claim_hash = self._stream_hash(claim)
+            try:
+                os.link(claim, target)
+            except FileExistsError as exc:
+                observed = self._stream_hash(target)
+                raise TargetChanged(target_path, observed) from exc
+            except OSError as exc:
+                raise TargetChanged(target_path, claim_hash) from exc
+            self._sync_existing_path(target)
+            raise TargetChanged(target_path, claim_hash)
+        if target.exists():
+            raise TargetChanged(target_path, self._stream_hash(target))
+        claim.unlink()
+        self._fsync_directory(claim.parent, strict=True)
         observed = self._stream_hash(backup)
         if observed != expected_file_hash:
             raise TargetChanged(target_path, observed)
@@ -167,16 +343,18 @@ class AtomicVaultWriter:
         expected_hash = hashlib.sha256(content).hexdigest()
         if not staged.exists():
             _fsync_file(staged, content)
+            self._fsync_directory(staged.parent, strict=True)
         else:
+            self._sync_existing_path(staged)
             staged_hash = self._stream_hash(staged)
             if staged_hash != expected_hash:
                 raise TargetChanged(str(staged), staged_hash)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_directory_durable(target.parent)
         try:
             os.link(staged, target)
         except FileExistsError as exc:
             raise TargetChanged(target_path, self._stream_hash(target)) from exc
-        self._fsync_directory(target.parent)
+        self._fsync_directory(target.parent, strict=True)
         observed = self._stream_hash(target)
         if observed != expected_hash:
             raise TargetChanged(target_path, observed)
@@ -326,18 +504,213 @@ class IntentExecutor:
                 raise VaultWriteError("lost intent ownership while marking recovery")
         return self._result(intent_id, "recovery_required", "unchanged")
 
+    @staticmethod
+    def _classify_recovery_file(
+        observation: FileObservationInput | None,
+        *,
+        expected_hash: str | None,
+        intended_hash: str,
+    ) -> _RecoveryFile:
+        if observation is None:
+            return _RecoveryFile("missing", None)
+        if observation.file_hash == intended_hash:
+            return _RecoveryFile("intended", observation)
+        if observation.file_hash == expected_hash:
+            return _RecoveryFile("expected", observation)
+        return _RecoveryFile("unknown", observation)
+
+    @staticmethod
+    def _observe_recovery_path(path: Path) -> FileObservationInput | None:
+        try:
+            return capture_file_observation(
+                path,
+                max_content_bytes=RECOVERY_OBSERVATION_LIMITS.max_file_bytes,
+                prefix_bytes=RECOVERY_OBSERVATION_LIMITS.max_prefix_bytes,
+            )
+        except FileNotFoundError:
+            return None
+
+    def _reconcile_recovery(
+        self,
+        intent: dict[str, Any],
+        revision: dict[str, Any],
+    ) -> IntentReconcileResult | None:
+        from app.wiki_revisions import WikiRevisionError
+
+        target = self.writer._safe_target(intent["target_path"])
+        backup = self.writer.backup_path(intent["id"])
+        staged = self.writer.staged_path(intent["id"])
+        claim = self.writer.capture_claim_path(intent["id"])
+        target_file = self._classify_recovery_file(
+            self._observe_recovery_path(target),
+            expected_hash=intent["expected_file_hash"],
+            intended_hash=revision["file_hash"],
+        )
+        backup_file = self._classify_recovery_file(
+            self._observe_recovery_path(backup),
+            expected_hash=intent["expected_file_hash"],
+            intended_hash=revision["file_hash"],
+        )
+        staged_file = self._classify_recovery_file(
+            self._observe_recovery_path(staged),
+            expected_hash=intent["expected_file_hash"],
+            intended_hash=revision["file_hash"],
+        )
+        claim_file = self._classify_recovery_file(
+            self._observe_recovery_path(claim),
+            expected_hash=intent["expected_file_hash"],
+            intended_hash=revision["file_hash"],
+        )
+        claim_is_duplicate = claim_file.kind != "missing" and any(
+            self.writer._same_file(claim, path)
+            for path in (target, backup)
+            if path.exists()
+        )
+        claim_is_unknown = (
+            claim_file.kind == "unknown" and not claim_is_duplicate
+        )
+        staged_is_unknown = staged_file.kind not in {"intended", "missing"}
+        has_external_unknown = (
+            target_file.kind == "unknown"
+            or backup_file.kind == "unknown"
+            or staged_is_unknown
+            or claim_is_unknown
+        )
+        intended_is_installed = target_file.kind == "intended"
+        intended_can_be_installed = (
+            target_file.kind == "missing"
+            and backup_file.kind == "intended"
+        )
+        if not has_external_unknown and (
+            intended_is_installed or intended_can_be_installed
+        ):
+            self._require_lease(intent["id"])
+            if intended_can_be_installed:
+                self.writer.install(
+                    intent["id"],
+                    intent["target_path"],
+                    revision["content"].encode("utf-8"),
+                )
+            else:
+                self.writer._sync_existing_path(target)
+                observed_hash = self.writer._stream_hash(target)
+                if observed_hash != revision["file_hash"]:
+                    raise TargetChanged(intent["target_path"], observed_hash)
+            self._require_lease(intent["id"])
+            captured_hash = (
+                backup_file.observation.file_hash
+                if backup_file.observation is not None
+                else None
+            )
+            with connect_app_write(self.settings) as conn:
+                installed = conn.execute(
+                    """
+                    UPDATE vault_write_intents
+                    SET status='installed',backup_path=?,captured_file_hash=?,
+                        backup_retention_status=?,updated_at=?
+                    WHERE id=? AND status='recovery_required'
+                      AND executor_owner=?
+                    """,
+                    (
+                        str(backup),
+                        captured_hash,
+                        "retained" if captured_hash is not None else "none",
+                        _utc_iso(),
+                        intent["id"],
+                        self.owner,
+                    ),
+                )
+                if installed.rowcount != 1:
+                    raise VaultWriteError(
+                        "known intended recovery status CAS failed"
+                    )
+            mutation = self.revisions.finalize_intent(
+                intent["id"],
+                self.owner,
+            )
+            return IntentReconcileResult(
+                intent_id=intent["id"],
+                intent_status="applied",
+                current_revision_id=mutation.current_revision_id,
+                current_kind="intended",
+            )
+        if (
+            target_file.kind != "unknown"
+            and backup_file.kind != "unknown"
+            and not staged_is_unknown
+            and not claim_is_unknown
+        ):
+            if target_file.kind == backup_file.kind == "missing":
+                outcome = self.revisions.fail_missing_recovery(
+                    intent["id"],
+                    self.owner,
+                )
+                return IntentReconcileResult(
+                    intent_id=intent["id"],
+                    intent_status="failed",
+                    current_revision_id=outcome["current_revision_id"],
+                    current_kind="unchanged",
+                    observation_ids=tuple(outcome["observation_ids"]),
+                )
+            return None
+
+        try:
+            outcome = self.revisions.recover_write_intent(
+                intent["id"],
+                self.owner,
+                target_kind=target_file.kind,
+                target_observation=(
+                    target_file.observation
+                    if target_file.kind == "unknown"
+                    else None
+                ),
+                backup_kind=backup_file.kind,
+                backup_observation=(
+                    backup_file.observation
+                    if backup_file.kind == "unknown"
+                    else None
+                ),
+                staged_kind=(
+                    "unknown" if staged_is_unknown else staged_file.kind
+                ),
+                staged_observation=(
+                    staged_file.observation if staged_is_unknown else None
+                ),
+                claim_kind=(
+                    "missing" if claim_is_duplicate else claim_file.kind
+                ),
+                claim_observation=(
+                    claim_file.observation if claim_is_unknown else None
+                ),
+            )
+        except (VaultWriteError, WikiRevisionError) as exc:
+            return self._mark_recovery(intent["id"], exc)
+        return IntentReconcileResult(
+            intent_id=intent["id"],
+            intent_status=outcome["intent_status"],
+            current_revision_id=outcome["current_revision_id"],
+            current_kind=outcome["current_kind"],
+            successor_intent_id=outcome.get("successor_intent_id"),
+            observation_ids=tuple(outcome.get("observation_ids") or ()),
+        )
+
     def capture_and_install(
         self,
         intent_id: str,
         *,
         stop_after: Literal["captured", "installed"] | None = None,
     ) -> IntentReconcileResult:
-        from app.wiki_revisions import RevisionConflict
+        from app.wiki_revisions import RevisionConflict, WikiRevisionError
 
         intent, revision = self._load_intent(intent_id)
         if intent["executor_owner"] != self.owner:
             raise VaultWriteError("intent is not owned by this executor")
         try:
+            if intent["status"] == "recovery_required":
+                self._require_lease(intent_id)
+                recovered = self._reconcile_recovery(intent, revision)
+                if recovered is not None:
+                    return recovered
             if intent["status"] in {"pending", "recovery_required"}:
                 self._require_lease(intent_id)
                 captured = self.writer.capture(
@@ -373,6 +746,7 @@ class IntentExecutor:
                 self._require_lease(intent_id)
                 target = self.writer._safe_target(intent["target_path"])
                 if target.exists():
+                    self.writer._sync_existing_path(target)
                     observed_hash = self.writer._stream_hash(target)
                     if observed_hash != revision["file_hash"]:
                         raise TargetChanged(intent["target_path"], observed_hash)
@@ -394,6 +768,7 @@ class IntentExecutor:
                 target = self.writer._safe_target(intent["target_path"])
                 if not target.exists():
                     raise TargetMissing(intent["target_path"])
+                self.writer._sync_existing_path(target)
                 observed_hash = self.writer._stream_hash(target)
                 if observed_hash != revision["file_hash"]:
                     raise TargetChanged(intent["target_path"], observed_hash)
@@ -406,7 +781,13 @@ class IntentExecutor:
                 )
         except FileNotFoundError:
             return self._mark_recovery(intent_id, TargetMissing(intent["target_path"]))
-        except (TargetChanged, TargetMissing, RevisionConflict) as exc:
+        except (
+            ObservationChanged,
+            TargetChanged,
+            TargetMissing,
+            RevisionConflict,
+            WikiRevisionError,
+        ) as exc:
             return self._mark_recovery(intent_id, exc)
         return self._result(intent_id, intent["status"], "unchanged")
 
@@ -436,6 +817,16 @@ class IntentExecutor:
     ) -> IntentReconcileResult:
         if not self.claim(intent_id, now=now):
             intent, _ = self._load_intent(intent_id)
+            if intent["status"] == "superseded":
+                outcome = self.revisions.replay_recovery_handoff(intent_id)
+                return IntentReconcileResult(
+                    intent_id=intent_id,
+                    intent_status="superseded",
+                    current_revision_id=outcome["current_revision_id"],
+                    current_kind=outcome["current_kind"],
+                    successor_intent_id=outcome["successor_intent_id"],
+                    observation_ids=tuple(outcome.get("observation_ids") or ()),
+                )
             if intent["executor_owner"] != self.owner:
                 raise VaultWriteError("intent lease is held by another executor")
         try:
@@ -469,6 +860,35 @@ class IntentExecutor:
             if result.intent_status == "applied":
                 completed.append(intent_id)
         return completed
+
+    def reconcile_retained_backups(self) -> list[str]:
+        with connect_app(self.settings) as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM vault_write_intents
+                WHERE status='applied'
+                  AND backup_retention_status IN ('retained','change_detected')
+                ORDER BY created_at,id
+                """
+            ).fetchall()
+        changed: list[str] = []
+        for row in rows:
+            intent_id = str(row["id"])
+            backup = self.writer.backup_path(intent_id)
+            try:
+                observation = capture_file_observation(
+                    backup,
+                    max_content_bytes=RECOVERY_OBSERVATION_LIMITS.max_file_bytes,
+                    prefix_bytes=RECOVERY_OBSERVATION_LIMITS.max_prefix_bytes,
+                )
+                if self.revisions.reconcile_retained_backup(
+                    intent_id,
+                    observation,
+                ):
+                    changed.append(intent_id)
+            except Exception:
+                continue
+        return changed
 
     def clear_terminal(self, intent_id: str, status: str, error: str | None = None) -> bool:
         if status not in {"aborted", "failed"}:

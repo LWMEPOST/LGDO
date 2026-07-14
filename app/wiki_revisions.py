@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager, nullcontext
@@ -35,6 +36,29 @@ MutationStatus = Literal[
 ]
 
 VALID_REVIEW_STATUSES = frozenset({"draft", "reviewed", "stale", "rejected"})
+
+
+def _copy_file_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    chunk_size: int = 64 * 1024,
+) -> None:
+    with source.open("rb") as source_handle:
+        with destination.open("xb") as destination_handle:
+            while chunk := source_handle.read(chunk_size):
+                destination_handle.write(chunk)
+            destination_handle.flush()
+            os.fsync(destination_handle.fileno())
+
+
+def _link_or_copy_file_no_replace(source: Path, destination: Path) -> None:
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        raise
+    except OSError:
+        _copy_file_no_replace(source, destination)
 
 
 @dataclass(frozen=True)
@@ -2605,6 +2629,1566 @@ class WikiRevisionService:
         page["pending_write_intent_id"] = intent_id
         return intent_id
 
+    @staticmethod
+    def _stable_recovery_id(prefix: str, *parts: str) -> str:
+        digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+        return f"{prefix}_{digest[:32]}"
+
+    def _persist_observation_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        observation: FileObservationInput,
+    ) -> dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT * FROM wiki_file_observations
+            WHERE page_path=? AND file_hash=?
+            """,
+            (page["path"], observation.file_hash),
+        ).fetchone()
+        if row is None:
+            observation_id = f"wobs_{uuid.uuid4().hex}"
+            truncated = bool(observation.content_truncated)
+            conn.execute(
+                """
+                INSERT INTO wiki_file_observations(
+                  id,page_id,page_path,file_hash,size_bytes,mtime_ns,content_bytes,
+                  content_prefix,content_truncated,parse_status,error_code,
+                  error_message,observed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(page_path,file_hash) DO NOTHING
+                """,
+                (
+                    observation_id,
+                    page["page_id"],
+                    page["path"],
+                    observation.file_hash,
+                    observation.size_bytes,
+                    observation.mtime_ns,
+                    observation.content_bytes,
+                    observation.content_prefix,
+                    truncated,
+                    "invalid" if truncated else "pending",
+                    "file_too_large" if truncated else None,
+                    (
+                        "file exceeds the observation capture limit"
+                        if truncated
+                        else None
+                    ),
+                    now_iso(),
+                ),
+            )
+        stored = conn.execute(
+            """
+            SELECT * FROM wiki_file_observations
+            WHERE page_path=? AND file_hash=?
+            """,
+            (page["path"], observation.file_hash),
+        ).fetchone()
+        if stored is None:
+            raise WikiRevisionError("observation insert did not produce a row")
+
+        def blob(value: Any) -> bytes | None:
+            return None if value is None else bytes(value)
+
+        if (
+            stored["page_id"] != page["page_id"]
+            or int(stored["size_bytes"]) != observation.size_bytes
+            or blob(stored["content_bytes"]) != observation.content_bytes
+            or blob(stored["content_prefix"]) != observation.content_prefix
+            or bool(stored["content_truncated"])
+            != bool(observation.content_truncated)
+        ):
+            raise RevisionConflict(
+                "observation natural key belongs to different bytes",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        return dict(stored)
+
+    @staticmethod
+    def _validate_observation_content(
+        observation: dict[str, Any],
+    ) -> tuple[bytes | None, Any | None, str | None, str | None]:
+        if bool(observation["content_truncated"]):
+            return (
+                None,
+                None,
+                "file_too_large",
+                "file exceeds the observation capture limit",
+            )
+        if observation["content_bytes"] is None:
+            return None, None, "missing_content_bytes", "full bytes are required"
+        content = bytes(observation["content_bytes"])
+        if len(content) != int(observation["size_bytes"]):
+            return (
+                None,
+                None,
+                "observation_size_mismatch",
+                "observation size does not match captured bytes",
+            )
+        if compute_file_hash(content) != observation["file_hash"]:
+            return (
+                None,
+                None,
+                "observation_hash_mismatch",
+                "observation hash does not match captured bytes",
+            )
+        try:
+            document = parse_wiki_bytes(content)
+            _source_ids(_plain(document.frontmatter))
+            _review_status(document.frontmatter.get("review_status"))
+        except MarkdownParseError as exc:
+            return None, None, exc.code, str(exc)
+        return content, document, None, None
+
+    def _create_external_candidate_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        *,
+        observation: dict[str, Any],
+        event_id: str,
+        expected_state_json: str,
+        actor: str,
+        metadata_extra: dict[str, Any],
+    ) -> RevisionRecord:
+        content, document, error_code, error_message = (
+            self._validate_observation_content(observation)
+        )
+        if error_code is not None or content is None or document is None:
+            conn.execute(
+                """
+                UPDATE wiki_file_observations
+                SET parse_status='invalid',error_code=?,error_message=?
+                WHERE id=?
+                """,
+                (error_code, error_message, observation["id"]),
+            )
+            raise InvalidWikiDocument(str(observation["id"]), str(error_code))
+
+        existing_event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        if existing_event is not None and existing_event["result_revision_id"] is not None:
+            existing_revision = conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (existing_event["result_revision_id"],),
+            ).fetchone()
+            try:
+                existing_metadata = json.loads(
+                    existing_revision["metadata_json"] or "{}"
+                ) if existing_revision is not None else {}
+            except (TypeError, json.JSONDecodeError):
+                existing_metadata = {}
+            if (
+                existing_revision is None
+                or existing_event["page_path"] != page["path"]
+                or existing_event["observation_id"] != observation["id"]
+                or existing_event["status"] not in {"pending", "prepared"}
+                or existing_revision["page_id"] != page["page_id"]
+                or existing_revision["origin"] != "external"
+                or existing_revision["base_revision_id"]
+                != page.get("current_revision_id")
+                or existing_metadata.get("vault_change_event_id") != event_id
+                or existing_metadata.get("observation_id") != observation["id"]
+                or existing_metadata.get("observed_file_hash")
+                != observation["file_hash"]
+                or any(
+                    existing_metadata.get(key) != value
+                    for key, value in metadata_extra.items()
+                )
+            ):
+                raise RevisionConflict(
+                    "recovery event identity changed",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            return RevisionRecord.from_row(existing_revision)
+
+        revision_id = f"wrev_{uuid.uuid4().hex}"
+        write_token = f"write_{uuid.uuid4().hex}"
+        review_status = _review_status(
+            document.frontmatter.get("review_status")
+            or page.get("review_status")
+        )
+        rendered = render_managed_frontmatter(
+            document,
+            page_id=page["page_id"],
+            revision_id=revision_id,
+            write_token=write_token,
+            review_status=review_status,
+        )
+        final_document = parse_wiki_bytes(rendered)
+        metadata = _plain(final_document.frontmatter)
+        metadata.update(
+            {
+                "vault_change_event_id": event_id,
+                "observation_id": observation["id"],
+                "observed_file_hash": observation["file_hash"],
+                **metadata_extra,
+            }
+        )
+        state_digest = hashlib.sha256(
+            expected_state_json.encode("utf-8")
+        ).hexdigest()
+        revision = self._create_revision_locked(
+            conn,
+            page,
+            content=rendered,
+            origin="external",
+            base_revision_id=page.get("current_revision_id"),
+            source_ids=_source_ids(metadata),
+            actor=actor,
+            note=None,
+            idempotency_key=f"external:{event_id}:{state_digest}",
+            metadata=metadata,
+            revision_id=revision_id,
+        )
+        conn.execute(
+            """
+            UPDATE wiki_file_observations
+            SET parse_status='valid',error_code=NULL,error_message=NULL
+            WHERE id=? AND page_id=?
+            """,
+            (observation["id"], page["page_id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO vault_change_events(
+              id,kind,page_path,observation_id,expected_state_json,status,
+              result_revision_id,detected_at,updated_at
+            ) VALUES (?,'modify',?,?,?,'prepared',?,?,?)
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (
+                event_id,
+                page["path"],
+                observation["id"],
+                expected_state_json,
+                revision.id,
+                now_iso(),
+                now_iso(),
+            ),
+        )
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        if (
+            event is None
+            or event["page_path"] != page["path"]
+            or event["observation_id"] != observation["id"]
+            or event["result_revision_id"] != revision.id
+            or event["status"] not in {"pending", "prepared"}
+        ):
+            raise RevisionConflict(
+                "external candidate event changed",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        return revision
+
+    @staticmethod
+    def _candidate_event_id(candidate: Any) -> str | None:
+        try:
+            metadata = json.loads(candidate["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        event_id = metadata.get("vault_change_event_id")
+        return event_id if isinstance(event_id, str) and event_id else None
+
+    def _recovery_displaced_lineage_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        *,
+        expected_intent_id: str | None = None,
+    ) -> tuple[Any, str] | None:
+        current_revision_id = page.get("current_revision_id")
+        if not isinstance(current_revision_id, str) or not current_revision_id:
+            return None
+        current = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (current_revision_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["page_id"] != page["page_id"]
+            or current["origin"] != "external"
+        ):
+            return None
+        try:
+            metadata = json.loads(current["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        displaced_revision_id = metadata.get("recovery_displaced_revision_id")
+        recovery_intent_id = metadata.get("recovery_intent_id")
+        if (
+            not isinstance(displaced_revision_id, str)
+            or not displaced_revision_id
+            or displaced_revision_id == current_revision_id
+            or not isinstance(recovery_intent_id, str)
+            or not recovery_intent_id
+            or (
+                expected_intent_id is not None
+                and recovery_intent_id != expected_intent_id
+            )
+        ):
+            return None
+        displaced = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (displaced_revision_id,),
+        ).fetchone()
+        recovery_intent = conn.execute(
+            "SELECT * FROM vault_write_intents WHERE id=?",
+            (recovery_intent_id,),
+        ).fetchone()
+        if (
+            displaced is None
+            or displaced["page_id"] != page["page_id"]
+            or recovery_intent is None
+            or recovery_intent["page_id"] != page["page_id"]
+            or recovery_intent["status"] != "superseded"
+            or recovery_intent["revision_id"] != displaced_revision_id
+        ):
+            return None
+        successor_intent_id = next(
+            (
+                payload.get("successor_intent_id")
+                for payload in self._audit_payloads_locked(
+                    conn,
+                    "wiki_recovery_handoff",
+                )
+                if payload.get("recovery_intent_id") == recovery_intent_id
+                and payload.get("candidate_revision_id") == current_revision_id
+                and isinstance(payload.get("successor_intent_id"), str)
+            ),
+            None,
+        )
+        if successor_intent_id is None:
+            successor_intent_id = next(
+                (
+                    payload.get("write_intent_id")
+                    for payload in self._audit_payloads_locked(
+                        conn,
+                        "wiki_conflict_resolution_prepared",
+                    )
+                    if payload.get("recovery_intent_id")
+                    == recovery_intent_id
+                    and payload.get("resolution_revision_id")
+                    == current_revision_id
+                    and isinstance(payload.get("write_intent_id"), str)
+                ),
+                None,
+            )
+        if successor_intent_id is None:
+            return None
+        successor = conn.execute(
+            "SELECT * FROM vault_write_intents WHERE id=?",
+            (successor_intent_id,),
+        ).fetchone()
+        if (
+            successor is None
+            or successor["page_id"] != page["page_id"]
+            or successor["revision_id"] != current_revision_id
+            or successor["status"] != "applied"
+        ):
+            return None
+        return displaced, recovery_intent_id
+
+    def _supersede_candidate_event_locked(
+        self,
+        conn: Any,
+        candidate_revision_id: str | None,
+    ) -> None:
+        if candidate_revision_id is None:
+            return
+        candidate = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (candidate_revision_id,),
+        ).fetchone()
+        if candidate is None:
+            return
+        event_id = self._candidate_event_id(candidate)
+        if event_id is None:
+            return
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        if event is None:
+            raise WikiRevisionError("external candidate event is missing")
+        if event["status"] == "superseded":
+            return
+        if (
+            event["status"] not in {"pending", "prepared"}
+            or event["result_revision_id"] != candidate_revision_id
+        ):
+            raise RevisionConflict(
+                "external candidate event is no longer supersedable",
+                current_revision_id=candidate["base_revision_id"],
+            )
+        changed = conn.execute(
+            """
+            UPDATE vault_change_events
+            SET status='superseded',updated_at=?
+            WHERE id=? AND result_revision_id=?
+              AND status IN ('pending','prepared')
+            """,
+            (now_iso(), event_id, candidate_revision_id),
+        )
+        if changed.rowcount != 1:
+            raise RevisionConflict(
+                "external candidate event changed while superseding",
+                current_revision_id=candidate["base_revision_id"],
+            )
+
+    def _supersede_retained_backup_review_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        intent_id: str,
+    ) -> bool:
+        pending = conn.execute(
+            """
+            SELECT * FROM review_items
+            WHERE page_id=? AND issue_type='concurrent_write_conflict'
+              AND status='pending'
+            ORDER BY created_at,id
+            """,
+            (page["page_id"],),
+        ).fetchall()
+        for review in pending:
+            candidate = conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (review["candidate_revision_id"],),
+            ).fetchone()
+            if candidate is None:
+                continue
+            try:
+                metadata = json.loads(candidate["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("retained_backup_intent_id") != intent_id
+            ):
+                continue
+            timestamp = now_iso()
+            changed = conn.execute(
+                """
+                UPDATE review_items
+                SET status='superseded',resolved_at=?,updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (timestamp, timestamp, review["id"]),
+            )
+            if changed.rowcount != 1:
+                raise RevisionConflict(
+                    "retained backup review changed while superseding",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            self._supersede_candidate_event_locked(
+                conn,
+                review["candidate_revision_id"],
+            )
+            return True
+        return False
+
+    def _seed_concurrent_review_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        *,
+        candidate: RevisionRecord,
+        event_id: str | None,
+        expected_state_extra: dict[str, Any] | None = None,
+    ) -> str:
+        pending = list(
+            conn.execute(
+                """
+                SELECT * FROM review_items
+                WHERE page_id=? AND status='pending'
+                  AND issue_type IN ('content_conflict','concurrent_write_conflict')
+                ORDER BY created_at,id
+                """,
+                (page["page_id"],),
+            ).fetchall()
+        )
+        matching = [
+            row
+            for row in pending
+            if row["issue_type"] == "concurrent_write_conflict"
+            and row["base_revision_id"] == page.get("current_revision_id")
+            and row["candidate_revision_id"] == candidate.id
+        ]
+        keep = matching[0] if len(matching) == 1 else None
+        timestamp = now_iso()
+        for row in pending:
+            if keep is not None and row["id"] == keep["id"]:
+                continue
+            if row["issue_type"] != "concurrent_write_conflict":
+                continue
+            changed = conn.execute(
+                """
+                UPDATE review_items
+                SET status='superseded',resolved_at=?,updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (timestamp, timestamp, row["id"]),
+            )
+            if changed.rowcount != 1:
+                raise RevisionConflict(
+                    "concurrent review changed while seeding candidate",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            self._supersede_candidate_event_locked(
+                conn,
+                row["candidate_revision_id"],
+            )
+
+        review_id = (
+            str(keep["id"])
+            if keep is not None
+            else self._stable_recovery_id(
+                "review",
+                page["page_id"],
+                candidate.id,
+                event_id or "no-event",
+            )
+        )
+        remaining = list(
+            conn.execute(
+                """
+                SELECT id FROM review_items
+                WHERE page_id=? AND status='pending'
+                  AND issue_type IN ('content_conflict','concurrent_write_conflict')
+                ORDER BY id
+                """,
+                (page["page_id"],),
+            ).fetchall()
+        )
+        planned_ids = {str(row["id"]) for row in remaining}
+        planned_ids.add(review_id)
+        expected_state = self._canonical_state_locked(conn, page)
+        expected_state["pending_conflict"] = sorted(planned_ids)
+        if expected_state_extra:
+            expected_state.update(expected_state_extra)
+        expected_state_json = canonical_state_json(expected_state)
+        conn.execute(
+            """
+            UPDATE review_items SET expected_state_json=?,updated_at=?
+            WHERE page_id=? AND status='pending'
+              AND issue_type IN ('content_conflict','concurrent_write_conflict')
+            """,
+            (expected_state_json, timestamp, page["page_id"]),
+        )
+        if keep is None:
+            conn.execute(
+                """
+                INSERT INTO review_items(
+                  id,page_path,page_id,issue_type,status,owner,source_ids_json,
+                  created_at,updated_at,base_revision_id,candidate_revision_id,
+                  expected_state_json
+                ) VALUES (?,?,?,'concurrent_write_conflict','pending',?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    review_id,
+                    page["path"],
+                    page["page_id"],
+                    page.get("owner"),
+                    json_dump(candidate.source_ids),
+                    timestamp,
+                    timestamp,
+                    page.get("current_revision_id"),
+                    candidate.id,
+                    expected_state_json,
+                ),
+            )
+        stored = conn.execute(
+            "SELECT * FROM review_items WHERE id=?",
+            (review_id,),
+        ).fetchone()
+        if (
+            stored is None
+            or stored["status"] != "pending"
+            or stored["candidate_revision_id"] != candidate.id
+            or stored["expected_state_json"] != expected_state_json
+        ):
+            raise RevisionConflict(
+                "concurrent review insert changed",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        if event_id is not None:
+            event_updated = conn.execute(
+                """
+                UPDATE vault_change_events
+                SET expected_state_json=?,status='prepared',updated_at=?
+                WHERE id=? AND result_revision_id=?
+                  AND status IN ('pending','prepared')
+                """,
+                (expected_state_json, timestamp, event_id, candidate.id),
+            )
+            if event_updated.rowcount != 1:
+                raise WikiRevisionError("candidate event status CAS failed")
+        return review_id
+
+    def _fail_closed_recovery_locked(
+        self,
+        locked: LockedPage,
+        *,
+        intent_id: str,
+        error_code: str,
+        observed_file_hash: str | None,
+    ) -> tuple[str, ...]:
+        page = locked.page
+        if (
+            page.get("lifecycle_status") == "invalid"
+            and page.get("sync_error") == error_code
+            and page.get("observed_file_hash") == observed_file_hash
+        ):
+            return ()
+        previous_epoch = int(page.get("projection_epoch") or 0)
+        next_epoch = previous_epoch + 1
+        expected_current = page.get("current_revision_id")
+        current_sql = (
+            "current_revision_id IS NULL"
+            if expected_current is None
+            else "current_revision_id=?"
+        )
+        params: list[Any] = [
+            error_code,
+            observed_file_hash,
+            next_epoch,
+            now_iso(),
+            page["page_id"],
+            intent_id,
+        ]
+        if expected_current is not None:
+            params.append(expected_current)
+        params.append(previous_epoch)
+        changed = locked.conn.execute(
+            f"""
+            UPDATE wiki_pages
+            SET lifecycle_status='invalid',deleted_at=NULL,sync_error=?,
+                observed_file_hash=?,projection_epoch=?,
+                rag_visible_revision_id=NULL,rag_visible_epoch=NULL,updated_at=?
+            WHERE page_id=? AND pending_write_intent_id=?
+              AND {current_sql} AND projection_epoch=?
+            """,
+            tuple(params),
+        )
+        if changed.rowcount != 1:
+            raise RevisionConflict(
+                "page changed while failing recovery closed",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        page.update(
+            lifecycle_status="invalid",
+            sync_error=error_code,
+            observed_file_hash=observed_file_hash,
+            projection_epoch=next_epoch,
+            rag_visible_revision_id=None,
+            rag_visible_epoch=None,
+            deleted_at=None,
+        )
+        self._reconcile_pending_reviews_locked(
+            locked.conn,
+            page["page_id"],
+            allow_conflicts=False,
+        )
+        timestamp = now_iso()
+        locked.conn.execute(
+            """
+            UPDATE review_items
+            SET status='superseded',resolved_at=?,updated_at=?
+            WHERE page_id=? AND issue_type='invalid_frontmatter'
+              AND status='pending'
+            """,
+            (timestamp, timestamp, page["page_id"]),
+        )
+        self.outbox.supersede_stale(
+            locked.conn,
+            page["page_id"],
+            next_epoch,
+        )
+        return tuple(
+            self.outbox.enqueue_pair_for_state(
+                locked.conn,
+                {
+                    **page,
+                    "current_revision_id": None,
+                    "projection_epoch": next_epoch,
+                },
+                "delete",
+                {"path": page["path"], "reason": error_code},
+            )
+        )
+
+    def _seed_invalid_recovery_review_locked(
+        self,
+        conn: Any,
+        page: dict[str, Any],
+        *,
+        observation_ids: list[str],
+    ) -> str:
+        review_id = self._stable_recovery_id(
+            "review",
+            "invalid-recovery",
+            page["page_id"],
+            str(page.get("projection_epoch") or 0),
+            *observation_ids,
+        )
+        timestamp = now_iso()
+        pending = conn.execute(
+            """
+            SELECT * FROM review_items
+            WHERE page_id=? AND issue_type='invalid_frontmatter'
+              AND status='pending'
+            ORDER BY created_at,id
+            """,
+            (page["page_id"],),
+        ).fetchall()
+        for row in pending:
+            if row["id"] == review_id:
+                continue
+            conn.execute(
+                """
+                UPDATE review_items
+                SET status='superseded',resolved_at=?,updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (timestamp, timestamp, row["id"]),
+            )
+        expected_state = self._canonical_state_locked(conn, page)
+        expected_state["recovery_observation_ids"] = observation_ids
+        expected_state_json = canonical_state_json(expected_state)
+        conn.execute(
+            """
+            INSERT INTO review_items(
+              id,page_path,page_id,issue_type,status,owner,source_ids_json,
+              created_at,updated_at,base_revision_id,candidate_revision_id,
+              expected_state_json
+            ) VALUES (?,?,?,'invalid_frontmatter','pending',?,?,?,?,?,NULL,?)
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (
+                review_id,
+                page["path"],
+                page["page_id"],
+                page.get("owner"),
+                page["source_ids_json"],
+                timestamp,
+                timestamp,
+                page.get("current_revision_id"),
+                expected_state_json,
+            ),
+        )
+        stored = conn.execute(
+            "SELECT * FROM review_items WHERE id=?",
+            (review_id,),
+        ).fetchone()
+        if (
+            stored is None
+            or stored["status"] != "pending"
+            or stored["base_revision_id"] != page.get("current_revision_id")
+            or stored["candidate_revision_id"] is not None
+            or stored["expected_state_json"] != expected_state_json
+        ):
+            raise RevisionConflict(
+                "invalid recovery review changed",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        return review_id
+
+    def _prepare_recovery_successor_locked(
+        self,
+        locked: LockedPage,
+        *,
+        old_intent: Any,
+        revision: RevisionRecord,
+        expected_file_hash: str | None,
+        write_token: str,
+        executor_owner: str | None,
+    ) -> str:
+        page = locked.page
+        successor_id = self._stable_recovery_id(
+            "wint",
+            str(old_intent["id"]),
+            revision.id,
+            expected_file_hash or "missing",
+        )
+        timestamp = now_iso()
+        locked.conn.execute(
+            """
+            INSERT INTO vault_write_intents(
+              id,page_id,revision_id,expected_revision_id,expected_file_hash,
+              target_path,write_token,status,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,'pending',?,?)
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (
+                successor_id,
+                page["page_id"],
+                revision.id,
+                page.get("current_revision_id"),
+                expected_file_hash,
+                page["path"],
+                write_token,
+                timestamp,
+                timestamp,
+            ),
+        )
+        successor = locked.conn.execute(
+            "SELECT * FROM vault_write_intents WHERE id=?",
+            (successor_id,),
+        ).fetchone()
+        if (
+            successor is None
+            or successor["page_id"] != page["page_id"]
+            or successor["revision_id"] != revision.id
+            or successor["expected_revision_id"] != page.get("current_revision_id")
+            or successor["expected_file_hash"] != expected_file_hash
+            or successor["target_path"] != page["path"]
+            or successor["status"] != "pending"
+        ):
+            raise RevisionConflict(
+                "recovery successor identity changed",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        owner_sql = (
+            " AND executor_owner IS NULL"
+            if executor_owner is None
+            else " AND executor_owner=?"
+        )
+        owner_params: tuple[Any, ...] = (
+            () if executor_owner is None else (executor_owner,)
+        )
+        superseded = locked.conn.execute(
+            f"""
+            UPDATE vault_write_intents
+            SET status='superseded',executor_owner=NULL,lease_expires_at=NULL,
+                last_error=NULL,updated_at=?
+            WHERE id=? AND status='recovery_required'{owner_sql}
+            """,
+            (timestamp, old_intent["id"], *owner_params),
+        )
+        if superseded.rowcount != 1:
+            raise RevisionConflict(
+                "recovery intent changed before successor handoff",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        current_revision_id = page.get("current_revision_id")
+        current_sql = (
+            "current_revision_id IS NULL"
+            if current_revision_id is None
+            else "current_revision_id=?"
+        )
+        handoff_params: list[Any] = [
+            successor_id,
+            timestamp,
+            page["page_id"],
+            old_intent["id"],
+        ]
+        if current_revision_id is not None:
+            handoff_params.append(current_revision_id)
+        handed_off = locked.conn.execute(
+            f"""
+            UPDATE wiki_pages SET pending_write_intent_id=?,updated_at=?
+            WHERE page_id=? AND pending_write_intent_id=?
+              AND {current_sql}
+            """,
+            tuple(handoff_params),
+        )
+        if handed_off.rowcount != 1:
+            raise RevisionConflict(
+                "pending recovery pointer changed before successor handoff",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            )
+        page["pending_write_intent_id"] = successor_id
+        return successor_id
+
+    @staticmethod
+    def _observation_error_locked(
+        conn: Any,
+        observation: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        _, _, error_code, error_message = (
+            WikiRevisionService._validate_observation_content(observation)
+        )
+        conn.execute(
+            """
+            UPDATE wiki_file_observations
+            SET parse_status=?,error_code=?,error_message=?
+            WHERE id=?
+            """,
+            (
+                "invalid" if error_code is not None else "valid",
+                error_code,
+                error_message,
+                observation["id"],
+            ),
+        )
+        return error_code, error_message
+
+    def recover_write_intent(
+        self,
+        intent_id: str,
+        executor_owner: str,
+        *,
+        target_kind: str,
+        target_observation: FileObservationInput | None,
+        backup_kind: str,
+        backup_observation: FileObservationInput | None,
+        staged_kind: str,
+        staged_observation: FileObservationInput | None,
+        claim_kind: str,
+        claim_observation: FileObservationInput | None,
+    ) -> dict[str, Any]:
+        with connect_app(self.settings) as conn:
+            locator = conn.execute(
+                "SELECT page_id FROM vault_write_intents WHERE id=?",
+                (intent_id,),
+            ).fetchone()
+        if locator is None:
+            raise WikiRevisionError(f"write intent not found: {intent_id}")
+        with self.coordinator.lock_page(page_id=locator["page_id"]) as locked:
+            suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+            intent = locked.conn.execute(
+                "SELECT * FROM vault_write_intents WHERE id=?" + suffix,
+                (intent_id,),
+            ).fetchone()
+            if (
+                intent is None
+                or intent["status"] != "recovery_required"
+                or intent["executor_owner"] != executor_owner
+                or locked.page.get("pending_write_intent_id") != intent_id
+            ):
+                raise RevisionConflict(
+                    "recovery intent ownership changed",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+            intended = locked.conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (intent["revision_id"],),
+            ).fetchone()
+            if intended is None:
+                raise WikiRevisionError(
+                    f"write revision not found: {intent['revision_id']}"
+                )
+
+            observations: list[tuple[str, dict[str, Any]]] = []
+            for source, kind, supplied in (
+                ("target", target_kind, target_observation),
+                ("backup", backup_kind, backup_observation),
+                ("staged", staged_kind, staged_observation),
+                ("claim", claim_kind, claim_observation),
+            ):
+                if kind != "unknown":
+                    continue
+                if supplied is None:
+                    raise WikiRevisionError(
+                        f"{source} recovery classification has no observation"
+                    )
+                observations.append(
+                    (
+                        source,
+                        self._persist_observation_locked(
+                            locked.conn,
+                            locked.page,
+                            supplied,
+                        ),
+                    )
+                )
+            if not observations:
+                raise WikiRevisionError("unknown recovery has no observations")
+
+            invalid: list[tuple[dict[str, Any], str, str]] = []
+            for _, observation in observations:
+                error_code, error_message = self._observation_error_locked(
+                    locked.conn,
+                    observation,
+                )
+                if error_code is not None:
+                    invalid.append(
+                        (observation, error_code, error_message or error_code)
+                    )
+            observation_ids = [str(row["id"]) for _, row in observations]
+            hidden_unknown = next(
+                (
+                    (source, observation)
+                    for source, observation in observations
+                    if source in {"staged", "claim"}
+                ),
+                None,
+            )
+            if invalid or hidden_unknown is not None:
+                if invalid:
+                    primary, error_code, error_message = invalid[0]
+                else:
+                    hidden_source, primary = hidden_unknown
+                    error_code = f"recovery_{hidden_source}_unknown"
+                    error_message = (
+                        f"{hidden_source} recovery bytes are not the "
+                        "intended revision"
+                    )
+                    locked.conn.execute(
+                        """
+                        UPDATE wiki_file_observations
+                        SET parse_status='valid',error_code=NULL,error_message=NULL
+                        WHERE id=?
+                        """,
+                        (primary["id"],),
+                    )
+                jobs = self._fail_closed_recovery_locked(
+                    locked,
+                    intent_id=intent_id,
+                    error_code=error_code,
+                    observed_file_hash=primary["file_hash"],
+                )
+                review_id = self._seed_invalid_recovery_review_locked(
+                    locked.conn,
+                    locked.page,
+                    observation_ids=observation_ids,
+                )
+                locked.conn.execute(
+                    """
+                    UPDATE vault_write_intents
+                    SET executor_owner=NULL,lease_expires_at=NULL,last_error=?,updated_at=?
+                    WHERE id=? AND status='recovery_required' AND executor_owner=?
+                    """,
+                    (error_message[:500], now_iso(), intent_id, executor_owner),
+                )
+                if not any(
+                    payload.get("recovery_intent_id") == intent_id
+                    and payload.get("review_id") == review_id
+                    for payload in self._audit_payloads_locked(
+                        locked.conn,
+                        "wiki_recovery_invalid",
+                    )
+                ):
+                    audit(
+                        locked.conn,
+                        "wiki_recovery_invalid",
+                        {
+                            "recovery_intent_id": intent_id,
+                            "observation_ids": observation_ids,
+                            "review_id": review_id,
+                            "error_code": error_code,
+                            "projection_job_ids": list(jobs),
+                        },
+                        now_iso(),
+                    )
+                return {
+                    "intent_status": "recovery_required",
+                    "current_revision_id": locked.page.get("current_revision_id"),
+                    "current_kind": "unchanged",
+                    "successor_intent_id": None,
+                    "observation_ids": observation_ids,
+                }
+
+            expected_state_json = canonical_state_json(
+                self._canonical_state_locked(locked.conn, locked.page)
+            )
+            primary_source, primary = observations[0]
+            secondary_ids = [
+                str(row["id"])
+                for source, row in observations
+                if source != primary_source
+            ]
+            primary_input = {
+                "target": target_observation,
+                "backup": backup_observation,
+            }.get(primary_source)
+            if primary_input is None:
+                raise WikiRevisionError(
+                    "external recovery candidate has no occurrence input"
+                )
+            event_id: str | None = None
+            pending_recovery_reviews = locked.conn.execute(
+                """
+                SELECT * FROM review_items
+                WHERE page_id=? AND issue_type='concurrent_write_conflict'
+                  AND status='pending'
+                ORDER BY created_at,id
+                """,
+                (locked.page["page_id"],),
+            ).fetchall()
+            for pending_review in pending_recovery_reviews:
+                pending_candidate = locked.conn.execute(
+                    "SELECT * FROM wiki_page_revisions WHERE id=?",
+                    (pending_review["candidate_revision_id"],),
+                ).fetchone()
+                if pending_candidate is None:
+                    continue
+                try:
+                    pending_metadata = json.loads(
+                        pending_candidate["metadata_json"] or "{}"
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    pending_metadata.get("recovery_intent_id") == intent_id
+                    and pending_metadata.get("recovery_source") == primary_source
+                    and pending_metadata.get("observation_id") == primary["id"]
+                    and sorted(
+                        pending_metadata.get(
+                            "recovery_secondary_observation_ids"
+                        )
+                        or []
+                    )
+                    == sorted(secondary_ids)
+                ):
+                    candidate_event_id = pending_metadata.get(
+                        "vault_change_event_id"
+                    )
+                    if isinstance(candidate_event_id, str):
+                        event_id = candidate_event_id
+                        break
+            if event_id is None:
+                event_id = self._stable_recovery_id(
+                    "vevt",
+                    intent_id,
+                    primary_source,
+                    primary["file_hash"],
+                    locked.page.get("observed_file_hash") or "none",
+                    str(primary_input.mtime_ns),
+                )
+            metadata_extra: dict[str, Any] = {
+                "recovery_intent_id": intent_id,
+                "recovery_source": primary_source,
+                "recovery_displaced_revision_id": intent["revision_id"],
+            }
+            if secondary_ids:
+                metadata_extra[
+                    "recovery_secondary_observation_ids"
+                ] = secondary_ids
+            candidate = self._create_external_candidate_locked(
+                locked.conn,
+                locked.page,
+                observation=primary,
+                event_id=event_id,
+                expected_state_json=expected_state_json,
+                actor="vault-recovery",
+                metadata_extra=metadata_extra,
+            )
+
+            if len(observations) > 1:
+                jobs = self._fail_closed_recovery_locked(
+                    locked,
+                    intent_id=intent_id,
+                    error_code="ambiguous_recovery",
+                    observed_file_hash=primary["file_hash"],
+                )
+                recovery_state = {
+                    "recovery_intent_id": intent_id,
+                    "recovery_primary_observation_id": primary["id"],
+                    "recovery_secondary_observation_ids": secondary_ids,
+                }
+                review_id = self._seed_concurrent_review_locked(
+                    locked.conn,
+                    locked.page,
+                    candidate=candidate,
+                    event_id=event_id,
+                    expected_state_extra=recovery_state,
+                )
+                released = locked.conn.execute(
+                    """
+                    UPDATE vault_write_intents
+                    SET executor_owner=NULL,lease_expires_at=NULL,
+                        last_error='ambiguous recovery requires resolution',updated_at=?
+                    WHERE id=? AND status='recovery_required' AND executor_owner=?
+                    """,
+                    (now_iso(), intent_id, executor_owner),
+                )
+                if released.rowcount != 1:
+                    raise RevisionConflict(
+                        "ambiguous recovery owner changed",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get("pending_write_intent_id"),
+                    )
+                if not any(
+                    payload.get("recovery_intent_id") == intent_id
+                    and payload.get("review_id") == review_id
+                    for payload in self._audit_payloads_locked(
+                        locked.conn,
+                        "wiki_recovery_ambiguous",
+                    )
+                ):
+                    audit(
+                        locked.conn,
+                        "wiki_recovery_ambiguous",
+                        {
+                            "recovery_intent_id": intent_id,
+                            "page_id": locked.page["page_id"],
+                            "review_id": review_id,
+                            "candidate_revision_id": candidate.id,
+                            "event_id": event_id,
+                            "primary_observation_id": primary["id"],
+                            "secondary_observation_ids": secondary_ids,
+                            "projection_job_ids": list(jobs),
+                        },
+                        now_iso(),
+                    )
+                return {
+                    "intent_status": "recovery_required",
+                    "current_revision_id": locked.page.get("current_revision_id"),
+                    "current_kind": "unchanged",
+                    "successor_intent_id": None,
+                    "observation_ids": observation_ids,
+                }
+
+            candidate_document = parse_wiki_bytes(candidate.content.encode("utf-8"))
+            write_token = candidate_document.frontmatter.get("lgdo_write_token")
+            if not isinstance(write_token, str) or not write_token:
+                raise WikiRevisionError("recovery candidate has no write token")
+            if target_kind == "unknown":
+                physical_target_hash = primary["file_hash"]
+            elif target_kind == "intended":
+                physical_target_hash = intended["file_hash"]
+            elif target_kind == "expected":
+                physical_target_hash = intent["expected_file_hash"]
+            elif target_kind == "missing":
+                physical_target_hash = None
+            else:
+                raise WikiRevisionError(
+                    f"invalid recovery target classification: {target_kind}"
+                )
+            successor_id = self._prepare_recovery_successor_locked(
+                locked,
+                old_intent=intent,
+                revision=candidate,
+                expected_file_hash=physical_target_hash,
+                write_token=write_token,
+                executor_owner=executor_owner,
+            )
+            audit(
+                locked.conn,
+                "wiki_recovery_handoff",
+                {
+                    "recovery_intent_id": intent_id,
+                    "successor_intent_id": successor_id,
+                    "candidate_revision_id": candidate.id,
+                    "observation_ids": observation_ids,
+                    "source": primary_source,
+                },
+                now_iso(),
+            )
+            return {
+                "intent_status": "superseded",
+                "current_revision_id": locked.page.get("current_revision_id"),
+                "current_kind": f"external_{primary_source}",
+                "successor_intent_id": successor_id,
+                "observation_ids": observation_ids,
+            }
+
+    def fail_missing_recovery(
+        self,
+        intent_id: str,
+        executor_owner: str,
+    ) -> dict[str, Any]:
+        with connect_app(self.settings) as conn:
+            locator = conn.execute(
+                "SELECT page_id FROM vault_write_intents WHERE id=?",
+                (intent_id,),
+            ).fetchone()
+        if locator is None:
+            raise WikiRevisionError(f"write intent not found: {intent_id}")
+        with self.coordinator.lock_page(page_id=locator["page_id"]) as locked:
+            suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+            intent = locked.conn.execute(
+                "SELECT * FROM vault_write_intents WHERE id=?" + suffix,
+                (intent_id,),
+            ).fetchone()
+            if (
+                intent is None
+                or intent["status"] != "recovery_required"
+                or intent["executor_owner"] != executor_owner
+                or locked.page.get("pending_write_intent_id") != intent_id
+            ):
+                raise RevisionConflict(
+                    "missing recovery intent changed",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+            jobs = self._fail_closed_recovery_locked(
+                locked,
+                intent_id=intent_id,
+                error_code="recovery_target_and_backup_missing",
+                observed_file_hash=None,
+            )
+            failed = locked.conn.execute(
+                """
+                UPDATE vault_write_intents
+                SET status='failed',executor_owner=NULL,lease_expires_at=NULL,
+                    last_error='target and backup are missing',updated_at=?
+                WHERE id=? AND status='recovery_required' AND executor_owner=?
+                """,
+                (now_iso(), intent_id, executor_owner),
+            )
+            if failed.rowcount != 1:
+                raise WikiRevisionError("missing recovery intent status CAS failed")
+            cleared = locked.conn.execute(
+                """
+                UPDATE wiki_pages SET pending_write_intent_id=NULL,updated_at=?
+                WHERE page_id=? AND pending_write_intent_id=?
+                """,
+                (now_iso(), locked.page["page_id"], intent_id),
+            )
+            if cleared.rowcount != 1:
+                raise WikiRevisionError("missing recovery pointer CAS failed")
+            locked.page["pending_write_intent_id"] = None
+            audit(
+                locked.conn,
+                "wiki_recovery_missing",
+                {
+                    "recovery_intent_id": intent_id,
+                    "page_id": locked.page["page_id"],
+                    "current_revision_id": locked.page.get("current_revision_id"),
+                    "projection_job_ids": list(jobs),
+                },
+                now_iso(),
+            )
+            return {
+                "current_revision_id": locked.page.get("current_revision_id"),
+                "observation_ids": [],
+            }
+
+    def replay_recovery_handoff(self, intent_id: str) -> dict[str, Any]:
+        with connect_app(self.settings) as conn:
+            old_intent = conn.execute(
+                "SELECT * FROM vault_write_intents WHERE id=?",
+                (intent_id,),
+            ).fetchone()
+            if old_intent is None or old_intent["status"] != "superseded":
+                raise RevisionConflict(
+                    "recovery handoff is not replayable",
+                    current_revision_id=None,
+                    pending_intent_id=None,
+                )
+            page = conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (old_intent["page_id"],),
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT intent.*,revision.metadata_json
+                FROM vault_write_intents AS intent
+                JOIN wiki_page_revisions AS revision ON revision.id=intent.revision_id
+                WHERE intent.page_id=? AND intent.id<>?
+                ORDER BY intent.created_at,intent.id
+                """,
+                (old_intent["page_id"], intent_id),
+            ).fetchall()
+            resolution_payload = next(
+                (
+                    payload
+                    for payload in self._audit_payloads_locked(
+                        conn,
+                        "wiki_conflict_resolution_prepared",
+                    )
+                    if payload.get("recovery_intent_id") == intent_id
+                    and isinstance(payload.get("write_intent_id"), str)
+                ),
+                None,
+            )
+        successor = None
+        metadata: dict[str, Any] = {}
+        for row in rows:
+            try:
+                candidate_metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if candidate_metadata.get("recovery_intent_id") == intent_id:
+                successor = row
+                metadata = candidate_metadata
+                break
+        if successor is None and resolution_payload is not None:
+            successor = next(
+                (
+                    row
+                    for row in rows
+                    if row["id"] == resolution_payload["write_intent_id"]
+                ),
+                None,
+            )
+            if successor is not None:
+                metadata = {
+                    "recovery_source": (
+                        "target"
+                        if resolution_payload.get("resolution")
+                        == "accept_candidate"
+                        else None
+                    )
+                }
+        if successor is None:
+            raise WikiRevisionError("superseded recovery has no successor intent")
+        observation_ids = [metadata.get("observation_id")]
+        observation_ids.extend(
+            metadata.get("recovery_secondary_observation_ids") or []
+        )
+        return {
+            "current_revision_id": (
+                page["current_revision_id"] if page is not None else None
+            ),
+            "current_kind": (
+                f"external_{metadata['recovery_source']}"
+                if metadata.get("recovery_source") in {"target", "backup"}
+                else "unchanged"
+            ),
+            "successor_intent_id": successor["id"],
+            "observation_ids": [
+                value for value in observation_ids if isinstance(value, str)
+            ],
+        }
+
+    def reconcile_retained_backup(
+        self,
+        intent_id: str,
+        observation: FileObservationInput,
+    ) -> bool:
+        with connect_app(self.settings) as conn:
+            locator = conn.execute(
+                "SELECT page_id FROM vault_write_intents WHERE id=?",
+                (intent_id,),
+            ).fetchone()
+        if locator is None:
+            raise WikiRevisionError(f"write intent not found: {intent_id}")
+        with self.coordinator.lock_page(page_id=locator["page_id"]) as locked:
+            suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+            intent = locked.conn.execute(
+                "SELECT * FROM vault_write_intents WHERE id=?" + suffix,
+                (intent_id,),
+            ).fetchone()
+            if (
+                intent is None
+                or intent["status"] != "applied"
+                or intent["backup_retention_status"]
+                not in {"retained", "change_detected"}
+            ):
+                return False
+            previous_hash = intent["backup_last_observed_hash"]
+            if previous_hash == observation.file_hash:
+                return False
+
+            observed = self._persist_observation_locked(
+                locked.conn,
+                locked.page,
+                observation,
+            )
+            error_code, error_message = self._observation_error_locked(
+                locked.conn,
+                observed,
+            )
+            candidate: RevisionRecord | None = None
+            event_id: str | None = None
+            review_id: str | None = None
+            if error_code is None:
+                expected_state_json = canonical_state_json(
+                    self._canonical_state_locked(locked.conn, locked.page)
+                )
+                event_id = self._stable_recovery_id(
+                    "vevt",
+                    "retained-backup",
+                    intent_id,
+                    previous_hash or "none",
+                    observation.file_hash,
+                    str(observation.mtime_ns),
+                )
+                candidate = self._create_external_candidate_locked(
+                    locked.conn,
+                    locked.page,
+                    observation=observed,
+                    event_id=event_id,
+                    expected_state_json=expected_state_json,
+                    actor="vault-backup-monitor",
+                    metadata_extra={
+                        "retained_backup_intent_id": intent_id,
+                        "retained_backup_previous_hash": previous_hash,
+                    },
+                )
+                review_id = self._seed_concurrent_review_locked(
+                    locked.conn,
+                    locked.page,
+                    candidate=candidate,
+                    event_id=event_id,
+                )
+            elif self._supersede_retained_backup_review_locked(
+                locked.conn,
+                locked.page,
+                intent_id,
+            ):
+                self._reconcile_pending_reviews_locked(
+                    locked.conn,
+                    locked.page["page_id"],
+                )
+
+            baseline_sql = (
+                "backup_last_observed_hash IS NULL"
+                if previous_hash is None
+                else "backup_last_observed_hash=?"
+            )
+            params: list[Any] = [
+                observation.file_hash,
+                now_iso(),
+                intent_id,
+            ]
+            if previous_hash is not None:
+                params.append(previous_hash)
+            advanced = locked.conn.execute(
+                f"""
+                UPDATE vault_write_intents
+                SET backup_last_observed_hash=?,
+                    backup_retention_status='change_detected',updated_at=?
+                WHERE id=? AND status='applied'
+                  AND backup_retention_status IN ('retained','change_detected')
+                  AND {baseline_sql}
+                """,
+                tuple(params),
+            )
+            if advanced.rowcount != 1:
+                raise RevisionConflict(
+                    "retained backup baseline changed during reconciliation",
+                    current_revision_id=locked.page.get("current_revision_id"),
+                    pending_intent_id=locked.page.get("pending_write_intent_id"),
+                )
+            audit(
+                locked.conn,
+                "wiki_retained_backup_changed",
+                {
+                    "intent_id": intent_id,
+                    "page_id": locked.page["page_id"],
+                    "page_path": locked.page["path"],
+                    "previous_hash": previous_hash,
+                    "backup_hash": observation.file_hash,
+                    "observation_id": observed["id"],
+                    "event_id": event_id,
+                    "candidate_revision_id": (
+                        candidate.id if candidate is not None else None
+                    ),
+                    "review_id": review_id,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                },
+                now_iso(),
+            )
+            return True
+
     def _canonical_state_locked(
         self,
         conn: Any,
@@ -3476,9 +5060,96 @@ class WikiRevisionService:
                 current_revision_id=page.get("current_revision_id"),
                 pending_intent_id=page.get("pending_write_intent_id"),
             )
-        expected_state_json = canonical_state_json(
-            self._canonical_state_locked(conn, page)
-        )
+        try:
+            stored_expected_state = json.loads(
+                review["expected_state_json"] or "{}"
+            )
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RevisionConflict(
+                "conflict review expected state is invalid",
+                current_revision_id=page.get("current_revision_id"),
+                pending_intent_id=page.get("pending_write_intent_id"),
+            ) from exc
+        expected_state = self._canonical_state_locked(conn, page)
+        recovery_keys = {
+            "recovery_intent_id",
+            "recovery_primary_observation_id",
+            "recovery_secondary_observation_ids",
+        }
+        present_recovery_keys = recovery_keys.intersection(stored_expected_state)
+        if present_recovery_keys:
+            if present_recovery_keys != recovery_keys:
+                raise RevisionConflict(
+                    "recovery conflict evidence is incomplete",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            recovery_intent_id = stored_expected_state["recovery_intent_id"]
+            primary_observation_id = stored_expected_state[
+                "recovery_primary_observation_id"
+            ]
+            secondary_observation_ids = stored_expected_state[
+                "recovery_secondary_observation_ids"
+            ]
+            if (
+                not isinstance(recovery_intent_id, str)
+                or not isinstance(primary_observation_id, str)
+                or not isinstance(secondary_observation_ids, list)
+                or not secondary_observation_ids
+                or not all(
+                    isinstance(value, str)
+                    for value in secondary_observation_ids
+                )
+            ):
+                raise RevisionConflict(
+                    "recovery conflict evidence is invalid",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            recovery_intent = conn.execute(
+                "SELECT * FROM vault_write_intents WHERE id=?",
+                (recovery_intent_id,),
+            ).fetchone()
+            if (
+                recovery_intent is None
+                or recovery_intent["page_id"] != page["page_id"]
+                or recovery_intent["status"]
+                not in {"recovery_required", "superseded"}
+            ):
+                raise RevisionConflict(
+                    "recovery intent is no longer valid for resolution",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            expected_state.update(
+                {
+                    key: stored_expected_state[key]
+                    for key in recovery_keys
+                }
+            )
+        displaced_intent_key = "recovery_displaced_intent_id"
+        displaced_lineage = None
+        if displaced_intent_key in stored_expected_state:
+            displaced_intent_id = stored_expected_state[displaced_intent_key]
+            if not isinstance(displaced_intent_id, str) or not displaced_intent_id:
+                raise RevisionConflict(
+                    "recovery-displaced conflict evidence is invalid",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            displaced_lineage = self._recovery_displaced_lineage_locked(
+                conn,
+                page,
+                expected_intent_id=displaced_intent_id,
+            )
+            if displaced_lineage is None:
+                raise RevisionConflict(
+                    "recovery-displaced conflict evidence is stale",
+                    current_revision_id=page.get("current_revision_id"),
+                    pending_intent_id=page.get("pending_write_intent_id"),
+                )
+            expected_state[displaced_intent_key] = displaced_intent_id
+        expected_state_json = canonical_state_json(expected_state)
         if review["expected_state_json"] != expected_state_json:
             raise RevisionConflict(
                 "conflict review expected state changed",
@@ -3503,9 +5174,17 @@ class WikiRevisionService:
                     pending_intent_id=page.get("pending_write_intent_id"),
                 )
         elif review["issue_type"] == "concurrent_write_conflict":
-            if candidate["origin"] not in {"manual", "external"}:
+            recovery_displaced_merge = (
+                candidate["origin"] == "merge"
+                and displaced_lineage is not None
+                and displaced_lineage[0]["id"] == candidate["id"]
+            )
+            if (
+                candidate["origin"] not in {"manual", "external"}
+                and not recovery_displaced_merge
+            ):
                 raise RevisionConflict(
-                    "concurrent conflict candidate must be manual or external",
+                    "concurrent conflict candidate has no resolvable lineage",
                     current_revision_id=page.get("current_revision_id"),
                     pending_intent_id=page.get("pending_write_intent_id"),
                 )
@@ -3692,6 +5371,17 @@ class WikiRevisionService:
                 review,
                 command,
             )
+            try:
+                review_expected_state = json.loads(
+                    review["expected_state_json"] or "{}"
+                )
+            except (TypeError, json.JSONDecodeError):
+                review_expected_state = {}
+            recovery_intent_id = review_expected_state.get(
+                "recovery_intent_id"
+            )
+            if not isinstance(recovery_intent_id, str):
+                recovery_intent_id = None
             prepared = self._resolution_payload_for_command_locked(
                 locked.conn,
                 "wiki_conflict_resolution_prepared",
@@ -3710,6 +5400,103 @@ class WikiRevisionService:
                             "pending_write_intent_id"
                         ),
                     )
+            elif recovery_intent_id is not None:
+                if command.resolution not in {"keep_current", "accept_candidate"}:
+                    raise RevisionConflict(
+                        "ambiguous recovery supports keep_current or accept_candidate",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                recovery_intent = locked.conn.execute(
+                    "SELECT * FROM vault_write_intents WHERE id=?" + suffix,
+                    (recovery_intent_id,),
+                ).fetchone()
+                if (
+                    recovery_intent is None
+                    or recovery_intent["status"] != "recovery_required"
+                    or locked.page.get("pending_write_intent_id")
+                    != recovery_intent_id
+                ):
+                    raise RevisionConflict(
+                        "recovery intent is no longer pending resolution",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                if command.resolution == "accept_candidate":
+                    resolution_revision = RevisionRecord.from_row(candidate)
+                else:
+                    current = locked.conn.execute(
+                        "SELECT * FROM wiki_page_revisions WHERE id=?",
+                        (command.expected_current_revision_id,),
+                    ).fetchone()
+                    if current is None or current["page_id"] != locked.page["page_id"]:
+                        raise RevisionConflict(
+                            "current recovery revision is no longer available",
+                            current_revision_id=locked.page.get(
+                                "current_revision_id"
+                            ),
+                            pending_intent_id=locked.page.get(
+                                "pending_write_intent_id"
+                            ),
+                        )
+                    resolution_revision = RevisionRecord.from_row(current)
+                resolution_document = parse_wiki_bytes(
+                    resolution_revision.content.encode("utf-8")
+                )
+                token = resolution_document.frontmatter.get("lgdo_write_token")
+                if not isinstance(token, str) or not token:
+                    raise WikiRevisionError(
+                        "recovery resolution revision has no managed write token"
+                    )
+                primary_observation = locked.conn.execute(
+                    "SELECT * FROM wiki_file_observations WHERE id=?",
+                    (
+                        review_expected_state[
+                            "recovery_primary_observation_id"
+                        ],
+                    ),
+                ).fetchone()
+                if (
+                    primary_observation is None
+                    or primary_observation["page_id"] != locked.page["page_id"]
+                ):
+                    raise RevisionConflict(
+                        "recovery primary observation is no longer valid",
+                        current_revision_id=locked.page.get("current_revision_id"),
+                        pending_intent_id=recovery_intent_id,
+                    )
+                intent_id = self._prepare_recovery_successor_locked(
+                    locked,
+                    old_intent=recovery_intent,
+                    revision=resolution_revision,
+                    expected_file_hash=primary_observation["file_hash"],
+                    write_token=token,
+                    executor_owner=None,
+                )
+                prepared_payload = {
+                    **command_payload,
+                    "page_id": locked.page["page_id"],
+                    "page_path": locked.page["path"],
+                    "issue_type": review["issue_type"],
+                    "candidate_revision_id": review["candidate_revision_id"],
+                    "resolution_revision_id": resolution_revision.id,
+                    "accepted_generated_revision_id": locked.page.get(
+                        "accepted_generated_revision_id"
+                    ),
+                    "expected_state_json": review["expected_state_json"],
+                    "write_intent_id": intent_id,
+                    "recovery_intent_id": recovery_intent_id,
+                }
+                audit(
+                    locked.conn,
+                    "wiki_conflict_resolution_prepared",
+                    prepared_payload,
+                    now_iso(),
+                )
             elif command.resolution == "keep_current":
                 if locked.page.get("pending_write_intent_id") is not None:
                     raise RevisionConflict(
@@ -3719,6 +5506,10 @@ class WikiRevisionService:
                             "pending_write_intent_id"
                         ),
                     )
+                self._supersede_candidate_event_locked(
+                    locked.conn,
+                    review["candidate_revision_id"],
+                )
                 payload = self._record_resolved_conflict_locked(
                     locked.conn,
                     locked.page,
@@ -3846,6 +5637,285 @@ class WikiRevisionService:
             )
         return self._resolved_mutation_from_payload(resolved, replayed=False)
 
+    def release_retained_backup(
+        self,
+        intent_id: str,
+        expected_backup_hash: str,
+        *,
+        actor: str,
+    ) -> BackupReleaseResult:
+        if not actor.strip():
+            raise RevisionConflict(
+                "backup release requires a nonblank actor",
+                current_revision_id=None,
+            )
+        with connect_app(self.settings) as conn:
+            locator = conn.execute(
+                """
+                SELECT page_id,backup_path,status,backup_retention_status,
+                       backup_last_observed_hash
+                FROM vault_write_intents WHERE id=?
+                """,
+                (intent_id,),
+            ).fetchone()
+        if locator is None:
+            raise RevisionConflict(
+                "backup release intent not found",
+                current_revision_id=None,
+            )
+        backup_path = self.writer.backup_path(intent_id)
+        persisted_path = locator["backup_path"]
+        if (
+            not isinstance(persisted_path, str)
+            or Path(persisted_path).resolve() != backup_path.resolve()
+        ):
+            raise RevisionConflict(
+                "retained backup path is invalid",
+                current_revision_id=None,
+            )
+        if (
+            locator["status"] == "applied"
+            and locator["backup_retention_status"] == "released"
+        ):
+            if backup_path.exists():
+                raise RevisionConflict(
+                    "released backup path reappeared",
+                    current_revision_id=None,
+                )
+            if locator["backup_last_observed_hash"] != expected_backup_hash:
+                raise RevisionConflict(
+                    "released backup hash does not match replay",
+                    current_revision_id=None,
+                )
+            with connect_app(self.settings) as conn:
+                replayed = any(
+                    payload.get("intent_id") == intent_id
+                    and payload.get("backup_hash") == expected_backup_hash
+                    for payload in self._audit_payloads_locked(
+                        conn,
+                        "vault_backup_released",
+                    )
+                )
+            if not replayed:
+                raise WikiRevisionError(
+                    "released backup has no completion audit"
+                )
+            return BackupReleaseResult(
+                intent_id=intent_id,
+                page_id=str(locator["page_id"]),
+                backup_hash=expected_backup_hash,
+            )
+        if not backup_path.exists():
+            raise RevisionConflict(
+                "retained backup path is missing",
+                current_revision_id=None,
+            )
+        initial_hash = self.writer._stream_hash(backup_path)
+        if initial_hash != expected_backup_hash:
+            raise RevisionConflict(
+                "retained backup hash changed before release",
+                current_revision_id=None,
+            )
+
+        snapshot_root = self.writer.pending_root / ".release-snapshots"
+        self.writer._ensure_directory_durable(snapshot_root)
+        snapshot_path = snapshot_root / f"{intent_id}-{uuid.uuid4().hex}.bak"
+        _link_or_copy_file_no_replace(backup_path, snapshot_path)
+        self.writer._fsync_existing_file(snapshot_path)
+        self.writer._fsync_directory(snapshot_root, strict=True)
+        if self.writer._stream_hash(snapshot_path) != expected_backup_hash:
+            raise RevisionConflict(
+                "retained backup changed while creating release snapshot",
+                current_revision_id=None,
+            )
+
+        tombstone_path = backup_path.with_name(
+            f"{backup_path.name}.release-{uuid.uuid4().hex}"
+        )
+        claimed = False
+        unlinked = False
+        canonical_preserved = True
+        canonical_was_displaced = False
+        release_confirmed = False
+        try:
+            with self.coordinator.lock_page(page_id=locator["page_id"]) as locked:
+                suffix = (
+                    " FOR UPDATE"
+                    if self.settings.database_backend == "postgres"
+                    else ""
+                )
+                intent = locked.conn.execute(
+                    "SELECT * FROM vault_write_intents WHERE id=?" + suffix,
+                    (intent_id,),
+                ).fetchone()
+                if (
+                    intent is None
+                    or intent["page_id"] != locked.page["page_id"]
+                    or intent["status"] != "applied"
+                    or intent["backup_retention_status"]
+                    not in {"retained", "change_detected"}
+                    or intent["backup_last_observed_hash"]
+                    != expected_backup_hash
+                    or not isinstance(intent["backup_path"], str)
+                    or Path(intent["backup_path"]).resolve()
+                    != backup_path.resolve()
+                ):
+                    raise RevisionConflict(
+                        "retained backup release precondition changed",
+                        current_revision_id=locked.page.get(
+                            "current_revision_id"
+                        ),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                canonical_was_displaced = True
+                backup_path.replace(tombstone_path)
+                claimed = True
+                canonical_preserved = False
+                release_hash = self.writer._stream_hash(tombstone_path)
+                if release_hash != expected_backup_hash:
+                    raise RevisionConflict(
+                        "retained backup hash changed during release",
+                        current_revision_id=locked.page.get(
+                            "current_revision_id"
+                        ),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                if backup_path.exists():
+                    raise RevisionConflict(
+                        "retained backup path was replaced during release",
+                        current_revision_id=locked.page.get(
+                            "current_revision_id"
+                        ),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                current = locked.conn.execute(
+                    "SELECT * FROM wiki_page_revisions WHERE id=?",
+                    (locked.page.get("current_revision_id"),),
+                ).fetchone()
+                observations = locked.conn.execute(
+                    """
+                    SELECT id FROM wiki_file_observations
+                    WHERE page_id=? AND file_hash=? ORDER BY id
+                    """,
+                    (locked.page["page_id"], expected_backup_hash),
+                ).fetchall()
+                tombstone_path.unlink()
+                unlinked = True
+                claimed = False
+                self.writer._fsync_directory(backup_path.parent, strict=True)
+                released = locked.conn.execute(
+                    """
+                    UPDATE vault_write_intents
+                    SET backup_retention_status='released',updated_at=?
+                    WHERE id=? AND status='applied'
+                      AND backup_retention_status IN ('retained','change_detected')
+                      AND backup_last_observed_hash=?
+                    """,
+                    (now_iso(), intent_id, expected_backup_hash),
+                )
+                if released.rowcount != 1:
+                    raise RevisionConflict(
+                        "retained backup release CAS failed",
+                        current_revision_id=locked.page.get(
+                            "current_revision_id"
+                        ),
+                        pending_intent_id=locked.page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+                audit(
+                    locked.conn,
+                    "vault_backup_released",
+                    {
+                        "actor": actor.strip(),
+                        "intent_id": intent_id,
+                        "page_id": locked.page["page_id"],
+                        "page_path": locked.page["path"],
+                        "current_revision_id": locked.page.get(
+                            "current_revision_id"
+                        ),
+                        "current_file_hash": (
+                            current["file_hash"]
+                            if current is not None
+                            else locked.page.get("file_hash")
+                        ),
+                        "backup_hash": expected_backup_hash,
+                        "backup_path": str(backup_path),
+                        "observation_ids": [
+                            str(row["id"]) for row in observations
+                        ],
+                    },
+                    now_iso(),
+                )
+            release_confirmed = True
+        except Exception as release_error:
+            restore_error: Exception | None = None
+            if not backup_path.exists():
+                self.writer._ensure_directory_durable(backup_path.parent)
+                restore_source: Path | None = None
+                if claimed and tombstone_path.exists():
+                    restore_source = tombstone_path
+                elif (claimed or unlinked) and snapshot_path.exists():
+                    restore_source = snapshot_path
+                if restore_source is not None:
+                    try:
+                        _link_or_copy_file_no_replace(
+                            restore_source,
+                            backup_path,
+                        )
+                        self.writer._fsync_existing_file(backup_path)
+                        self.writer._fsync_directory(
+                            backup_path.parent,
+                            strict=True,
+                        )
+                    except Exception as exc:
+                        restore_error = exc
+                    else:
+                        claimed = False
+                        canonical_preserved = True
+                elif claimed or unlinked:
+                    restore_error = FileNotFoundError(
+                        "retained backup restore source is missing"
+                    )
+            elif not canonical_preserved:
+                restore_error = FileExistsError(
+                    "retained backup canonical path reappeared during restore"
+                )
+            if restore_error is not None:
+                preserved_paths = [
+                    path
+                    for path in (backup_path, tombstone_path, snapshot_path)
+                    if path.exists()
+                ]
+                raise OSError(
+                    "retained backup release failed "
+                    f"({release_error}); restore failed; recovery artifact "
+                    "preserved at "
+                    + ", ".join(str(path) for path in preserved_paths)
+                ) from restore_error
+            raise
+        finally:
+            if release_confirmed or (
+                canonical_preserved and not canonical_was_displaced
+            ):
+                if tombstone_path.exists():
+                    try:
+                        tombstone_path.unlink()
+                    except OSError:
+                        pass
+                snapshot_path.unlink(missing_ok=True)
+        return BackupReleaseResult(
+            intent_id=intent_id,
+            page_id=str(locator["page_id"]),
+            backup_hash=expected_backup_hash,
+        )
+
     def _prepared_resolution_for_intent_locked(
         self,
         conn: Any,
@@ -3886,7 +5956,12 @@ class WikiRevisionService:
             or payload["resolution_revision_id"] != revision["id"]
             or payload["expected_current_revision_id"]
             != intent["expected_revision_id"]
-            or payload["resolution"] not in {"accept_candidate", "merged_content"}
+            or payload["resolution"]
+            not in {"keep_current", "accept_candidate", "merged_content"}
+            or (
+                payload["resolution"] == "keep_current"
+                and not isinstance(payload.get("recovery_intent_id"), str)
+            )
         ):
             raise RevisionConflict(
                 "prepared conflict resolution no longer matches its intent",
@@ -4035,15 +6110,27 @@ class WikiRevisionService:
             applied = locked.conn.execute(
                 """
                 UPDATE vault_write_intents
-                SET status='applied',backup_retention_status='retained',executor_owner=NULL,
-                    lease_expires_at=NULL,updated_at=?
+                SET status='applied',backup_last_observed_hash=captured_file_hash,
+                    backup_retention_status=CASE
+                      WHEN captured_file_hash IS NULL THEN 'none'
+                      ELSE 'retained'
+                    END,
+                    executor_owner=NULL,lease_expires_at=NULL,updated_at=?
                 WHERE id=? AND status='installed' AND executor_owner=?
                 """,
                 (now_iso(), intent_id, executor_owner),
             )
             if applied.rowcount != 1:
                 raise WikiRevisionError("intent owner/status CAS failed during finalize")
-            if revision["origin"] == "external":
+            apply_external_event = revision["origin"] == "external" and not (
+                resolution_payload is not None
+                and resolution_payload.get("resolution") == "keep_current"
+                and isinstance(
+                    resolution_payload.get("recovery_intent_id"),
+                    str,
+                )
+            )
+            if apply_external_event:
                 external_event_id = metadata.get("vault_change_event_id")
                 if not isinstance(external_event_id, str) or not external_event_id:
                     raise WikiRevisionError(
@@ -4089,7 +6176,29 @@ class WikiRevisionService:
                     "observed_file_hash": observed_file_hash,
                 }
             )
+            displaced_candidate = None
+            displaced_expected_state_extra = None
+            displaced_lineage = self._recovery_displaced_lineage_locked(
+                locked.conn,
+                locked.page,
+            )
+            if (
+                displaced_lineage is not None
+                and displaced_lineage[0]["origin"]
+                in {"manual", "external", "merge"}
+            ):
+                displaced_candidate = RevisionRecord.from_row(
+                    displaced_lineage[0]
+                )
+                displaced_expected_state_extra = {
+                    "recovery_displaced_intent_id": displaced_lineage[1]
+                }
             if resolution_payload is not None and resolution_review is not None:
+                if revision["id"] != resolution_review["candidate_revision_id"]:
+                    self._supersede_candidate_event_locked(
+                        locked.conn,
+                        resolution_review["candidate_revision_id"],
+                    )
                 self._record_resolved_conflict_locked(
                     locked.conn,
                     locked.page,
@@ -4099,7 +6208,23 @@ class WikiRevisionService:
                     write_intent_id=intent_id,
                     projection_job_ids=tuple(jobs),
                 )
+                if displaced_candidate is not None:
+                    self._seed_concurrent_review_locked(
+                        locked.conn,
+                        locked.page,
+                        candidate=displaced_candidate,
+                        event_id=None,
+                        expected_state_extra=displaced_expected_state_extra,
+                    )
             else:
+                if displaced_candidate is not None:
+                    self._seed_concurrent_review_locked(
+                        locked.conn,
+                        locked.page,
+                        candidate=displaced_candidate,
+                        event_id=None,
+                        expected_state_extra=displaced_expected_state_extra,
+                    )
                 self._reconcile_pending_reviews_locked(
                     locked.conn,
                     intent["page_id"],
@@ -4198,32 +6323,102 @@ class WikiRevisionService:
                 "SELECT * FROM wiki_page_revisions WHERE id=?",
                 (review["candidate_revision_id"],),
             ).fetchone()
+            expected_state_extra = None
+            has_displaced_marker = False
+            if candidate is not None:
+                try:
+                    review_expected_state = json.loads(
+                        review["expected_state_json"] or "{}"
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    review_expected_state = {}
+                if not isinstance(review_expected_state, dict):
+                    review_expected_state = {}
+                displaced_intent_key = "recovery_displaced_intent_id"
+                has_displaced_marker = (
+                    displaced_intent_key in review_expected_state
+                )
+                displaced_intent_id = review_expected_state.get(
+                    displaced_intent_key
+                )
+                displaced_lineage = None
+                if isinstance(displaced_intent_id, str) and displaced_intent_id:
+                    displaced_lineage = (
+                        self._recovery_displaced_lineage_locked(
+                            conn,
+                            page,
+                            expected_intent_id=displaced_intent_id,
+                        )
+                    )
+                if (
+                    displaced_lineage is not None
+                    and displaced_lineage[0]["id"] == candidate["id"]
+                    and candidate["origin"]
+                    in {"manual", "external", "merge"}
+                ):
+                    expected_state_extra = {
+                        "recovery_displaced_intent_id": displaced_intent_id
+                    }
+            candidate_origin_allowed = (
+                expected_state_extra is not None
+                if has_displaced_marker
+                else candidate is not None
+                and candidate["origin"] in {"manual", "external"}
+            )
             if (
                 candidate is not None
                 and candidate["page_id"] == page_id
-                and candidate["origin"] in {"manual", "external"}
+                and candidate_origin_allowed
                 and review["base_revision_id"] == page["current_revision_id"]
                 and review["candidate_revision_id"]
                 != page["current_revision_id"]
             ):
+                candidate_event_id = self._candidate_event_id(candidate)
+                if candidate_event_id is not None:
+                    candidate_event = conn.execute(
+                        "SELECT * FROM vault_change_events WHERE id=?",
+                        (candidate_event_id,),
+                    ).fetchone()
+                    if (
+                        candidate_event is None
+                        or candidate_event["status"]
+                        not in {"pending", "prepared"}
+                        or candidate_event["result_revision_id"]
+                        != candidate["id"]
+                    ):
+                        candidate_event_id = None
                 desired["concurrent_write_conflict"] = {
                     "base_revision_id": page["current_revision_id"],
                     "candidate_revision_id": review["candidate_revision_id"],
                     "owner": review["owner"] or page["owner"],
                     "source_ids_json": candidate["source_ids_json"],
+                    "expected_state_extra": expected_state_extra,
+                    "event_id": candidate_event_id,
                 }
                 break
 
         matching: dict[str, Any] = {}
         for issue_type, spec in desired.items():
-            candidates = [
-                review
-                for review in pending
-                if review["issue_type"] == issue_type
-                and review["base_revision_id"] == spec["base_revision_id"]
-                and review["candidate_revision_id"]
-                == spec["candidate_revision_id"]
-            ]
+            candidates = []
+            for review in pending:
+                try:
+                    review_expected_state = json.loads(
+                        review["expected_state_json"] or "{}"
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    not isinstance(review_expected_state, dict)
+                    or review_expected_state.get("path") != page["path"]
+                    or review["issue_type"] != issue_type
+                    or review["page_path"] != page["path"]
+                    or review["base_revision_id"]
+                    != spec["base_revision_id"]
+                    or review["candidate_revision_id"]
+                    != spec["candidate_revision_id"]
+                ):
+                    continue
+                candidates.append(review)
             if len(candidates) == 1:
                 matching[issue_type] = candidates[0]
 
@@ -4237,6 +6432,9 @@ class WikiRevisionService:
         }
         expected_state = self._canonical_state_locked(conn, page)
         expected_state["pending_conflict"] = sorted(planned_ids.values())
+        for spec in desired.values():
+            if spec.get("expected_state_extra"):
+                expected_state.update(spec["expected_state_extra"])
         expected_state_json = canonical_state_json(expected_state)
         stable = (
             len(pending) == len(desired)
@@ -4251,7 +6449,14 @@ class WikiRevisionService:
             return str(content["id"]) if content is not None else None
 
         timestamp = now_iso()
+        matching_ids = {
+            str(review["id"])
+            for review in matching.values()
+        }
+        desired_concurrent = desired.get("concurrent_write_conflict")
         for review in pending:
+            if str(review["id"]) in matching_ids:
+                continue
             superseded = conn.execute(
                 """
                 UPDATE review_items
@@ -4266,40 +6471,99 @@ class WikiRevisionService:
                     current_revision_id=page.get("current_revision_id"),
                     pending_intent_id=page.get("pending_write_intent_id"),
                 )
+            if (
+                review["issue_type"] == "concurrent_write_conflict"
+                and (
+                    desired_concurrent is None
+                    or review["candidate_revision_id"]
+                    != desired_concurrent["candidate_revision_id"]
+                )
+            ):
+                self._supersede_candidate_event_locked(
+                    conn,
+                    review["candidate_revision_id"],
+                )
 
         if not desired:
             return None
-        final_ids = {
-            issue_type: f"review_{uuid.uuid4().hex}"
-            for issue_type in desired
-        }
+        final_ids = planned_ids
         expected_state = self._canonical_state_locked(conn, page)
         expected_state["pending_conflict"] = sorted(final_ids.values())
+        for spec in desired.values():
+            if spec.get("expected_state_extra"):
+                expected_state.update(spec["expected_state_extra"])
         expected_state_json = canonical_state_json(expected_state)
         for issue_type in ("content_conflict", "concurrent_write_conflict"):
             spec = desired.get(issue_type)
             if spec is None:
                 continue
-            conn.execute(
+            if issue_type in matching:
+                updated = conn.execute(
+                    """
+                    UPDATE review_items
+                    SET expected_state_json=?,updated_at=?
+                    WHERE id=? AND status='pending'
+                      AND base_revision_id=? AND candidate_revision_id=?
+                    """,
+                    (
+                        expected_state_json,
+                        timestamp,
+                        final_ids[issue_type],
+                        spec["base_revision_id"],
+                        spec["candidate_revision_id"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RevisionConflict(
+                        "matching conflict changed during reconciliation",
+                        current_revision_id=page.get("current_revision_id"),
+                        pending_intent_id=page.get(
+                            "pending_write_intent_id"
+                        ),
+                    )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO review_items(
+                      id,page_path,page_id,issue_type,status,owner,source_ids_json,
+                      created_at,updated_at,base_revision_id,candidate_revision_id,
+                      expected_state_json
+                    ) VALUES (?,?,?,?,'pending',?,?,?,?,?,?,?)
+                    """,
+                    (
+                        final_ids[issue_type],
+                        page["path"],
+                        page_id,
+                        issue_type,
+                        spec["owner"],
+                        spec["source_ids_json"],
+                        timestamp,
+                        timestamp,
+                        spec["base_revision_id"],
+                        spec["candidate_revision_id"],
+                        expected_state_json,
+                    ),
+                )
+        if (
+            desired_concurrent is not None
+            and desired_concurrent.get("event_id") is not None
+        ):
+            event_updated = conn.execute(
                 """
-                INSERT INTO review_items(
-                  id,page_path,page_id,issue_type,status,owner,source_ids_json,
-                  created_at,updated_at,base_revision_id,candidate_revision_id,
-                  expected_state_json
-                ) VALUES (?,?,?,?,'pending',?,?,?,?,?,?,?)
+                UPDATE vault_change_events
+                SET expected_state_json=?,status='prepared',updated_at=?
+                WHERE id=? AND result_revision_id=?
+                  AND status IN ('pending','prepared')
                 """,
                 (
-                    final_ids[issue_type],
-                    page["path"],
-                    page_id,
-                    issue_type,
-                    spec["owner"],
-                    spec["source_ids_json"],
-                    timestamp,
-                    timestamp,
-                    spec["base_revision_id"],
-                    spec["candidate_revision_id"],
                     expected_state_json,
+                    timestamp,
+                    desired_concurrent["event_id"],
+                    desired_concurrent["candidate_revision_id"],
                 ),
             )
+            if event_updated.rowcount != 1:
+                raise WikiRevisionError(
+                    "desired candidate event changed during reconciliation"
+                )
         return final_ids.get("content_conflict")
