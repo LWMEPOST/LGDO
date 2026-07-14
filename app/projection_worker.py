@@ -9,13 +9,14 @@ from datetime import datetime, timezone
 from typing import Literal, TypeVar
 
 from app.config import Settings
-from app.db import connect_app
+from app.db import connect_app, connect_app_write
 from app.gbrain_projection import (
     GBrainBatchRepository,
     GBrainProjectionClient,
     ProjectionLeaseLost as GBrainProjectionLeaseLost,
 )
 from app.projection_jobs import TERMINAL_STATUSES, ProjectionJob, ProjectionOutbox
+from app.timeutil import now_iso
 from app.wiki_rag_projection import (
     ProjectionLeaseLost as RagProjectionLeaseLost,
     ProjectionSuperseded,
@@ -66,12 +67,79 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def projection_worker_status(
+class ProjectionJobNotFound(LookupError):
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        super().__init__(f"projection job not found: {job_id}")
+
+
+class ProjectionJobStateConflict(RuntimeError):
+    def __init__(self, job_id: str, status: str):
+        self.job_id = job_id
+        self.status = status
+        super().__init__(
+            f"projection job {job_id} cannot be retried from status {status}"
+        )
+
+
+def list_projection_jobs(
     settings: Settings,
-    worker_id: str,
-    running: bool,
-) -> ProjectionWorkerStatus:
-    counts = {
+    *,
+    target: str | None = None,
+    status: str | None = None,
+    page_id: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if target is not None:
+        clauses.append("target = ?")
+        params.append(target)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if page_id is not None:
+        clauses.append("page_id = ?")
+        params.append(page_id)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(max(1, min(limit, 100)))
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM knowledge_projection_jobs{where}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def retry_projection_job(settings: Settings, job_id: str) -> dict:
+    timestamp = now_iso()
+    with connect_app_write(settings) as conn:
+        updated = conn.execute(
+            """
+            UPDATE knowledge_projection_jobs
+            SET status='pending', attempts=0, available_at=?, last_error=NULL,
+                lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+            WHERE id=? AND status='failed'
+            """,
+            (timestamp, timestamp, job_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM knowledge_projection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise ProjectionJobNotFound(job_id)
+        if updated.rowcount != 1:
+            raise ProjectionJobStateConflict(job_id, str(row["status"]))
+        return dict(row)
+
+
+def projection_health(settings: Settings) -> dict[str, dict[str, int | bool]]:
+    counts: dict[str, dict[str, int | bool]] = {
         target: {status: 0 for status in ("pending", "running", "failed")}
         for target in ("rag", "gbrain")
     }
@@ -96,16 +164,24 @@ def projection_worker_status(
         and settings.gbrain_projection_api_key
         and settings.gbrain_managed_source_id
     )
-    gbrain: dict[str, int | bool] = {
-        **counts["gbrain"],
-        "configured": configured,
-        "degraded": bool(counts["gbrain"]["failed"] or not configured),
-    }
+    counts["gbrain"]["configured"] = configured
+    counts["gbrain"]["degraded"] = bool(
+        counts["gbrain"]["failed"] or not configured
+    )
+    return counts
+
+
+def projection_worker_status(
+    settings: Settings,
+    worker_id: str,
+    running: bool,
+) -> ProjectionWorkerStatus:
+    counts = projection_health(settings)
     return ProjectionWorkerStatus(
         worker_id=worker_id,
         running=running,
-        rag=counts["rag"],
-        gbrain=gbrain,
+        rag={key: int(value) for key, value in counts["rag"].items()},
+        gbrain=counts["gbrain"],
     )
 
 

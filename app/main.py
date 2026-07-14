@@ -8,7 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from app.api import router
 from app.config import get_settings
 from app.db import init_app_db
-from app.projection_worker import ProjectionWorker
+from app.gbrain import _gbrain_circuit_is_open
+from app.projection_worker import ProjectionWorker, projection_health
 from app.vault import ensure_vault
 
 
@@ -32,8 +33,26 @@ app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "app": settings.app_name}
+def health() -> dict:
+    projections = projection_health(settings)
+    circuit_open = _gbrain_circuit_is_open(settings)
+    query_available = bool(
+        settings.gbrain_enabled
+        and settings.gbrain_endpoint
+        and not circuit_open
+    )
+    return {
+        "status": "ok",
+        "app": settings.app_name,
+        "gbrain": {
+            "query": {
+                "available": query_available,
+                "circuit_open": circuit_open,
+            },
+            "projection": projections["gbrain"],
+        },
+        "rag": {"projection": projections["rag"]},
+    }
 
 
 app.include_router(router, prefix="/api/internal", tags=["internal"])

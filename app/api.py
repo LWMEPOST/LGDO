@@ -69,6 +69,12 @@ from app.models import (
     WikiRevisionListResponse,
     WikiStatusUpdateRequest,
 )
+from app.projection_worker import (
+    ProjectionJobNotFound,
+    ProjectionJobStateConflict,
+    list_projection_jobs,
+    retry_projection_job,
+)
 from app.search import ask, stream_ask_events
 from app.vault import slugify
 from app.wiki import compile_wiki
@@ -244,6 +250,40 @@ def rag_status_endpoint(user: UserContext = Depends(current_user)) -> dict:
         return rag_status(get_settings())
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/projection-jobs")
+def list_projection_jobs_endpoint(
+    target: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    page_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1),
+    user: UserContext = Depends(current_user),
+) -> list[dict]:
+    return list_projection_jobs(
+        get_settings(),
+        target=target,
+        status=status,
+        page_id=page_id,
+        limit=limit,
+    )
+
+
+@router.post("/projection-jobs/{job_id}/retry")
+def retry_projection_job_endpoint(
+    job_id: str,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_editor(user)
+    try:
+        return retry_projection_job(get_settings(), job_id)
+    except ProjectionJobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectionJobStateConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "projection_job_state_conflict", "status": exc.status},
+        ) from exc
 
 
 @router.post("/rag/sync-postgres")

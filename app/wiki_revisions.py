@@ -6353,6 +6353,11 @@ class WikiRevisionService:
                     current_revision_id=locked.page["current_revision_id"],
                     pending_intent_id=intent_id,
                 )
+            include_gbrain = (
+                prepared_transition_payload is None
+                or prepared_transition_payload.get("transition_kind") != "compile"
+                or self.settings.gbrain_import_on_compile
+            )
             jobs = self.outbox.enqueue_pair_for_state(
                 locked.conn,
                 {
@@ -6362,6 +6367,7 @@ class WikiRevisionService:
                 },
                 "upsert",
                 {"path": locked.page["path"]},
+                include_gbrain=include_gbrain,
             )
             applied = locked.conn.execute(
                 """

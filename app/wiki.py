@@ -108,6 +108,8 @@ def compile_wiki(settings: Settings, request: CompileRequest) -> CompileResponse
     updated_pages = 0
     conflicted_pages = 0
     projection_jobs = 0
+    projection_job_ids: list[str] = []
+    seen_projection_job_ids: set[str] = set()
 
     with connect_app(settings) as conn:
         params: list[object] = [request.domain]
@@ -174,6 +176,10 @@ def compile_wiki(settings: Settings, request: CompileRequest) -> CompileResponse
             created_pages += 1
         else:
             updated_pages += 1
+        for projection_job_id in transition.projection_job_ids:
+            if projection_job_id not in seen_projection_job_ids:
+                seen_projection_job_ids.add(projection_job_id)
+                projection_job_ids.append(projection_job_id)
         if not transition.replayed:
             projection_jobs += len(transition.projection_job_ids)
 
@@ -195,6 +201,7 @@ def compile_wiki(settings: Settings, request: CompileRequest) -> CompileResponse
         review_items=review_items,
         conflicted_pages=conflicted_pages,
         projection_jobs=projection_jobs,
+        projection_job_ids=projection_job_ids,
     )
 
 

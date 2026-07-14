@@ -116,8 +116,11 @@ class ProjectionOutbox:
         page: Mapping[str, Any],
         operation: str,
         payload: dict[str, Any],
+        *,
+        include_gbrain: bool = True,
     ) -> list[str]:
         values = dict(page)
+        targets = ("rag", "gbrain") if include_gbrain else ("rag",)
         return [
             self.enqueue(
                 conn,
@@ -128,7 +131,7 @@ class ProjectionOutbox:
                 projection_epoch=int(values.get("projection_epoch") or 0),
                 payload=payload,
             )
-            for target in ("rag", "gbrain")
+            for target in targets
         ]
 
     def claim(

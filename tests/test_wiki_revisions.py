@@ -2563,17 +2563,18 @@ def test_compile_replay_fails_closed_while_matching_intent_cannot_be_claimed(
             """
         ).fetchone()
         completed_jobs = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_projection_jobs"
-        ).fetchone()[0]
+            "SELECT id,target FROM knowledge_projection_jobs ORDER BY target"
+        ).fetchall()
 
     assert replay.created_pages == 0
     assert replay.updated_pages == 0
     assert replay.conflicted_pages == 0
     assert replay.projection_jobs == 0
+    assert replay.projection_job_ids == [completed_jobs[0]["id"]]
     assert completed_source["last_compiled_at"] is not None
     assert completed_page["current_revision_id"] == completed_page["generated_revision_id"]
     assert completed_page["pending_write_intent_id"] is None
-    assert completed_jobs == 2
+    assert [row["target"] for row in completed_jobs] == ["rag"]
 
 
 @dataclass(frozen=True)
