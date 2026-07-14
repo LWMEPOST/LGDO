@@ -31,3 +31,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+markers = [
+  "gbrain_e2e: opt-in acceptance tests against a temporary live GBrain PGLite HTTP server",
+]
