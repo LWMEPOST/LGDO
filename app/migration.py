@@ -40,15 +40,21 @@ def migrate_sqlite_to_postgres(settings: Settings, sqlite_path: Path | None = No
 
 def _upsert_row(cur: Any, table: str, row: dict[str, Any]) -> None:
     primary_key = TABLE_PRIMARY_KEYS[table]
+    primary_keys = (primary_key,) if isinstance(primary_key, str) else primary_key
     columns = list(row.keys())
     placeholders = ", ".join(["%s"] * len(columns))
     quoted_columns = ", ".join(_quote_identifier(column) for column in columns)
     updates = ", ".join(
         f"{_quote_identifier(column)} = EXCLUDED.{_quote_identifier(column)}"
         for column in columns
-        if column != primary_key
+        if column not in primary_keys
     )
-    conflict = f"ON CONFLICT ({_quote_identifier(primary_key)}) DO UPDATE SET {updates}" if updates else "ON CONFLICT DO NOTHING"
+    conflict_target = ", ".join(_quote_identifier(column) for column in primary_keys)
+    conflict = (
+        f"ON CONFLICT ({conflict_target}) DO UPDATE SET {updates}"
+        if updates
+        else "ON CONFLICT DO NOTHING"
+    )
     cur.execute(
         f"""
         INSERT INTO {_quote_identifier(table)} ({quoted_columns})
@@ -291,5 +297,91 @@ _KNOWN_COLUMNS.update(
             "created_at",
             "updated_at",
         },
+        "wiki_chunks": {
+            "id",
+            "page_id",
+            "revision_id",
+            "projection_epoch",
+            "chunk_index",
+            "page_path",
+            "domain",
+            "title",
+            "text",
+            "token_json",
+            "embedding_json",
+            "embedding_model",
+            "source_ids_json",
+            "created_at",
+            "updated_at",
+        },
+        "gbrain_page_projections": {
+            "id",
+            "page_id",
+            "revision_id",
+            "projection_epoch",
+            "page_path",
+            "file_hash",
+            "semantic_hash",
+            "gbrain_source_id",
+            "slug",
+            "source_path",
+            "gbrain_content_hash",
+            "gbrain_page_generation",
+            "status",
+            "imported_at",
+            "invalidated_at",
+            "last_job_id",
+        },
+        "gbrain_projection_batches": {
+            "id",
+            "mode",
+            "status",
+            "batch_watermark_json",
+            "included_snapshot_json",
+            "lease_owner",
+            "lease_expires_at",
+            "result_json",
+            "last_error",
+            "started_at",
+            "finished_at",
+            "created_at",
+            "updated_at",
+        },
+        "gbrain_projection_batch_jobs": {
+            "batch_id",
+            "job_id",
+            "page_id",
+            "revision_id",
+            "projection_epoch",
+            "operation",
+        },
+        "gbrain_projection_segments": {
+            "id",
+            "batch_id",
+            "segment_index",
+            "mode",
+            "idempotency_key",
+            "expected_pages_json",
+            "protected_mappings_json",
+            "status",
+            "lease_owner",
+            "lease_expires_at",
+            "result_json",
+            "last_error",
+            "started_at",
+            "finished_at",
+        },
+        "gbrain_projection_protections": {
+            "id",
+            "gbrain_source_id",
+            "page_id",
+            "slug",
+            "source_path",
+            "reason",
+            "active",
+            "created_at",
+            "resolved_at",
+        },
+        "projection_state": {"key", "value", "updated_at"},
     }
 )

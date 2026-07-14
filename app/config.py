@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     gbrain_enabled: bool = False
     gbrain_endpoint: str | None = None
     gbrain_api_key: str | None = None
+    gbrain_query_api_key: str | None = None
+    gbrain_projection_api_key: str | None = None
+    gbrain_managed_source_id: str | None = None
+    gbrain_import_allowed_root: Path | None = None
     gbrain_home: Path = Path("data/gbrain")
     gbrain_repo_path: Path = Path("gbrain")
     gbrain_command: str = "bun"
@@ -52,8 +56,14 @@ class Settings(BaseSettings):
     gbrain_circuit_failure_threshold: int = 3
     gbrain_circuit_cooldown_seconds: int = 30
     gbrain_import_timeout_seconds: int = 600
+    gbrain_incremental_timeout_seconds: int = 120
+    gbrain_reconcile_timeout_seconds: int = 600
     gbrain_import_on_compile: bool = False
     gbrain_import_no_embed: bool = False
+    projection_worker_enabled: bool = True
+    projection_poll_seconds: float = 1.0
+    projection_lease_seconds: int = 180
+    projection_claim_limit: int = 500
     oidc_enabled: bool = False
     oidc_issuer: str | None = None
     oidc_jwks_url: str | None = None
@@ -71,6 +81,10 @@ class Settings(BaseSettings):
     auth_session_ttl_hours: int = 12
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    @property
+    def gbrain_query_token(self) -> str | None:
+        return self.gbrain_query_api_key or self.gbrain_api_key
 
     @property
     def postgres_dsn(self) -> str:

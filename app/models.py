@@ -70,6 +70,8 @@ class CompileResponse(BaseModel):
     review_items: int
     conflicted_pages: int = 0
     projection_jobs: int = 0
+    projection_job_ids: list[str] = Field(default_factory=list)
+    projection_status: Literal["queued"] = "queued"
 
 
 class AskRequest(BaseModel):
@@ -96,6 +98,23 @@ class Citation(BaseModel):
     source_id: str
     wiki_page: str | None = None
     snippet: str
+    page_id: str | None = None
+    revision_id: str | None = None
+    chunk_id: str | None = None
+    origin: Literal["document", "wiki", "gbrain"] | None = None
+
+
+class ProjectionJobResponse(BaseModel):
+    id: str
+    target: Literal["rag", "gbrain"]
+    operation: str
+    page_id: str | None
+    revision_id: str | None
+    projection_epoch: int
+    status: str
+    attempts: int
+    available_at: str
+    last_error: str | None
 
 
 class MemoryHit(BaseModel):

@@ -28,10 +28,17 @@ MAIN_TABLES = [
     "vault_change_events",
     "vault_write_intents",
     "knowledge_projection_jobs",
+    "wiki_chunks",
+    "gbrain_page_projections",
+    "gbrain_projection_batches",
+    "gbrain_projection_batch_jobs",
+    "gbrain_projection_segments",
+    "gbrain_projection_protections",
+    "projection_state",
     "audit_logs",
 ]
 
-TABLE_PRIMARY_KEYS = {
+TABLE_PRIMARY_KEYS: dict[str, str | tuple[str, ...]] = {
     "sources": "id",
     "wiki_pages": "path",
     "review_items": "id",
@@ -40,6 +47,13 @@ TABLE_PRIMARY_KEYS = {
     "wiki_file_observations": "id",
     "vault_change_events": "id",
     "knowledge_projection_jobs": "id",
+    "wiki_chunks": "id",
+    "gbrain_page_projections": "id",
+    "gbrain_projection_batches": "id",
+    "gbrain_projection_batch_jobs": ("batch_id", "job_id"),
+    "gbrain_projection_segments": "id",
+    "gbrain_projection_protections": "id",
+    "projection_state": "key",
     "query_logs": "id",
     "feedback": "id",
     "knowledge_gaps": "id",
@@ -322,6 +336,123 @@ ON document_chunks(domain);
 
 CREATE INDEX IF NOT EXISTS idx_document_chunks_source
 ON document_chunks(source_id);
+
+CREATE TABLE IF NOT EXISTS wiki_chunks (
+  id TEXT PRIMARY KEY,
+  page_id TEXT NOT NULL,
+  revision_id TEXT NOT NULL,
+  projection_epoch INTEGER NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  page_path TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  title TEXT NOT NULL,
+  text TEXT NOT NULL,
+  token_json TEXT NOT NULL DEFAULT '[]',
+  embedding_json TEXT NOT NULL DEFAULT '[]',
+  embedding_model TEXT NOT NULL,
+  source_ids_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wiki_chunks_epoch_unique
+ON wiki_chunks(page_id, revision_id, projection_epoch, chunk_index);
+
+CREATE INDEX IF NOT EXISTS idx_wiki_chunks_domain_epoch
+ON wiki_chunks(domain, page_id, projection_epoch);
+
+CREATE TABLE IF NOT EXISTS gbrain_page_projections (
+  id TEXT PRIMARY KEY,
+  page_id TEXT NOT NULL,
+  revision_id TEXT NOT NULL,
+  projection_epoch INTEGER NOT NULL,
+  page_path TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  semantic_hash TEXT NOT NULL,
+  gbrain_source_id TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  gbrain_content_hash TEXT NOT NULL,
+  gbrain_page_generation INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  imported_at TEXT,
+  invalidated_at TEXT,
+  last_job_id TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gbrain_projection_slug_unique
+ON gbrain_page_projections(gbrain_source_id, slug);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gbrain_projection_current_page
+ON gbrain_page_projections(gbrain_source_id, page_id) WHERE status = 'current';
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_batches (
+  id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  batch_watermark_json TEXT NOT NULL,
+  included_snapshot_json TEXT NOT NULL,
+  lease_owner TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  last_error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_batch_jobs (
+  batch_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  page_id TEXT,
+  revision_id TEXT,
+  projection_epoch INTEGER NOT NULL,
+  operation TEXT NOT NULL,
+  PRIMARY KEY(batch_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_segments (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL,
+  segment_index INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  expected_pages_json TEXT NOT NULL,
+  protected_mappings_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL,
+  lease_owner TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  last_error TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE(batch_id, segment_index)
+);
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_protections (
+  id TEXT PRIMARY KEY,
+  gbrain_source_id TEXT NOT NULL,
+  page_id TEXT,
+  slug TEXT,
+  source_path TEXT,
+  reason TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  resolved_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gbrain_active_protections
+ON gbrain_projection_protections(gbrain_source_id, active);
+
+CREATE TABLE IF NOT EXISTS projection_state (
+  key TEXT PRIMARY KEY,
+  value INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO projection_state(key, value, updated_at)
+VALUES ('gbrain_projection_generation', 0, CURRENT_TIMESTAMP);
 """
 
 PG_SCHEMA = """
@@ -592,6 +723,124 @@ ON document_chunks(domain);
 
 CREATE INDEX IF NOT EXISTS idx_document_chunks_source
 ON document_chunks(source_id);
+
+CREATE TABLE IF NOT EXISTS wiki_chunks (
+  id TEXT PRIMARY KEY,
+  page_id TEXT NOT NULL,
+  revision_id TEXT NOT NULL,
+  projection_epoch INTEGER NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  page_path TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  title TEXT NOT NULL,
+  text TEXT NOT NULL,
+  token_json TEXT NOT NULL DEFAULT '[]',
+  embedding_json TEXT NOT NULL DEFAULT '[]',
+  embedding_model TEXT NOT NULL,
+  source_ids_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wiki_chunks_epoch_unique
+ON wiki_chunks(page_id, revision_id, projection_epoch, chunk_index);
+
+CREATE INDEX IF NOT EXISTS idx_wiki_chunks_domain_epoch
+ON wiki_chunks(domain, page_id, projection_epoch);
+
+CREATE TABLE IF NOT EXISTS gbrain_page_projections (
+  id TEXT PRIMARY KEY,
+  page_id TEXT NOT NULL,
+  revision_id TEXT NOT NULL,
+  projection_epoch INTEGER NOT NULL,
+  page_path TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  semantic_hash TEXT NOT NULL,
+  gbrain_source_id TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  gbrain_content_hash TEXT NOT NULL,
+  gbrain_page_generation INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  imported_at TEXT,
+  invalidated_at TEXT,
+  last_job_id TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gbrain_projection_slug_unique
+ON gbrain_page_projections(gbrain_source_id, slug);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gbrain_projection_current_page
+ON gbrain_page_projections(gbrain_source_id, page_id) WHERE status = 'current';
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_batches (
+  id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  batch_watermark_json TEXT NOT NULL,
+  included_snapshot_json TEXT NOT NULL,
+  lease_owner TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  last_error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_batch_jobs (
+  batch_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  page_id TEXT,
+  revision_id TEXT,
+  projection_epoch INTEGER NOT NULL,
+  operation TEXT NOT NULL,
+  PRIMARY KEY(batch_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_segments (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL,
+  segment_index INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  expected_pages_json TEXT NOT NULL,
+  protected_mappings_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL,
+  lease_owner TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  last_error TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE(batch_id, segment_index)
+);
+
+CREATE TABLE IF NOT EXISTS gbrain_projection_protections (
+  id TEXT PRIMARY KEY,
+  gbrain_source_id TEXT NOT NULL,
+  page_id TEXT,
+  slug TEXT,
+  source_path TEXT,
+  reason TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  resolved_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gbrain_active_protections
+ON gbrain_projection_protections(gbrain_source_id, active);
+
+CREATE TABLE IF NOT EXISTS projection_state (
+  key TEXT PRIMARY KEY,
+  value INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+INSERT INTO projection_state(key, value, updated_at)
+VALUES ('gbrain_projection_generation', 0, CURRENT_TIMESTAMP)
+ON CONFLICT (key) DO NOTHING;
 
 ALTER TABLE wiki_pages ADD COLUMN IF NOT EXISTS page_id TEXT;
 ALTER TABLE wiki_pages ADD COLUMN IF NOT EXISTS current_revision_id TEXT;
