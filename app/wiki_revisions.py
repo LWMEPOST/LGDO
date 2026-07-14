@@ -6017,7 +6017,6 @@ class WikiRevisionService:
                 "wiki_revision_transition_prepared",
             )
             if payload.get("intent_id") == intent["id"]
-            and payload.get("revision_id") == revision["id"]
         ]
         if not matching:
             return None
@@ -6040,7 +6039,8 @@ class WikiRevisionService:
         ):
             raise WikiRevisionError("prepared revision transition audit is invalid")
         if (
-            payload["page_id"] != intent["page_id"]
+            payload["revision_id"] != revision["id"]
+            or payload["page_id"] != intent["page_id"]
             or payload["page_id"] != revision["page_id"]
             or payload["page_path"] != intent["target_path"]
             or payload["page_path"] != revision["page_path"]
@@ -6051,16 +6051,47 @@ class WikiRevisionService:
 
         kind = payload["transition_kind"]
         transition_id = payload["transition_id"]
+        idempotency_key = revision["idempotency_key"]
+        key_prefix, separator, state_digest = idempotency_key.rpartition(":")
+        has_state_digest = (
+            separator == ":"
+            and len(state_digest) == 64
+            and all(character in "0123456789abcdef" for character in state_digest)
+        )
         if kind == "compile":
+            try:
+                revision_metadata = json.loads(revision["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                revision_metadata = None
+            source_hash = (
+                revision_metadata.get("source_hash")
+                if isinstance(revision_metadata, dict)
+                else None
+            )
+            compiler_version = (
+                revision_metadata.get("compiler_version")
+                if isinstance(revision_metadata, dict)
+                else None
+            )
+            expected_key_prefix = (
+                f"compile:{transition_id}:{revision['page_id']}:"
+                f"{source_hash}:{compiler_version}"
+            )
             valid = (
                 revision["origin"] == "generated"
                 and payload.get("compile_job_id") == transition_id
+                and isinstance(source_hash, str)
+                and isinstance(compiler_version, str)
+                and has_state_digest
+                and key_prefix == expected_key_prefix
             )
         else:
             valid = (
                 kind in {"manual", "human", "status", "metadata"}
                 and revision["origin"] == "manual"
                 and payload.get("request_id") == transition_id
+                and has_state_digest
+                and key_prefix == f"{kind}:{transition_id}"
             )
         if not valid:
             raise WikiRevisionError(
@@ -6261,10 +6292,18 @@ class WikiRevisionService:
             )
             next_epoch = int(locked.page["projection_epoch"] or 0) + 1
             try:
-                content_document = parse_wiki_bytes(
-                    revision["content"].encode("utf-8")
+                revision_content = revision["content"].encode("utf-8")
+            except (AttributeError, UnicodeEncodeError) as exc:
+                raise WikiRevisionError(
+                    f"write revision content is invalid: {revision['id']}"
+                ) from exc
+            if compute_file_hash(revision_content) != revision["file_hash"]:
+                raise WikiRevisionError(
+                    f"write revision content hash changed: {revision['id']}"
                 )
-            except (AttributeError, UnicodeEncodeError, MarkdownParseError) as exc:
+            try:
+                content_document = parse_wiki_bytes(revision_content)
+            except MarkdownParseError as exc:
                 raise WikiRevisionError(
                     f"write revision content is invalid: {revision['id']}"
                 ) from exc

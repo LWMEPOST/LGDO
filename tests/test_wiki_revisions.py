@@ -434,6 +434,167 @@ def test_finalize_invalid_revision_content_fails_closed(legacy_page_fixture):
     assert applied_count == 0
 
 
+def test_finalize_valid_revision_content_hash_mismatch_fails_closed(
+    legacy_page_fixture,
+):
+    service, page = legacy_page_fixture
+    prepared = service.update_status(
+        StatusUpdateCommand(
+            page_path=page.page_path,
+            review_status="stale",
+            expected_revision_id=page.current_revision_id,
+            request_id="status-valid-content-hash-mismatch",
+            actor="alice",
+            owner="status-owner",
+        ),
+        execute_intent=False,
+    )
+    executor = IntentExecutor(service.settings, owner="content-hash-finalize")
+    installed = executor.execute(
+        prepared.write_intent_id,
+        stop_after="installed",
+    )
+    with connect_app_write(service.settings) as conn:
+        revision = conn.execute(
+            "SELECT content FROM wiki_page_revisions WHERE id=?",
+            (prepared.revision_id,),
+        ).fetchone()
+        tampered_content = revision["content"].replace(
+            "review_status: stale",
+            "review_status: rejected",
+        )
+        assert tampered_content != revision["content"]
+        conn.execute(
+            "UPDATE wiki_page_revisions SET content=? WHERE id=?",
+            (tampered_content, prepared.revision_id),
+        )
+
+    outcome = executor.capture_and_install(prepared.write_intent_id)
+
+    with connect_app(service.settings) as conn:
+        page_row = conn.execute(
+            """
+            SELECT current_revision_id,pending_write_intent_id,projection_epoch,
+                   review_status,owner
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (page.page_id,),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT status FROM vault_write_intents WHERE id=?",
+            (prepared.write_intent_id,),
+        ).fetchone()
+        applied_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE event_type='wiki_revision_applied'
+              AND payload_json LIKE ?
+            """,
+            (f'%"revision_id":"{prepared.revision_id}"%',),
+        ).fetchone()[0]
+        projection_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM knowledge_projection_jobs
+            WHERE revision_id=?
+            """,
+            (prepared.revision_id,),
+        ).fetchone()[0]
+
+    assert installed.intent_status == "installed"
+    assert outcome.intent_status == "recovery_required"
+    assert page_row["current_revision_id"] == page.current_revision_id
+    assert page_row["pending_write_intent_id"] == prepared.write_intent_id
+    assert page_row["projection_epoch"] == page.projection_epoch
+    assert page_row["review_status"] == "reviewed"
+    assert page_row["owner"] == "alice"
+    assert intent["status"] == "recovery_required"
+    assert applied_count == 0
+    assert projection_count == 0
+
+
+@pytest.mark.parametrize(
+    "tampered_field",
+    ["revision_id", "transition_kind", "transition_id"],
+)
+def test_finalize_rejects_invalid_prepared_transition_for_same_intent(
+    legacy_page_fixture,
+    tampered_field,
+):
+    service, page = legacy_page_fixture
+    prepared = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page.page_path,
+            content=page.content + "\nPrepared audit integrity.\n",
+            expected_revision_id=page.current_revision_id,
+            request_id="prepared-audit-integrity",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="reviewed",
+        ),
+        execute_intent=False,
+    )
+    with connect_app_write(service.settings) as conn:
+        row = conn.execute(
+            """
+            SELECT id,payload_json FROM audit_logs
+            WHERE event_type='wiki_revision_transition_prepared'
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        assert payload["intent_id"] == prepared.write_intent_id
+        if tampered_field == "revision_id":
+            payload["revision_id"] = "wrev_wrong"
+        elif tampered_field == "transition_kind":
+            payload["transition_kind"] = "status"
+        else:
+            payload["transition_id"] = "forged-request"
+            payload["request_id"] = "forged-request"
+        conn.execute(
+            "UPDATE audit_logs SET payload_json=? WHERE id=?",
+            (json.dumps(payload), row["id"]),
+        )
+
+    outcome = IntentExecutor(service.settings).execute(prepared.write_intent_id)
+
+    with connect_app(service.settings) as conn:
+        page_row = conn.execute(
+            """
+            SELECT current_revision_id,pending_write_intent_id,projection_epoch
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (page.page_id,),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT status FROM vault_write_intents WHERE id=?",
+            (prepared.write_intent_id,),
+        ).fetchone()
+        applied_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE event_type='wiki_revision_applied'
+              AND payload_json LIKE ?
+            """,
+            (f'%"revision_id":"{prepared.revision_id}"%',),
+        ).fetchone()[0]
+        projection_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM knowledge_projection_jobs
+            WHERE revision_id=?
+            """,
+            (prepared.revision_id,),
+        ).fetchone()[0]
+
+    assert outcome.intent_status == "recovery_required"
+    assert page_row["current_revision_id"] == page.current_revision_id
+    assert page_row["pending_write_intent_id"] == prepared.write_intent_id
+    assert page_row["projection_epoch"] == page.projection_epoch
+    assert intent["status"] == "recovery_required"
+    assert applied_count == 0
+    assert projection_count == 0
+
+
 def test_manual_replay_requires_the_same_canonical_state(legacy_page_fixture):
     service, page = legacy_page_fixture
     command = ManualSaveCommand(
