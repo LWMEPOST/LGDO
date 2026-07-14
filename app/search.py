@@ -11,6 +11,11 @@ from typing import Any
 from app.aliases import build_alias_context, expand_query_with_aliases
 from app.answer_modes import AnswerModeConfig, get_answer_mode_config
 from app.auth import UserContext, apply_request_user_override, can_read_metadata
+from app.citations import (
+    dedupe_citations,
+    map_gbrain_hit,
+    map_local_hit,
+)
 from app.config import Settings
 from app.db import audit, connect_app, init_app_db, json_dump
 from app.external_embedding import ExternalEmbeddingError, rerank_rows_with_dashscope
@@ -116,7 +121,7 @@ def build_ask_assembly(
         except Exception:
             gbrain_result = GBrainQueryResult([], reason="exception")
 
-    gbrain_hits = gbrain_result.hits
+    raw_gbrain_hits = gbrain_result.hits
     external_diagnostics: dict[str, Any] | None = None
 
     with connect_app(settings) as conn:
@@ -124,7 +129,19 @@ def build_ask_assembly(
         answer_parts: list[str] = []
         context_blocks: list[str] = []
         memory_hits = search_query_memory(conn, request, tokens, mode_config, resolved_user)
-        gbrain_hits = filter_authorized_gbrain_hits(conn, gbrain_hits, resolved_user)
+        gbrain_diagnostics = {
+            "mapped": 0,
+            "stale": 0,
+            "unauthorized": 0,
+            "unmapped": 0,
+        }
+        mapped_gbrain = []
+        for hit in raw_gbrain_hits:
+            evidence = map_gbrain_hit(conn, hit, resolved_user)
+            gbrain_diagnostics[evidence.diagnostic] += 1
+            if evidence.diagnostic == "mapped":
+                mapped_gbrain.append((hit, evidence))
+        gbrain_hits = [hit for hit, _ in mapped_gbrain]
         if not gbrain_hits and settings.dashscope_embedding_enabled and chunk_hits:
             try:
                 chunk_hits, external_diagnostics = rerank_rows_with_dashscope(
@@ -138,30 +155,22 @@ def build_ask_assembly(
                     "degraded_from": "dashscope_embedding",
                     "reason": str(exc),
                 }
+        mapped_chunk_hits: list[dict[str, Any]] = []
         for item in chunk_hits[: mode_config.context_limit]:
-            source_id = item["source_id"]
-            if not can_read_source_id(conn, source_id, resolved_user):
+            evidence = map_local_hit(conn, item, resolved_user)
+            if evidence.diagnostic != "mapped":
                 continue
-            page = find_wiki_page_by_source(conn, source_id, request.domain)
-            page_path = page["path"] if page else None
-            snippet = item["snippet"]
-            context_text = clip_context(item["text"])
-            citations.append(
-                Citation(
-                    source_id=source_id,
-                    wiki_page=page_path,
-                    snippet=snippet,
-                )
-            )
-            title = page["title"] if page else item["title"]
-            answer_parts.append(f"- {title}: {snippet}")
-            context_blocks.append(
-                f"标题：{title}\n页面：{page_path or '未生成知识页'}\n来源：{source_id}\n资料正文：\n{context_text}"
-            )
+            mapped_chunk_hits.append(item)
+            citations.extend(evidence.citations)
+            answer_parts.append(evidence.answer_part)
+            context_blocks.append(evidence.context)
 
-        gbrain_context_blocks = build_gbrain_context(gbrain_hits, mode_config.context_limit)
+        visible_gbrain = mapped_gbrain[: mode_config.context_limit]
+        gbrain_context_blocks = [evidence.context for _, evidence in visible_gbrain]
+        for _, evidence in visible_gbrain:
+            citations.extend(evidence.citations)
         context_blocks.extend(gbrain_context_blocks)
-        answer_parts.extend(build_gbrain_answer_parts(gbrain_hits, mode_config.context_limit))
+        answer_parts.extend(evidence.answer_part for _, evidence in visible_gbrain)
 
         if not citations:
             citations, answer_parts, context_blocks = fallback_wiki_search(
@@ -188,7 +197,9 @@ def build_ask_assembly(
                 confidence = "medium"
             if not chunk_hits and gbrain_context_blocks:
                 confidence = "medium"
-        citations = filter_authorized_citations(conn, citations, resolved_user)
+        citations = dedupe_citations(
+            filter_authorized_citations(conn, citations, resolved_user)
+        )
         if request.require_citations and not citations and not gbrain_context_blocks:
             answer_override = "当前用户权限范围内没有找到足够依据回答这个问题。请确认资料 ACL 标签或补充授权资料。"
             confidence = "low"
@@ -198,12 +209,15 @@ def build_ask_assembly(
             "answer_mode": mode_config.key,
             "mode_label": mode_config.label,
             "chunk_hits": len(chunk_hits),
-            "authorized_chunk_hits": len(
-                [item for item in chunk_hits if can_read_source_id(conn, item.get("source_id"), resolved_user)]
-            ),
+            "authorized_chunk_hits": len(mapped_chunk_hits),
             "context_limit": mode_config.context_limit,
             "memory_hits": len(memory_hits),
             "gbrain_hits": len(gbrain_hits),
+            "gbrain_raw_hits": len(raw_gbrain_hits),
+            "gbrain_mapped": gbrain_diagnostics["mapped"],
+            "gbrain_stale": gbrain_diagnostics["stale"],
+            "gbrain_unauthorized": gbrain_diagnostics["unauthorized"],
+            "gbrain_unmapped": gbrain_diagnostics["unmapped"],
             "gbrain_enabled": settings.gbrain_enabled,
             "gbrain_reason": gbrain_result.reason if gbrain_result else "exception",
             "gbrain_circuit_open": gbrain_result.circuit_open if gbrain_result else False,
@@ -239,8 +253,7 @@ def build_ask_assembly(
                     "external_vector_score": item.get("external_vector_score"),
                     "external_rrf_score": item.get("external_rrf_score"),
                 }
-                for item in chunk_hits[: mode_config.context_limit]
-                if can_read_source_id(conn, item.get("source_id"), resolved_user)
+                for item in mapped_chunk_hits
             ],
             "gbrain_top_hits": [
                 {
@@ -495,7 +508,7 @@ def can_read_source_id(conn, source_id: str | None, user_context: UserContext | 
     if not source_id:
         return False
     row = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-    if row is None or row["status"] == "deleted":
+    if row is None or row["status"] != "active":
         return False
     metadata = __import__("json").loads(row["metadata_json"] or "{}")
     return can_read_metadata(metadata, user_context, row["owner"])
@@ -514,9 +527,11 @@ def filter_authorized_gbrain_hits(
     hits: list[GBrainHit],
     user_context: UserContext | None = None,
 ) -> list[GBrainHit]:
-    if user_context is None or user_context.is_admin:
-        return hits
-    return [hit for hit in hits if hit.source_id and can_read_source_id(conn, hit.source_id, user_context)]
+    return [
+        hit
+        for hit in hits
+        if map_gbrain_hit(conn, hit, user_context).diagnostic == "mapped"
+    ]
 
 
 def query_log_is_authorized(conn, citations_json: str, user_context: UserContext | None = None) -> bool:
