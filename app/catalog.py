@@ -1,13 +1,31 @@
 from __future__ import annotations
 
+from dataclasses import asdict
+
 from app.config import Settings
 from app.auth import UserContext, can_read_metadata, filter_rows_by_acl
 from app.db import audit, connect_app, init_app_db, row_to_dict, rows_to_dicts
 from app.gbrain import get_gbrain_status
-from app.models import GapUpdateRequest, ReviewUpdateRequest, WikiPageSaveRequest, WikiStatusUpdateRequest
+from app.models import (
+    BackupReleaseRequest,
+    ConflictResolveRequest,
+    GapUpdateRequest,
+    ReviewUpdateRequest,
+    WikiPageSaveRequest,
+    WikiStatusUpdateRequest,
+)
 from app.rag import delete_document_chunks
 from app.timeutil import now_iso
 from app.vault import append_log, ensure_vault
+from app.wiki_revisions import (
+    ManualSaveCommand,
+    PageNotFound,
+    PreconditionRequired,
+    ResolveConflictCommand,
+    StatusUpdateCommand,
+    WikiRevisionError,
+    WikiRevisionService,
+)
 
 
 def list_sources(
@@ -237,6 +255,11 @@ def update_review_item(settings: Settings, review_id: str, request: ReviewUpdate
         row = conn.execute("SELECT * FROM review_items WHERE id = ?", (review_id,)).fetchone()
         if row is None:
             raise ValueError(f"review item 不存在: {review_id}")
+        if row["issue_type"] in {"content_conflict", "concurrent_write_conflict"}:
+            raise ValueError(
+                "冲突 review 必须通过 "
+                f"/wiki/conflicts/{review_id}/resolve 处理"
+            )
 
         conn.execute(
             """
@@ -278,108 +301,205 @@ def update_review_item(settings: Settings, review_id: str, request: ReviewUpdate
     return updated or {}
 
 
-def update_wiki_page_status(settings: Settings, page_path: str, request: WikiStatusUpdateRequest) -> dict:
+def _wiki_revision_service(settings: Settings) -> WikiRevisionService:
     init_app_db(settings)
     ensure_vault(settings.vault_path)
-    timestamp = now_iso()
-    with connect_app(settings) as conn:
-        row = conn.execute("SELECT * FROM wiki_pages WHERE path = ?", (page_path,)).fetchone()
-        if row is None:
-            raise ValueError(f"wiki page 不存在: {page_path}")
+    return WikiRevisionService(settings)
 
-        conn.execute(
-            """
-            UPDATE wiki_pages
-            SET review_status = ?, owner = COALESCE(?, owner), updated_at = ?
-            WHERE path = ?
-            """,
-            (request.review_status, request.owner, timestamp, page_path),
-        )
-        audit(
-            conn,
-            "wiki_status_updated",
-            {
-                "page_path": page_path,
-                "review_status": request.review_status,
-                "owner": request.owner,
-                "note": request.note,
-            },
-            timestamp,
-        )
-        updated = row_to_dict(conn.execute("SELECT * FROM wiki_pages WHERE path = ?", (page_path,)).fetchone())
 
-    append_log(
-        settings.vault_path,
-        "review_log.md",
-        f"- {timestamp} {page_path}: review_status={request.review_status} "
-        f"owner={request.owner or ''} note={request.note or ''}",
+def _wiki_mutation_payload(
+    service: WikiRevisionService,
+    result,
+) -> dict:
+    page = service.get_page(result.page_path)
+    payload = asdict(result)
+    payload["path"] = result.page_path
+    payload["page_path"] = result.page_path
+    payload["projection_job_ids"] = list(result.projection_job_ids)
+    payload["review_status"] = page.metadata.get("review_status")
+    return payload
+
+
+def update_wiki_page_status(
+    settings: Settings,
+    page_path: str,
+    request: WikiStatusUpdateRequest,
+    *,
+    actor: str,
+) -> dict:
+    if request.expected_revision_id is None:
+        raise PreconditionRequired("expected_revision_id is required")
+    service = _wiki_revision_service(settings)
+    result = service.update_status(
+        StatusUpdateCommand(
+            page_path=page_path,
+            review_status=request.review_status,
+            expected_revision_id=request.expected_revision_id,
+            request_id=request.request_id,
+            actor=actor,
+            owner=request.owner,
+            note=request.note,
+        )
     )
-    return updated or {}
+    return _wiki_mutation_payload(service, result)
 
 
 def read_wiki_page(settings: Settings, page_path: str) -> dict:
-    init_app_db(settings)
-    ensure_vault(settings.vault_path)
-    safe_page_path = _validate_vault_rel_path(page_path)
-    absolute = settings.vault_path / safe_page_path
-    if not absolute.exists() or not absolute.is_file():
-        raise ValueError(f"wiki page 文件不存在: {page_path}")
-
-    with connect_app(settings) as conn:
-        row = row_to_dict(conn.execute("SELECT * FROM wiki_pages WHERE path = ?", (page_path,)).fetchone())
-
+    page = _wiki_revision_service(settings).get_page(page_path)
     return {
-        "path": page_path,
-        "content": absolute.read_text(encoding="utf-8"),
-        "metadata": row or {},
+        "path": page.page_path,
+        "page_id": page.page_id,
+        "content": page.content,
+        "current_revision_id": page.current_revision_id,
+        "generated_revision_id": page.generated_revision_id,
+        "accepted_generated_revision_id": page.accepted_generated_revision_id,
+        "lifecycle_status": page.lifecycle_status,
+        "projection_epoch": page.projection_epoch,
+        "write_in_progress": page.write_in_progress,
+        "write_intent_id": page.write_intent_id,
+        "metadata": page.metadata,
     }
 
 
-def save_wiki_page(settings: Settings, page_path: str, request: WikiPageSaveRequest) -> dict:
-    init_app_db(settings)
-    ensure_vault(settings.vault_path)
-    safe_page_path = _validate_vault_rel_path(page_path)
-    if not str(safe_page_path).replace("\\", "/").startswith("wiki/"):
-        raise ValueError("只能编辑 wiki/ 目录下的知识页")
-
-    absolute = settings.vault_path / safe_page_path
-    if not absolute.exists() or not absolute.is_file():
-        raise ValueError(f"wiki page 文件不存在: {page_path}")
-
-    timestamp = now_iso()
-    absolute.write_text(request.content, encoding="utf-8")
-    with connect_app(settings) as conn:
-        row = conn.execute("SELECT * FROM wiki_pages WHERE path = ?", (page_path,)).fetchone()
-        if row is None:
-            raise ValueError(f"wiki page 元数据不存在: {page_path}")
-        conn.execute(
-            """
-            UPDATE wiki_pages
-            SET review_status = ?, owner = COALESCE(?, owner), updated_at = ?
-            WHERE path = ?
-            """,
-            (request.review_status, request.owner, timestamp, page_path),
+def save_wiki_page(
+    settings: Settings,
+    page_path: str,
+    request: WikiPageSaveRequest,
+    *,
+    actor: str,
+) -> dict:
+    if request.expected_revision_id is None:
+        raise PreconditionRequired("expected_revision_id is required")
+    service = _wiki_revision_service(settings)
+    result = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page_path,
+            content=request.content,
+            expected_revision_id=request.expected_revision_id,
+            request_id=request.request_id,
+            actor=actor,
+            owner=request.owner,
+            note=request.note,
+            review_status=request.review_status,
         )
-        audit(
-            conn,
-            "wiki_page_saved",
-            {
-                "page_path": page_path,
-                "review_status": request.review_status,
-                "owner": request.owner,
-                "note": request.note,
-            },
-            timestamp,
-        )
-        updated = row_to_dict(conn.execute("SELECT * FROM wiki_pages WHERE path = ?", (page_path,)).fetchone())
-
-    append_log(
-        settings.vault_path,
-        "review_log.md",
-        f"- {timestamp} saved {page_path}: review_status={request.review_status} "
-        f"owner={request.owner or ''} note={request.note or ''}",
     )
-    return updated or {}
+    return _wiki_mutation_payload(service, result)
+
+
+def list_wiki_page_revisions(
+    settings: Settings,
+    page_path: str,
+    *,
+    limit: int,
+    offset: int,
+) -> dict:
+    service = _wiki_revision_service(settings)
+    page = service.get_page(page_path)
+    with connect_app(settings) as conn:
+        total = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+                (page.page_id,),
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            """
+            SELECT id,page_id,page_path,revision_number,file_hash,semantic_hash,
+                   origin,base_revision_id,source_ids_json,actor,note,
+                   metadata_json,idempotency_key,created_at
+            FROM wiki_page_revisions
+            WHERE page_id=?
+            ORDER BY revision_number DESC,id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (page.page_id, limit, offset),
+        ).fetchall()
+    return {
+        "items": [row_to_dict(row) for row in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+def get_wiki_revision(settings: Settings, revision_id: str) -> dict:
+    service = _wiki_revision_service(settings)
+    with connect_app(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT revision.*,page.path AS current_page_path
+            FROM wiki_page_revisions AS revision
+            JOIN wiki_pages AS page ON page.page_id=revision.page_id
+            WHERE revision.id=?
+            """,
+            (revision_id,),
+        ).fetchone()
+    if row is None:
+        raise PageNotFound(revision_id)
+    revision = row_to_dict(row) or {}
+    current_page_path = revision.pop("current_page_path")
+    service.get_page(current_page_path)
+    return revision
+
+
+def list_wiki_page_conflicts(settings: Settings, page_path: str) -> list[dict]:
+    service = _wiki_revision_service(settings)
+    service.get_page(page_path)
+    return service.list_conflicts(page_path, status="pending")
+
+
+def resolve_wiki_conflict(
+    settings: Settings,
+    review_id: str,
+    request: ConflictResolveRequest,
+    *,
+    actor: str,
+) -> dict:
+    service = _wiki_revision_service(settings)
+    with connect_app(settings) as conn:
+        review = conn.execute(
+            "SELECT issue_type FROM review_items WHERE id=?",
+            (review_id,),
+        ).fetchone()
+    if review is None:
+        raise PageNotFound(review_id)
+    if review["issue_type"] not in {
+        "content_conflict",
+        "concurrent_write_conflict",
+    }:
+        raise WikiRevisionError(
+            f"review item is not a resolvable conflict: {review_id}"
+        )
+    result = service.resolve_conflict(
+        ResolveConflictCommand(
+            review_id=review_id,
+            resolution=request.resolution,
+            merged_content=request.merged_content,
+            expected_current_revision_id=request.expected_current_revision_id,
+            expected_generated_revision_id=request.expected_generated_revision_id,
+            request_id=request.request_id,
+            actor=actor,
+            note=request.note,
+        )
+    )
+    return _wiki_mutation_payload(service, result)
+
+
+def release_wiki_backup(
+    settings: Settings,
+    intent_id: str,
+    request: BackupReleaseRequest,
+    *,
+    actor: str,
+) -> dict:
+    service = _wiki_revision_service(settings)
+    return asdict(
+        service.release_retained_backup(
+            intent_id,
+            request.expected_backup_hash,
+            actor=actor,
+        )
+    )
 
 
 def list_knowledge_gaps(settings: Settings, status: str | None = None) -> list[dict]:

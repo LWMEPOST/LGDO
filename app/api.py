@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
+from typing import NoReturn
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi import Depends, Request
@@ -12,14 +13,19 @@ from app.accounts import authenticate_account, create_account, list_accounts, re
 from app.auth import UserContext, resolve_user_context
 from app.catalog import (
     delete_source,
+    get_wiki_revision,
     list_knowledge_gaps,
     list_ingest_reports,
     list_review_items,
     list_sources,
+    list_wiki_page_conflicts,
+    list_wiki_page_revisions,
     list_wiki_pages,
     rag_status,
     read_source_preview,
     read_wiki_page,
+    release_wiki_backup,
+    resolve_wiki_conflict,
     save_wiki_page,
     update_knowledge_gap,
     update_review_item,
@@ -37,8 +43,11 @@ from app.models import (
     AskRequest,
     AskResponse,
     AuthSessionResponse,
+    BackupReleaseRequest,
+    BackupReleaseResponse,
     CompileRequest,
     CompileResponse,
+    ConflictResolveRequest,
     EvalQuestionRequest,
     EvalRunResponse,
     EntityAliasRequest,
@@ -52,13 +61,23 @@ from app.models import (
     SourcePreviewResponse,
     UpgradedEvalRunRequest,
     UploadResponse,
+    WikiConflictResponse,
+    WikiMutationResponse,
     WikiPageContentResponse,
     WikiPageSaveRequest,
+    WikiRevisionDetailResponse,
+    WikiRevisionListResponse,
     WikiStatusUpdateRequest,
 )
 from app.search import ask, stream_ask_events
 from app.vault import slugify
 from app.wiki import compile_wiki
+from app.wiki_revisions import (
+    InvalidWikiDocument,
+    PageNotFound,
+    PreconditionRequired,
+    RevisionConflict,
+)
 
 
 router = APIRouter()
@@ -76,6 +95,41 @@ def require_account_admin(user: UserContext) -> None:
 def require_editor(user: UserContext) -> None:
     if not user.is_admin and user.role != "editor":
         raise HTTPException(status_code=403, detail="需要 admin/editor 权限执行内部管理操作")
+
+
+def raise_wiki_http(exc: Exception) -> NoReturn:
+    if isinstance(exc, PreconditionRequired):
+        raise HTTPException(
+            status_code=428,
+            detail={"code": "expected_revision_required"},
+        ) from exc
+    if isinstance(exc, RevisionConflict):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "revision_conflict",
+                "message": str(exc),
+                "current_revision_id": exc.current_revision_id,
+                "pending_intent_id": exc.pending_intent_id,
+            },
+        ) from exc
+    if isinstance(exc, PageNotFound):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "wiki_page_not_found"},
+        ) from exc
+    if isinstance(exc, InvalidWikiDocument):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": exc.error_code,
+                "observation_id": exc.observation_id,
+            },
+        ) from exc
+    raise HTTPException(
+        status_code=400,
+        detail={"code": "wiki_mutation_failed", "message": str(exc)},
+    ) from exc
 
 
 def bearer_from_request(request: Request) -> str | None:
@@ -216,6 +270,62 @@ def migrate_sqlite_to_postgres_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get(
+    "/wiki/revisions/{revision_id}",
+    response_model=WikiRevisionDetailResponse,
+)
+def get_wiki_revision_endpoint(
+    revision_id: str,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    try:
+        return get_wiki_revision(get_settings(), revision_id)
+    except Exception as exc:
+        raise_wiki_http(exc)
+
+
+@router.post(
+    "/wiki/conflicts/{review_id}/resolve",
+    response_model=WikiMutationResponse,
+)
+def resolve_wiki_conflict_endpoint(
+    review_id: str,
+    request: ConflictResolveRequest,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_editor(user)
+    try:
+        return resolve_wiki_conflict(
+            get_settings(),
+            review_id,
+            request,
+            actor=user.user_id,
+        )
+    except Exception as exc:
+        raise_wiki_http(exc)
+
+
+@router.post(
+    "/wiki/write-intents/{intent_id}/release-backup",
+    response_model=BackupReleaseResponse,
+)
+def release_wiki_backup_endpoint(
+    intent_id: str,
+    request: BackupReleaseRequest,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_account_admin(user)
+    try:
+        return release_wiki_backup(
+            get_settings(),
+            intent_id,
+            request,
+            actor=user.user_id,
+        )
+    except Exception as exc:
+        raise_wiki_http(exc)
+
+
 @router.get("/wiki/pages")
 def list_wiki_pages_endpoint(
     domain: str | None = Query(default=None),
@@ -224,10 +334,48 @@ def list_wiki_pages_endpoint(
     try:
         return list_wiki_pages(get_settings(), domain)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise_wiki_http(exc)
 
 
-@router.patch("/wiki/pages/{page_path:path}/status")
+@router.get(
+    "/wiki/pages/{page_path:path}/revisions",
+    response_model=WikiRevisionListResponse,
+)
+def list_wiki_page_revisions_endpoint(
+    page_path: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user: UserContext = Depends(current_user),
+) -> dict:
+    try:
+        return list_wiki_page_revisions(
+            get_settings(),
+            page_path,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        raise_wiki_http(exc)
+
+
+@router.get(
+    "/wiki/pages/{page_path:path}/conflicts",
+    response_model=list[WikiConflictResponse],
+)
+def list_wiki_page_conflicts_endpoint(
+    page_path: str,
+    user: UserContext = Depends(current_user),
+) -> list[dict]:
+    try:
+        return list_wiki_page_conflicts(get_settings(), page_path)
+    except Exception as exc:
+        raise_wiki_http(exc)
+
+
+@router.patch(
+    "/wiki/pages/{page_path:path}/status",
+    response_model=WikiMutationResponse,
+)
 def update_wiki_status_endpoint(
     page_path: str,
     request: WikiStatusUpdateRequest,
@@ -235,9 +383,14 @@ def update_wiki_status_endpoint(
 ) -> dict:
     require_editor(user)
     try:
-        return update_wiki_page_status(get_settings(), page_path, request)
+        return update_wiki_page_status(
+            get_settings(),
+            page_path,
+            request,
+            actor=user.user_id,
+        )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise_wiki_http(exc)
 
 
 @router.get("/wiki/pages/{page_path:path}", response_model=WikiPageContentResponse)
@@ -248,10 +401,13 @@ def read_wiki_page_endpoint(
     try:
         return WikiPageContentResponse(**read_wiki_page(get_settings(), page_path))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise_wiki_http(exc)
 
 
-@router.put("/wiki/pages/{page_path:path}")
+@router.put(
+    "/wiki/pages/{page_path:path}",
+    response_model=WikiMutationResponse,
+)
 def save_wiki_page_endpoint(
     page_path: str,
     request: WikiPageSaveRequest,
@@ -259,9 +415,14 @@ def save_wiki_page_endpoint(
 ) -> dict:
     require_editor(user)
     try:
-        return save_wiki_page(get_settings(), page_path, request)
+        return save_wiki_page(
+            get_settings(),
+            page_path,
+            request,
+            actor=user.user_id,
+        )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise_wiki_http(exc)
 
 
 @router.get("/gaps")
@@ -372,7 +533,7 @@ def compile_endpoint(request: CompileRequest, user: UserContext = Depends(curren
     try:
         return compile_wiki(get_settings(), request)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise_wiki_http(exc)
 
 
 @router.post("/ask", response_model=AskResponse)

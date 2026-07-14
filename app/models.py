@@ -196,21 +196,116 @@ class ReviewUpdateRequest(BaseModel):
 
 class WikiStatusUpdateRequest(BaseModel):
     review_status: str = Field(pattern="^(draft|reviewed|stale|rejected)$")
+    expected_revision_id: str | None = None
+    request_id: str
     owner: str | None = None
     note: str | None = None
 
 
 class WikiPageContentResponse(BaseModel):
     path: str
+    page_id: str
     content: str
+    current_revision_id: str
+    generated_revision_id: str | None = None
+    accepted_generated_revision_id: str | None = None
+    lifecycle_status: str
+    projection_epoch: int
+    write_in_progress: bool = False
+    write_intent_id: str | None = None
     metadata: dict
 
 
 class WikiPageSaveRequest(BaseModel):
     content: str
+    expected_revision_id: str | None = None
+    request_id: str
     review_status: str = Field(default="draft", pattern="^(draft|reviewed|stale|rejected)$")
     owner: str | None = None
     note: str | None = None
+
+
+class ConflictResolveRequest(BaseModel):
+    resolution: Literal["keep_current", "accept_candidate", "merged_content"]
+    merged_content: str | None = None
+    expected_current_revision_id: str
+    expected_generated_revision_id: str | None = None
+    request_id: str
+    note: str | None = None
+
+
+class WikiMutationResponse(BaseModel):
+    path: str
+    page_path: str
+    page_id: str
+    status: str
+    revision_id: str | None = None
+    current_revision_id: str | None = None
+    generated_revision_id: str | None = None
+    candidate_revision_id: str | None = None
+    write_intent_id: str | None = None
+    conflict_review_id: str | None = None
+    observation_id: str | None = None
+    audit_revision_id: str | None = None
+    projection_job_ids: list[str] = Field(default_factory=list)
+    replayed: bool = False
+    review_status: str | None = None
+
+
+class WikiRevisionMetadataResponse(BaseModel):
+    id: str
+    page_id: str
+    page_path: str
+    revision_number: int
+    file_hash: str
+    semantic_hash: str
+    origin: str
+    base_revision_id: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    actor: str | None = None
+    note: str | None = None
+    metadata: dict = Field(default_factory=dict)
+    idempotency_key: str
+    created_at: str
+
+
+class WikiRevisionDetailResponse(WikiRevisionMetadataResponse):
+    content: str
+
+
+class WikiRevisionListResponse(BaseModel):
+    items: list[WikiRevisionMetadataResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class WikiConflictResponse(BaseModel):
+    id: str
+    page_path: str
+    page_id: str | None = None
+    issue_type: str
+    status: str
+    owner: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+    base_revision_id: str | None = None
+    candidate_revision_id: str | None = None
+    resolution_revision_id: str | None = None
+    expected_state: dict = Field(default_factory=dict)
+    resolved_at: str | None = None
+
+
+class BackupReleaseRequest(BaseModel):
+    expected_backup_hash: str
+
+
+class BackupReleaseResponse(BaseModel):
+    intent_id: str
+    page_id: str
+    backup_hash: str
+    status: Literal["released"] = "released"
 
 
 class GapUpdateRequest(BaseModel):
