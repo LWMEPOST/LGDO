@@ -9,7 +9,7 @@ from typing import Any, Literal, Mapping
 from app.config import Settings
 from app.db import connect_app_write, json_dump
 
-RETRY_DELAYS = {1: 5, 2: 30, 3: 120, 4: 600}
+OUTBOX_RETRY_DELAYS_SECONDS = (5, 30, 120, 600)
 TERMINAL_STATUSES = {"succeeded", "failed", "superseded"}
 
 
@@ -152,16 +152,16 @@ class ProjectionOutbox:
                 """
                 SELECT * FROM knowledge_projection_jobs
                 WHERE target = ?
-                  AND attempts < 5
                   AND (
-                    (status IN ('pending','failed') AND available_at <= ?)
-                    OR (status = 'running' AND lease_expires_at < ?)
+                    (status = 'pending' AND attempts < 5 AND available_at <= ?)
+                    OR (status = 'failed' AND attempts < 5 AND available_at <= ?)
+                    OR (status = 'running' AND attempts < 5 AND lease_expires_at < ?)
                   )
                 ORDER BY available_at, created_at
                 LIMIT ?
                 """
                 + suffix,
-                (target, claimed_iso, claimed_iso, limit),
+                (target, claimed_iso, claimed_iso, claimed_iso, limit),
             ).fetchall()
             for row in rows:
                 updated = conn.execute(
@@ -169,15 +169,17 @@ class ProjectionOutbox:
                     UPDATE knowledge_projection_jobs
                     SET status='running', attempts=attempts+1, lease_owner=?,
                         lease_expires_at=?, updated_at=?
-                    WHERE id=? AND attempts < 5
-                      AND ((status IN ('pending','failed') AND available_at <= ?)
-                           OR (status='running' AND lease_expires_at < ?))
+                    WHERE id=?
+                      AND ((status='pending' AND attempts < 5 AND available_at <= ?)
+                           OR (status='failed' AND attempts < 5 AND available_at <= ?)
+                           OR (status='running' AND attempts < 5 AND lease_expires_at < ?))
                     """,
                     (
                         worker_id,
                         lease_expires_at,
                         claimed_iso,
                         row["id"],
+                        claimed_iso,
                         claimed_iso,
                         claimed_iso,
                     ),
@@ -254,21 +256,26 @@ class ProjectionOutbox:
         last_error: str,
         now: datetime | None = None,
     ) -> bool:
-        failed_at = now or datetime.now(timezone.utc)
+        failure_time = now or datetime.now(timezone.utc)
         with connect_app_write(self.settings) as conn:
             suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
             job = conn.execute(
-                "SELECT * FROM knowledge_projection_jobs WHERE id=?" + suffix,
-                (job_id,),
+                """
+                SELECT attempts FROM knowledge_projection_jobs
+                WHERE id=? AND status='running' AND lease_owner=?
+                """
+                + suffix,
+                (job_id, worker_id),
             ).fetchone()
-            if job is None or job["status"] != "running" or job["lease_owner"] != worker_id:
+            if job is None:
                 return False
-            delay = RETRY_DELAYS.get(int(job["attempts"]))
-            available_at = (
-                _utc_iso(failed_at + timedelta(seconds=delay))
-                if delay is not None
-                else None
-            )
+            attempts = int(job["attempts"])
+            available_at = None
+            if 1 <= attempts <= len(OUTBOX_RETRY_DELAYS_SECONDS):
+                available_at = (
+                    failure_time
+                    + timedelta(seconds=OUTBOX_RETRY_DELAYS_SECONDS[attempts - 1])
+                ).isoformat()
             return self.finish_claimed(
                 conn,
                 job_id=job_id,

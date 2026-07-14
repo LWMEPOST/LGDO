@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api import router
 from app.config import get_settings
 from app.db import init_app_db
+from app.projection_worker import ProjectionWorker
 from app.vault import ensure_vault
 
 
@@ -18,7 +19,13 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     ensure_vault(settings.vault_path)
     init_app_db(settings)
-    yield
+    worker = ProjectionWorker(settings)
+    app.state.projection_worker = worker
+    await worker.start()
+    try:
+        yield
+    finally:
+        await worker.stop()
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)

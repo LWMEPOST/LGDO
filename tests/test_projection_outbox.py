@@ -4,7 +4,7 @@ import pytest
 
 from app.config import get_settings
 from app.db import connect_app, init_app_db
-from app.projection_jobs import ProjectionOutbox
+from app.projection_jobs import OUTBOX_RETRY_DELAYS_SECONDS, ProjectionOutbox
 
 
 def sqlite_settings(tmp_path):
@@ -158,3 +158,90 @@ def test_mark_failed_schedules_attempts_one_to_four_and_leaves_five_terminal(
         ) == []
     else:
         assert datetime.fromisoformat(row["available_at"]) == now + timedelta(seconds=delay_seconds)
+
+
+def test_retry_delay_contract_is_fixed():
+    assert OUTBOX_RETRY_DELAYS_SECONDS == (5, 30, 120, 600)
+
+
+@pytest.mark.parametrize("status", ["pending", "failed", "running"])
+def test_attempt_five_is_never_reclaimed_from_any_claim_branch(tmp_path, status):
+    settings = sqlite_settings(tmp_path)
+    outbox = ProjectionOutbox(settings)
+    now = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
+    with connect_app(settings) as conn:
+        seed_page(conn)
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="upsert",
+            page_id="page_1",
+            revision_id="wrev_1",
+            projection_epoch=1,
+            payload={"path": "wiki/product/faq/demo.md"},
+        )
+        conn.execute(
+            """
+            UPDATE knowledge_projection_jobs
+            SET status=?, attempts=5, available_at=?, lease_owner=?, lease_expires_at=?
+            WHERE id=?
+            """,
+            (
+                status,
+                (now - timedelta(seconds=1)).isoformat(),
+                "dead-worker" if status == "running" else None,
+                (now - timedelta(seconds=1)).isoformat(),
+                job_id,
+            ),
+        )
+
+    assert outbox.claim(
+        target="rag",
+        worker_id="worker_b",
+        limit=1,
+        lease_seconds=30,
+        now=now,
+    ) == []
+
+
+def test_attempt_four_failed_job_is_claimed_only_at_available_at(tmp_path):
+    settings = sqlite_settings(tmp_path)
+    outbox = ProjectionOutbox(settings)
+    now = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
+    available_at = now + timedelta(seconds=600)
+    with connect_app(settings) as conn:
+        seed_page(conn)
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="upsert",
+            page_id="page_1",
+            revision_id="wrev_1",
+            projection_epoch=1,
+            payload={"path": "wiki/product/faq/demo.md"},
+        )
+        conn.execute(
+            """
+            UPDATE knowledge_projection_jobs
+            SET status='failed', attempts=4, available_at=?
+            WHERE id=?
+            """,
+            (available_at.isoformat(), job_id),
+        )
+
+    assert outbox.claim(
+        target="rag",
+        worker_id="worker_b",
+        limit=1,
+        lease_seconds=30,
+        now=available_at - timedelta(microseconds=1),
+    ) == []
+    claimed = outbox.claim(
+        target="rag",
+        worker_id="worker_b",
+        limit=1,
+        lease_seconds=30,
+        now=available_at,
+    )
+    assert [job.id for job in claimed] == [job_id]
+    assert claimed[0].attempts == 5
