@@ -232,36 +232,156 @@ def test_revision_lifecycle_is_auditable_reachable_and_immutable(
         (row["event_type"], json.loads(row["payload_json"]))
         for row in audit_rows
     ]
-    applied_transition_ids = {
-        payload.get("transition_id")
+    applied_audits = [
+        payload
         for event_type, payload in audit_payloads
         if event_type == "wiki_revision_applied"
+    ]
+    applied_by_transition = {
+        payload["transition_id"]: payload for payload in applied_audits
     }
-    assert {
+    assert len(applied_audits) == len(applied_by_transition)
+    assert applied_by_transition.keys() == {
         "trace-compile-initial",
         "trace-manual",
         "trace-status",
         "trace-external",
         "trace-resolve",
-    } <= applied_transition_ids
-    assert any(
-        event_type == "wiki_page_renamed"
-        and payload.get("event_id") == "trace-rename"
-        for event_type, payload in audit_payloads
+    }
+    applied_expectations = (
+        (
+            "trace-compile-initial",
+            "compile",
+            initial_generated,
+            "generated",
+            None,
+        ),
+        (
+            "trace-manual",
+            "manual",
+            manual,
+            "manual",
+            initial_generated.revision_id,
+        ),
+        (
+            "trace-status",
+            "status",
+            status,
+            "manual",
+            manual.revision_id,
+        ),
+        (
+            "trace-external",
+            "external",
+            external,
+            "external",
+            status.revision_id,
+        ),
+        (
+            "trace-resolve",
+            "conflict_resolution",
+            resolved,
+            "merge",
+            external.revision_id,
+        ),
     )
-    assert any(
-        event_type == "wiki_page_deleted"
-        and payload.get("event_id") == "trace-delete"
-        for event_type, payload in audit_payloads
+    for transition_id, kind, result, origin, base_revision_id in applied_expectations:
+        payload = applied_by_transition[transition_id]
+        assert payload["transition_kind"] == kind
+        assert payload["page_id"] == page_id
+        assert payload["revision_id"] == result.revision_id
+        assert payload["intent_id"] == result.write_intent_id
+        assert payload["origin"] == origin
+        assert payload["base_revision_id"] == base_revision_id
+
+    assert applied_by_transition["trace-compile-initial"]["compile_job_id"] == (
+        "trace-compile-initial"
     )
-    assert any(
-        event_type == "wiki_external_change_reused_current"
-        and payload.get("event_id") == "trace-restore"
+    for request_id in ("trace-manual", "trace-status", "trace-resolve"):
+        assert applied_by_transition[request_id]["request_id"] == request_id
+    assert applied_by_transition["trace-external"]["event_id"] == "trace-external"
+
+    prepared_audits = [
+        payload
         for event_type, payload in audit_payloads
+        if event_type == "wiki_revision_transition_prepared"
+    ]
+    prepared_by_transition = {
+        payload["transition_id"]: payload for payload in prepared_audits
+    }
+    assert len(prepared_audits) == len(prepared_by_transition)
+    assert prepared_by_transition.keys() == {
+        "trace-compile-initial",
+        "trace-manual",
+        "trace-status",
+    }
+    for transition_id, kind, result, _, _ in applied_expectations[:3]:
+        payload = prepared_by_transition[transition_id]
+        assert payload["transition_kind"] == kind
+        assert payload["page_id"] == page_id
+        assert payload["revision_id"] == result.revision_id
+        assert payload["intent_id"] == result.write_intent_id
+
+    assert prepared_by_transition["trace-compile-initial"]["compile_job_id"] == (
+        "trace-compile-initial"
     )
-    assert any(
-        event_type == "wiki_conflict_resolved"
-        and payload.get("review_id") == conflict["id"]
-        and payload.get("request_id") == "trace-resolve"
-        for event_type, payload in audit_payloads
+    for request_id in ("trace-manual", "trace-status"):
+        assert prepared_by_transition[request_id]["request_id"] == request_id
+
+    assert generated.write_intent_id is None
+    assert "trace-compile-conflict" not in prepared_by_transition
+    assert revisions_by_id[generated.revision_id]["idempotency_key"].startswith(
+        f"compile:trace-compile-conflict:{page_id}:"
     )
+    assert review["candidate_revision_id"] == generated.revision_id
+
+    def one_audit(event_type: str, identity_key: str, identity: str) -> dict:
+        matches = [
+            payload
+            for candidate_type, payload in audit_payloads
+            if candidate_type == event_type and payload.get(identity_key) == identity
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    renamed_audit = one_audit("wiki_page_renamed", "event_id", "trace-rename")
+    assert renamed_audit["page_id"] == page_id
+    assert renamed_audit["audit_revision_id"] == renamed.revision_id
+    assert renamed_audit["old_path"] == generated_page.page_path
+    assert renamed_audit["path"] == renamed_path
+
+    deleted_audit = one_audit("wiki_page_deleted", "event_id", "trace-delete")
+    assert deleted_audit["page_id"] == page_id
+    assert deleted_audit["current_revision_id"] == deleted.revision_id
+    assert deleted_audit["path"] == renamed_path
+
+    restored_audit = one_audit(
+        "wiki_external_change_reused_current",
+        "event_id",
+        "trace-restore",
+    )
+    assert restored_audit["page_id"] == page_id
+    assert restored_audit["revision_id"] == restored.revision_id
+    assert restored_audit["observation_id"] == restored.observation_id
+
+    prepared_resolution = one_audit(
+        "wiki_conflict_resolution_prepared",
+        "request_id",
+        "trace-resolve",
+    )
+    assert prepared_resolution["page_id"] == page_id
+    assert prepared_resolution["review_id"] == conflict["id"]
+    assert prepared_resolution["candidate_revision_id"] == generated.revision_id
+    assert prepared_resolution["resolution_revision_id"] == resolved.revision_id
+    assert prepared_resolution["write_intent_id"] == resolved.write_intent_id
+
+    resolved_audit = one_audit(
+        "wiki_conflict_resolved",
+        "request_id",
+        "trace-resolve",
+    )
+    assert resolved_audit["page_id"] == page_id
+    assert resolved_audit["review_id"] == conflict["id"]
+    assert resolved_audit["candidate_revision_id"] == generated.revision_id
+    assert resolved_audit["resolution_revision_id"] == resolved.revision_id
+    assert resolved_audit["write_intent_id"] == resolved.write_intent_id
