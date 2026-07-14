@@ -647,6 +647,35 @@ def _upsert_chunk(conn: Any, chunk: dict[str, Any], timestamp: str, settings: Se
     )
 
 
+def _merge_document_and_wiki_rows(
+    document_rows: list[dict[str, Any]],
+    wiki_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    wiki_by_source: dict[str, list[int]] = {}
+    wiki_by_content: dict[str, list[int]] = {}
+    for index, row in enumerate(wiki_rows):
+        for source_id in row.get("source_ids") or []:
+            wiki_by_source.setdefault(str(source_id), []).append(index)
+        content_key = normalize_for_match(str(row.get("text") or ""))
+        if content_key:
+            wiki_by_content.setdefault(content_key, []).append(index)
+
+    merged: list[dict[str, Any]] = []
+    emitted_wiki: set[int] = set()
+    for document in document_rows:
+        matching_indexes = list(wiki_by_source.get(str(document.get("source_id") or ""), []))
+        content_key = normalize_for_match(str(document.get("text") or ""))
+        matching_indexes.extend(wiki_by_content.get(content_key, []))
+        for index in matching_indexes:
+            if index not in emitted_wiki:
+                merged.append(wiki_rows[index])
+                emitted_wiki.add(index)
+        merged.append(document)
+
+    merged.extend(row for index, row in enumerate(wiki_rows) if index not in emitted_wiki)
+    return merged
+
+
 def search_chunks(
     settings: Settings,
     question: str,
@@ -658,29 +687,39 @@ def search_chunks(
     user_context: UserContext | None = None,
     alias_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    init_app_db(settings)
     if settings.rag_store_backend == "postgres":
         from app.pg_rag import search_pg_chunks
 
-        return search_pg_chunks(
+        document_candidates = search_pg_chunks(
             settings,
             question,
             domain,
-            limit,
+            max(limit * 8, 40),
             keyword_weight=keyword_weight,
             vector_weight=vector_weight,
             user_context=user_context,
             alias_context=alias_context,
         )
+    else:
+        with connect_app(settings) as conn:
+            params: list[object] = []
+            query = "SELECT * FROM document_chunks"
+            if domain:
+                query += " WHERE domain = ?"
+                params.append(domain)
+            document_candidates = rows_to_dicts(conn.execute(query, params).fetchall())
 
-    init_app_db(settings)
+    document_candidates = [
+        {**row, "origin": "document"}
+        for row in document_candidates
+    ]
+    from app.wiki_rag_projection import load_visible_wiki_rows
+
     with connect_app(settings) as conn:
-        params: list[object] = []
-        query = "SELECT * FROM document_chunks"
-        if domain:
-            query += " WHERE domain = ?"
-            params.append(domain)
-        rows = rows_to_dicts(conn.execute(query, params).fetchall())
+        wiki_candidates = load_visible_wiki_rows(conn, domain)
 
+    rows = _merge_document_and_wiki_rows(document_candidates, wiki_candidates)
     rows = filter_rows_by_acl(rows, user_context)
     ranked = rank_search_rows(
         rows,

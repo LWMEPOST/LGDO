@@ -87,7 +87,7 @@ def test_postgres_rag_store_indexes_and_retrieves_chunks(tmp_path, monkeypatch):
         "/api/internal/ask",
         json={"question": "P1 故障多久内响应？", "domain": "product"},
     )
-    assert answer.status_code == 200
+    assert answer.status_code == 200, answer.text
     body = answer.json()
     assert body["citations"]
     service_source = next(source for source in client.get("/api/internal/sources?domain=product").json() if source["title"] == "service_sla")
@@ -231,3 +231,107 @@ def test_search_pg_chunks_falls_back_without_pgvector(monkeypatch):
 
     assert executed
     assert all("<=>" not in query for query in executed)
+
+
+def test_search_chunks_merges_postgres_and_visible_wiki_candidates(tmp_path, monkeypatch):
+    import app.pg_rag as pg_rag
+    import app.rag as rag
+    from app.config import Settings
+    from app.db import connect_app, init_app_db
+
+    settings = Settings(
+        database_backend="sqlite",
+        database_path=tmp_path / "metadata.db",
+        rag_store_backend="postgres",
+        _env_file=None,
+    )
+    init_app_db(settings)
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,rag_visible_revision_id,
+              projection_epoch,rag_visible_epoch,lifecycle_status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/refund.md",
+                "page_refund",
+                "product",
+                "faq",
+                "Refund FAQ",
+                '["source_document"]',
+                "approved",
+                "t0",
+                "t0",
+                "wrev_refund",
+                "wrev_refund",
+                3,
+                3,
+                "active",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_chunks(
+              id,page_id,revision_id,projection_epoch,chunk_index,page_path,
+              domain,title,text,token_json,embedding_json,embedding_model,
+              source_ids_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki_chunk_refund",
+                "page_refund",
+                "wrev_refund",
+                3,
+                0,
+                "wiki/product/refund.md",
+                "product",
+                "Refund FAQ",
+                "Wiki refund terms.",
+                '["wiki", "refund"]',
+                "[]",
+                "local-hash-v1",
+                '["source_document"]',
+                "t0",
+                "t0",
+            ),
+        )
+
+    pg_limits: list[int] = []
+    document_row = {
+        "id": "document_chunk_refund",
+        "source_id": "source_document",
+        "domain": "product",
+        "title": "Refund Policy",
+        "chunk_index": 0,
+        "text": "Document refund terms.",
+        "tokens": ["document", "refund"],
+        "metadata": {},
+        "embedding": [],
+    }
+
+    def fake_pg_search(_settings, _question, _domain, limit, **_kwargs):
+        pg_limits.append(limit)
+        return [document_row]
+
+    ranked_inputs: list[dict] = []
+
+    def capture_ranker(rows, _question, **_kwargs):
+        ranked_inputs.extend(rows)
+        return rows
+
+    monkeypatch.setattr(pg_rag, "search_pg_chunks", fake_pg_search)
+    monkeypatch.setattr(rag, "rank_search_rows", capture_ranker)
+    monkeypatch.setattr(rag, "diversify_ranked_rows", lambda rows, limit: rows[:limit])
+
+    result = rag.search_chunks(settings, "refund", domain="product", limit=5)
+
+    assert pg_limits == [40]
+    assert [row["origin"] for row in ranked_inputs] == ["wiki", "document"]
+    assert [row["id"] for row in ranked_inputs] == [
+        "wiki_chunk_refund",
+        "document_chunk_refund",
+    ]
+    assert result == ranked_inputs
