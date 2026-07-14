@@ -596,16 +596,16 @@ async function processExpectedPage(
     if (beforeHash !== expected.file_hash) throw new Error('raw file hash does not match manifest file_hash');
     newSlug = validateManifestIdentity(expected, read.markdown);
 
-    if (old && old.slug !== newSlug) {
-      const moved = await engine.updateSlug(old.slug, newSlug, { sourceId: input.source_id });
-      if (!moved) throw new Error(`rename affected zero rows: ${old.slug}`);
-      renamedFrom = old.slug;
-      if (!await verifyExternalIdentity(engine, input.source_id, expected.page_id, newSlug)) {
-        throw new Error(`forward rename identity verification failed: ${old.slug}`);
-      }
-    }
-
     try {
+      if (old && old.slug !== newSlug) {
+        const moved = await engine.updateSlug(old.slug, newSlug, { sourceId: input.source_id });
+        if (!moved) throw new Error(`rename affected zero rows: ${old.slug}`);
+        renamedFrom = old.slug;
+        if (!await verifyExternalIdentity(engine, input.source_id, expected.page_id, newSlug)) {
+          throw new Error(`forward rename identity verification failed: ${old.slug}`);
+        }
+      }
+
       const imported = await importFromContent(engine, newSlug, read.markdown, {
         sourceId: input.source_id,
         sourcePath: expected.path,

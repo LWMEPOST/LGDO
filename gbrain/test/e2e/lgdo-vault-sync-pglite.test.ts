@@ -314,6 +314,141 @@ describe('trusted LGDO Vault sync against PGLite', () => {
     expect(await engine.getPage('new/location', { sourceId: TASK4_SOURCE, includeDeleted: true })).toBeNull();
   });
 
+  test('compensates a rename when forward identity verification fails', async () => {
+    await resetTask4State();
+    const expected = writeTask4Page(
+      'new/verification.md',
+      'page-verification',
+      'rev-new',
+      'new verification content',
+    );
+    await engine.putPage('old/verification', {
+      type: 'concept',
+      title: 'Old verification',
+      compiled_truth: 'old verification content',
+      source_path: 'old/verification.md',
+      frontmatter: {
+        id: 'page-verification',
+        lgdo_page_id: 'page-verification',
+        lgdo_revision_id: 'rev-old',
+      },
+    }, { sourceId: TASK4_SOURCE });
+
+    const originalExecuteRaw = engine.executeRaw;
+    const originalUpdateSlug = engine.updateSlug;
+    let identityReads = 0;
+    const renameArgs: Parameters<PGLiteEngine['updateSlug']>[] = [];
+    (engine as any).executeRaw = async function (...args: Parameters<PGLiteEngine['executeRaw']>) {
+      if (args[0].includes("frontmatter->>'id' AS external_id")) {
+        identityReads += 1;
+        if (identityReads === 2) return [];
+      }
+      return originalExecuteRaw.call(this, ...args);
+    };
+    (engine as any).updateSlug = async function (...args: Parameters<PGLiteEngine['updateSlug']>) {
+      renameArgs.push(args);
+      return originalUpdateSlug.call(this, ...args);
+    };
+
+    let result;
+    try {
+      result = await runLgdoVaultSync(
+        task4Context(),
+        task4Input('incremental', [expected], 'forward-verification-compensation'),
+      );
+    } finally {
+      delete (engine as any).executeRaw;
+      delete (engine as any).updateSlug;
+    }
+
+    expect(result.pages[0].status).toBe('error');
+    expect(result.pages[0].error).toBe('forward rename identity verification failed: old/verification');
+    expect(renameArgs).toEqual([
+      ['old/verification', 'new/verification', { sourceId: TASK4_SOURCE }],
+      ['new/verification', 'old/verification', { sourceId: TASK4_SOURCE }],
+    ]);
+    expect(await engine.getPage('old/verification', {
+      sourceId: TASK4_SOURCE,
+      includeDeleted: true,
+    })).not.toBeNull();
+    expect(await engine.getPage('new/verification', {
+      sourceId: TASK4_SOURCE,
+      includeDeleted: true,
+    })).toBeNull();
+  });
+
+  test('requires recovery and protects both mappings when forward verification compensation fails', async () => {
+    await resetTask4State();
+    const expected = writeTask4Page(
+      'new/verification-recovery.md',
+      'page-verification-recovery',
+      'rev-new',
+      'new verification recovery content',
+    );
+    await engine.putPage('old/verification-recovery', {
+      type: 'concept',
+      title: 'Old verification recovery',
+      compiled_truth: 'old verification recovery content',
+      source_path: 'old/verification-recovery.md',
+      frontmatter: {
+        id: 'page-verification-recovery',
+        lgdo_page_id: 'page-verification-recovery',
+        lgdo_revision_id: 'rev-old',
+      },
+    }, { sourceId: TASK4_SOURCE });
+
+    const originalExecuteRaw = engine.executeRaw;
+    const originalUpdateSlug = engine.updateSlug;
+    let identityReads = 0;
+    const renameArgs: Parameters<PGLiteEngine['updateSlug']>[] = [];
+    (engine as any).executeRaw = async function (...args: Parameters<PGLiteEngine['executeRaw']>) {
+      if (args[0].includes("frontmatter->>'id' AS external_id")) {
+        identityReads += 1;
+        if (identityReads === 2) return [];
+      }
+      return originalExecuteRaw.call(this, ...args);
+    };
+    (engine as any).updateSlug = async function (...args: Parameters<PGLiteEngine['updateSlug']>) {
+      renameArgs.push(args);
+      if (renameArgs.length === 2) return false;
+      return originalUpdateSlug.call(this, ...args);
+    };
+
+    let result;
+    try {
+      result = await runLgdoVaultSync(
+        task4Context(),
+        task4Input('incremental', [expected], 'forward-verification-recovery'),
+      );
+    } finally {
+      delete (engine as any).executeRaw;
+      delete (engine as any).updateSlug;
+    }
+
+    expect(result.pages[0].status).toBe('recovery_required');
+    expect(result.pages[0].error).toBe(
+      'forward rename identity verification failed: old/verification-recovery',
+    );
+    expect(renameArgs).toEqual([
+      ['old/verification-recovery', 'new/verification-recovery', { sourceId: TASK4_SOURCE }],
+      ['new/verification-recovery', 'old/verification-recovery', { sourceId: TASK4_SOURCE }],
+    ]);
+    expect(result.pages[0].protected_mappings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        slug: 'old/verification-recovery',
+        source_path: 'old/verification-recovery.md',
+      }),
+      expect.objectContaining({
+        slug: 'new/verification-recovery',
+        source_path: 'new/verification-recovery.md',
+      }),
+    ]));
+    expect(await engine.getPage('new/verification-recovery', {
+      sourceId: TASK4_SOURCE,
+      includeDeleted: true,
+    })).not.toBeNull();
+  });
+
   test('returns recovery_required and persists both rename mappings through reconcile', async () => {
     await resetTask4State();
     const expected = writeTask4Page('new/recovery.md', 'page-recovery', 'rev-new', 'new recovery content');
