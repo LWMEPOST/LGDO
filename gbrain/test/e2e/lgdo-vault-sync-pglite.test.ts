@@ -2,14 +2,20 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import {
+  __setEmbedTransportForTests,
+  configureGateway,
+  resetGateway,
+} from '../../src/core/ai/gateway.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
 import {
   runLgdoVaultSync,
   type LgdoExpectedPage,
   type LgdoVaultSyncInput,
 } from '../../src/core/lgdo-vault-sync.ts';
-import type { OperationContext } from '../../src/core/operations.ts';
+import { operationsByName, type OperationContext } from '../../src/core/operations.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { awaitPendingSearchCacheWrites } from '../../src/core/search/hybrid.ts';
 
 let engine: PGLiteEngine;
 const TASK4_SOURCE = 'lgdo-e2e';
@@ -83,6 +89,7 @@ async function resetTask4State(): Promise<void> {
   mkdirSync(TASK4_ROOT, { recursive: true });
   process.env.GBRAIN_IMPORT_ALLOWED_ROOTS = realpathSync(TASK4_ROOT);
   await engine.executeRaw('DELETE FROM lgdo_vault_sync_runs WHERE source_id = $1', [TASK4_SOURCE]);
+  await engine.executeRaw('DELETE FROM query_cache WHERE source_id = $1', [TASK4_SOURCE]);
   await engine.executeRaw('DELETE FROM pages WHERE source_id = $1', [TASK4_SOURCE]);
   await engine.executeRaw(
     `INSERT INTO sources (id, name, local_path, config, archived)
@@ -98,6 +105,27 @@ async function resetTask4State(): Promise<void> {
       JSON.stringify({ lgdo_managed: true, lgdo_projection_client_id: TASK4_CLIENT }),
     ],
   );
+}
+
+type ProjectionHit = {
+  slug: string;
+  chunk_text?: string;
+  snippet?: string;
+  source_path?: string;
+  content_hash?: string;
+  page_generation?: number;
+};
+
+function projectionHitText(hit: ProjectionHit | undefined): string | undefined {
+  return hit?.chunk_text ?? hit?.snippet;
+}
+
+function fakeTask5Embeddings(count: number): { embeddings: number[][] } {
+  return {
+    embeddings: Array.from({ length: count }, () =>
+      Array.from({ length: 1536 }, (_, index) => index === 0 ? 1 : 0),
+    ),
+  };
 }
 
 async function pageGeneration(slug: string): Promise<number> {
@@ -117,6 +145,8 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => {
+  __setEmbedTransportForTests(null);
+  resetGateway();
   if (originalAllowedRoots === undefined) delete process.env.GBRAIN_IMPORT_ALLOWED_ROOTS;
   else process.env.GBRAIN_IMPORT_ALLOWED_ROOTS = originalAllowedRoots;
   rmSync(TASK4_TMP, { recursive: true, force: true });
@@ -224,6 +254,155 @@ describe('LGDO import contracts against PGLite', () => {
 });
 
 describe('trusted LGDO Vault sync against PGLite', () => {
+  test('rejects a legacy admin identity even when it is bound to the managed source', async () => {
+    await resetTask4State();
+    const expected = writeTask4Page(
+      'legacy-admin.md',
+      'page-legacy-admin',
+      'rev-legacy-admin',
+      'legacy admin must not project',
+    );
+    const syncOp = operationsByName.lgdo_vault_sync;
+    expect(syncOp, 'op registered: lgdo_vault_sync').toBeDefined();
+    if (!syncOp) return;
+
+    const context = task4Context();
+    context.auth = {
+      ...context.auth!,
+      clientId: 'legacy-admin',
+      scopes: ['admin'],
+    };
+
+    await expect(syncOp.handler(
+      context,
+      task4Input('incremental', [expected], 'legacy-admin-rejected') as unknown as Record<string, unknown>,
+    )).rejects.toThrow('caller is not the configured LGDO projection client');
+  });
+
+  test('rejects a canonical root that is not the managed source root', async () => {
+    await resetTask4State();
+    const expected = writeTask4Page(
+      'wrong-root.md',
+      'page-wrong-root',
+      'rev-wrong-root',
+      'wrong root must not project',
+    );
+    const wrongRoot = join(TASK4_TMP, 'other-vault');
+    mkdirSync(wrongRoot, { recursive: true });
+    const syncOp = operationsByName.lgdo_vault_sync;
+    expect(syncOp, 'op registered: lgdo_vault_sync').toBeDefined();
+    if (!syncOp) return;
+
+    await expect(syncOp.handler(
+      task4Context(),
+      {
+        ...task4Input('incremental', [expected], 'wrong-root-rejected'),
+        root: realpathSync(wrongRoot),
+      },
+    )).rejects.toThrow('root does not match source local_path');
+  });
+
+  test('invalidates cached old content and stamps current projection identity on query and search', async () => {
+    await resetTask4State();
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-fake' },
+    });
+    __setEmbedTransportForTests((async (args: { values: unknown[] }) =>
+      fakeTask5Embeddings(args.values.length)) as never);
+
+    const syncOp = operationsByName.lgdo_vault_sync;
+    const queryOp = operationsByName.query;
+    const searchOp = operationsByName.search;
+    expect(syncOp, 'op registered: lgdo_vault_sync').toBeDefined();
+    expect(queryOp).toBeDefined();
+    expect(searchOp).toBeDefined();
+    if (!syncOp || !queryOp || !searchOp) return;
+
+    try {
+      const oldExpected = writeTask4Page(
+        'cache-identity.md',
+        'page-cache-identity',
+        'rev-old',
+        'lgdotaskfivecachetoken old-snippet',
+      );
+      await syncOp.handler(
+        task4Context(),
+        task4Input('incremental', [oldExpected], 'cache-identity-old') as unknown as Record<string, unknown>,
+      );
+
+      const oldResults = await queryOp.handler(task4Context(), {
+        query: 'lgdotaskfivecachetoken',
+        limit: 10,
+        expand: false,
+        use_cache: true,
+      }) as ProjectionHit[];
+      expect(projectionHitText(oldResults.find((hit) => hit.slug === 'cache-identity'))).toContain('old-snippet');
+      expect(await awaitPendingSearchCacheWrites()).toEqual({ unfinished: 0 });
+
+      const cached = await engine.executeRaw<{ results: unknown }>(
+        `SELECT results FROM query_cache WHERE source_id = $1 ORDER BY created_at DESC`,
+        [TASK4_SOURCE],
+      );
+      expect(cached.length).toBeGreaterThan(0);
+      expect(JSON.stringify(cached[0].results)).toContain('old-snippet');
+
+      const newExpected = writeTask4Page(
+        'cache-identity.md',
+        'page-cache-identity',
+        'rev-new',
+        'lgdotaskfivecachetoken new-snippet',
+      );
+      await syncOp.handler(
+        task4Context(),
+        task4Input('incremental', [newExpected], 'cache-identity-new') as unknown as Record<string, unknown>,
+      );
+
+      const newResults = await queryOp.handler(task4Context(), {
+        query: 'lgdotaskfivecachetoken',
+        limit: 10,
+        expand: false,
+        use_cache: true,
+      }) as ProjectionHit[];
+      const queryHit = newResults.find((hit) => hit.slug === 'cache-identity');
+      expect(JSON.stringify(newResults)).not.toContain('old-snippet');
+      expect(projectionHitText(queryHit)).toContain('new-snippet');
+
+      const [identity] = await engine.executeRaw<{
+        source_path: string;
+        content_hash: string;
+        generation: number | string;
+      }>(
+        `SELECT source_path, content_hash, generation
+           FROM pages
+          WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+        [TASK4_SOURCE, 'cache-identity'],
+      );
+      expect(queryHit).toMatchObject({
+        source_path: identity.source_path,
+        content_hash: identity.content_hash,
+        page_generation: Number(identity.generation),
+      });
+
+      await engine.setConfig('search.mcp_keyword_only', 'true');
+      const searchResults = await searchOp.handler(task4Context(), {
+        query: 'lgdotaskfivecachetoken',
+        limit: 10,
+      }) as ProjectionHit[];
+      const searchHit = searchResults.find((hit) => hit.slug === 'cache-identity');
+      expect(projectionHitText(searchHit)).toContain('new-snippet');
+      expect(searchHit).toMatchObject({
+        source_path: identity.source_path,
+        content_hash: identity.content_hash,
+        page_generation: Number(identity.generation),
+      });
+    } finally {
+      __setEmbedTransportForTests(null);
+      resetGateway();
+    }
+  });
+
   test('restores a deleted page and force reimports the trusted revision', async () => {
     await resetTask4State();
     const expected = writeTask4Page('restore.md', 'page-restore', 'rev-new', 'restored through manifest sync');

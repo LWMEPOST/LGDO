@@ -24,7 +24,7 @@ import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
-import type { OperationContext, AuthInfo } from '../core/operations.ts';
+import type { Operation, OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
@@ -51,6 +51,44 @@ import {
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
+
+export function authorizeMcpOperation(
+  auth: AuthInfo,
+  op: Operation,
+): { ok: true } | { ok: false; message: string } {
+  const required = op.scope ?? 'read';
+  if (!hasScope(auth.scopes, required)) {
+    return { ok: false, message: `requires '${required}'` };
+  }
+  if (op.name === 'lgdo_vault_sync' && (!auth.sourceId || !auth.clientId)) {
+    return { ok: false, message: 'projection token must be source-bound' };
+  }
+  return { ok: true };
+}
+
+const parseMcpJson = express.json({ limit: '1mb' });
+
+export const mcpJsonBodyParser = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  parseMcpJson(req, res, (error?: unknown) => {
+    const payloadError = error as { status?: number; type?: string } | undefined;
+    if (payloadError?.status === 413 || payloadError?.type === 'entity.too.large') {
+      res.status(413).json({
+        error: 'payload_too_large',
+        message: 'Request body exceeds 1048576 bytes',
+      });
+      return;
+    }
+    if (error) {
+      next(error);
+      return;
+    }
+    next();
+  });
+};
 
 /**
  * v0.36.1.x #1024: bootstrap token resolution.
@@ -1434,7 +1472,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider }), async (req: Request, res: Response) => {
+  app.post('/mcp', mcpJsonBodyParser, requireBearerAuth({ verifier: oauthProvider }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
@@ -1522,8 +1560,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // sources_admin / users_admin scopes resolve through the same
       // hierarchy. Plain string includes() at this site would have made
       // sources_admin tokens look like they couldn't even read.)
-      const requiredScope = op.scope || 'read';
-      if (!hasScope(authInfo.scopes, requiredScope)) {
+      const authorization = authorizeMcpOperation(authInfo, op);
+      if (!authorization.ok) {
         // v0.28.10: persist scope-rejected attempts. Same operator-visibility
         // motivation as the unknown-op path — and it makes the v0.26.3
         // persistence regression test reliable across both rejection paths.
@@ -1533,7 +1571,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             engine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
+            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: ${authorization.message}`],
             [null],
           );
         } catch { /* best effort */ }
@@ -1543,7 +1581,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
           status: 'error',
-          error: { code: 'insufficient_scope', message: `requires '${requiredScope}'` },
+          error: { code: 'insufficient_scope', message: authorization.message },
           timestamp: new Date().toISOString(),
         });
         return {
@@ -1551,7 +1589,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             type: 'text',
             text: JSON.stringify({
               error: 'insufficient_scope',
-              message: `Operation ${name} requires '${requiredScope}' scope`,
+              message: `Operation ${name} ${authorization.message}`,
               your_scopes: authInfo.scopes,
             }),
           }],

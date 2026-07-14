@@ -10,6 +10,7 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
+import { runLgdoVaultSync, type LgdoVaultSyncInput } from './lgdo-vault-sync.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
@@ -1387,6 +1388,73 @@ const list_pages: Operation = {
 
 // --- Search ---
 
+type ProjectionStampedResult = SearchResult & {
+  source_path?: string | null;
+  content_hash?: string | null;
+  page_generation?: number;
+};
+
+interface ProjectionIdentityRow {
+  source_id: string;
+  slug: string;
+  source_path: string | null;
+  content_hash: string | null;
+  generation: number | string | null;
+  deleted_at: Date | string | null;
+}
+
+/**
+ * Attach the current database identity to result rows, including rows loaded
+ * from query cache. Matching stays composite-keyed on source + slug, and
+ * deleted or missing pages deliberately receive no identity metadata.
+ */
+async function stampProjectionIdentity(
+  engine: BrainEngine,
+  rows: SearchResult[],
+): Promise<void> {
+  if (rows.length === 0) return;
+
+  const mutableRows = rows as ProjectionStampedResult[];
+  const slugsBySource = new Map<string, Set<string>>();
+  for (const row of mutableRows) {
+    delete row.source_path;
+    delete row.content_hash;
+    delete row.page_generation;
+    const sourceId = row.source_id ?? 'default';
+    const slugs = slugsBySource.get(sourceId) ?? new Set<string>();
+    slugs.add(row.slug);
+    slugsBySource.set(sourceId, slugs);
+  }
+
+  const identities = new Map<string, ProjectionIdentityRow>();
+  for (const [sourceId, slugs] of slugsBySource) {
+    try {
+      const pages = await engine.executeRaw<ProjectionIdentityRow>(
+        `SELECT source_id, slug, source_path, content_hash, generation, deleted_at
+           FROM pages
+          WHERE source_id = $1 AND slug = ANY($2::text[])`,
+        [sourceId, [...slugs]],
+      );
+      for (const page of pages) {
+        if (page.deleted_at == null) identities.set(`${page.source_id}\0${page.slug}`, page);
+      }
+    } catch {
+      // Diagnostic metadata is fail-open for pre-migration or degraded brains.
+    }
+  }
+
+  for (const row of mutableRows) {
+    const sourceId = row.source_id ?? 'default';
+    const identity = identities.get(`${sourceId}\0${row.slug}`);
+    if (!identity) continue;
+    const generation = Number(identity.generation);
+    if (!Number.isFinite(generation)) continue;
+    row.source_path = identity.source_path;
+    row.content_hash = identity.content_hash;
+    row.page_generation = generation;
+  }
+}
+
 const search: Operation = {
   name: 'search',
   description: SEARCH_DESCRIPTION,
@@ -1421,6 +1489,7 @@ const search: Operation = {
       // agent-warning channel (hybridSearch stamps it; this branch bypasses
       // hybridSearch, so stamp explicitly). Fail-open inside the helper.
       await stampContentFlags(ctx.engine, results);
+      await stampProjectionIdentity(ctx.engine, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
       return results;
@@ -1437,6 +1506,7 @@ const search: Operation = {
       ...(perCallMode ? { mode: perCallMode } : {}),
       onMeta: (m) => { capturedMeta = m; },
     });
+    await stampProjectionIdentity(ctx.engine, results);
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
@@ -1583,6 +1653,7 @@ const query: Operation = {
         embeddingColumn: 'embedding_image',
         ...querySourceScope,
       });
+      await stampProjectionIdentity(ctx.engine, results);
       return results;
     }
 
@@ -1643,6 +1714,7 @@ const query: Operation = {
       // v0.43 — relational recall override. Omitted = smart default (mode bundle).
       relationalRetrieval: typeof p.relational === 'boolean' ? (p.relational as boolean) : undefined,
     });
+    await stampProjectionIdentity(ctx.engine, results);
     const latency_ms = Date.now() - startedAt;
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
@@ -2524,6 +2596,24 @@ const sync_brain: Operation = {
     });
   },
   cliHints: { name: 'sync', hidden: true },
+};
+
+const lgdo_vault_sync: Operation = {
+  name: 'lgdo_vault_sync',
+  description: 'Synchronize a source-bound LGDO Vault from a trusted revision manifest.',
+  mutating: true,
+  scope: 'write',
+  params: {
+    source_id: { type: 'string', required: true },
+    root: { type: 'string', required: true },
+    mode: { type: 'string', required: true, enum: ['incremental', 'reconcile'] },
+    expected_pages: { type: 'array', required: true, items: { type: 'object' } },
+    protected_mappings: { type: 'array', required: true, items: { type: 'object' } },
+    no_embed: { type: 'boolean', required: true },
+    idempotency_key: { type: 'string', required: true },
+  },
+  handler: async (ctx, params) =>
+    runLgdoVaultSync(ctx, params as unknown as LgdoVaultSyncInput),
 };
 
 // --- Raw Data ---
@@ -5043,7 +5133,7 @@ export const operations: Operation[] = [
   // v0.41.19.0: thin-client `gbrain status` payload (admin-scope, sync + cycle only)
   get_status_snapshot,
   // Sync
-  sync_brain,
+  sync_brain, lgdo_vault_sync,
   // Raw data
   put_raw_data, get_raw_data,
   // Resolution & chunks
