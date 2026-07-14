@@ -7,10 +7,11 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
@@ -79,8 +80,8 @@ class FakeLlamaServer:
 @dataclass(frozen=True)
 class GBrainTestServer:
     endpoint: str
-    query_token: str
-    projection_token: str
+    query_token: str = field(repr=False)
+    projection_token: str = field(repr=False)
     source_id: str
     root: Path
     process: subprocess.Popen[str]
@@ -216,12 +217,32 @@ def _creation_flags(*, server: bool = False) -> int:
     return flags
 
 
+def _redact_sensitive_output(value: str) -> str:
+    redacted = re.sub(
+        r"(?im)(Client Secret:\s*)\S+",
+        r"\1[REDACTED]",
+        value,
+    )
+    redacted = re.sub(
+        r'''(?i)(["']?access[_ -]?token["']?\s*[:=]\s*["']?)[^"'\s,}]+''',
+        r"\1[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", redacted)
+    return re.sub(
+        r"\bgbrain_(?:cs|at|rt)_[A-Za-z0-9._~+/=-]+\b",
+        "[REDACTED]",
+        redacted,
+    )
+
+
 def _run_bun(
     bun: Path,
     env: dict[str, str],
     *args: str,
     timeout: float = 120,
     cwd: Path = GBRAIN_REPO,
+    redact_sensitive_output: bool = False,
 ) -> str:
     completed = subprocess.run(
         [os.fspath(bun), *args],
@@ -237,11 +258,18 @@ def _run_bun(
         check=False,
     )
     if completed.returncode != 0:
+        rendered_args = repr(args)
+        stdout = completed.stdout[-4000:]
+        stderr = completed.stderr[-4000:]
+        if redact_sensitive_output:
+            rendered_args = _redact_sensitive_output(rendered_args)
+            stdout = _redact_sensitive_output(stdout)
+            stderr = _redact_sensitive_output(stderr)
         raise AssertionError(
             "Bun command failed "
-            f"({completed.returncode}): {args!r}\n"
-            f"stdout:\n{completed.stdout[-4000:]}\n"
-            f"stderr:\n{completed.stderr[-4000:]}"
+            f"({completed.returncode}): {rendered_args}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
         )
     return completed.stdout
 
@@ -251,15 +279,28 @@ def _run_cli(
     env: dict[str, str],
     *args: str,
     timeout: float = 120,
+    redact_sensitive_output: bool = False,
 ) -> str:
-    return _run_bun(bun, env, "run", "src/cli.ts", *args, timeout=timeout)
+    return _run_bun(
+        bun,
+        env,
+        "run",
+        "src/cli.ts",
+        *args,
+        timeout=timeout,
+        redact_sensitive_output=redact_sensitive_output,
+    )
 
 
 def _parse_client_credentials(output: str) -> tuple[str, str]:
     client_id = re.search(r"Client ID:\s+(\S+)", output)
     client_secret = re.search(r"Client Secret:\s+(\S+)", output)
     if client_id is None or client_secret is None:
-        raise AssertionError(f"OAuth registration omitted credentials:\n{output}")
+        redacted = _redact_sensitive_output(output)
+        raise AssertionError(
+            "OAuth registration omitted credentials; redacted output tail:\n"
+            f"{redacted[-2000:]}"
+        )
     return client_id.group(1), client_secret.group(1)
 
 
@@ -320,7 +361,10 @@ def _mint_token(
     payload = response.json()
     token = payload.get("access_token") if isinstance(payload, dict) else None
     if not isinstance(token, str) or not token:
-        raise AssertionError(f"OAuth token response omitted access_token: {payload!r}")
+        raise AssertionError(
+            "OAuth token response omitted access_token: "
+            f"{_redact_sensitive_output(repr(payload))}"
+        )
     return token
 
 
@@ -351,8 +395,20 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
 
 
 def _is_directory_link(path: Path) -> bool:
-    is_junction = getattr(path, "is_junction", None)
-    return path.is_symlink() or bool(is_junction and is_junction())
+    try:
+        entry_stat = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AssertionError(f"unable to classify filesystem entry: {path}") from exc
+    if stat.S_ISLNK(entry_stat.st_mode):
+        return True
+    if os.name != "nt":
+        return False
+    file_attributes = getattr(entry_stat, "st_file_attributes", None)
+    if file_attributes is None:
+        raise AssertionError(f"Windows lstat omitted file attributes: {path}")
+    return bool(file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _remove_tree_entry(path: Path) -> None:
@@ -497,6 +553,7 @@ def gbrain_pglite_server(
         "--source",
         source_id,
         timeout=60,
+        redact_sensitive_output=True,
     )
     query_client_id, query_client_secret = _parse_client_credentials(query_output)
 
@@ -513,6 +570,7 @@ def gbrain_pglite_server(
         "--source",
         source_id,
         timeout=60,
+        redact_sensitive_output=True,
     )
     projection_client_id, projection_client_secret = _parse_client_credentials(
         projection_output

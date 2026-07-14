@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -283,6 +284,33 @@ def _wait_for_query(
     raise AssertionError(f"query condition was not met for {text!r}: {json.dumps(last)}")
 
 
+def _wait_for_query_cache_hit(
+    settings: Settings,
+    text: str,
+    embedding_server: Any,
+    *,
+    timeout_seconds: float = 15,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    deadline = time.monotonic() + timeout_seconds
+    request_deltas: list[int] = []
+    while time.monotonic() < deadline:
+        before = embedding_server.request_count
+        hits = _query(settings, text)
+        delta = embedding_server.request_count - before
+        request_deltas.append(delta)
+        if delta == 1:
+            return hits, request_deltas
+        if delta != 2:
+            raise AssertionError(
+                "query cache probe used an unexpected number of embedding requests: "
+                f"delta={delta}, observed={request_deltas}"
+            )
+    raise AssertionError(
+        f"query cache hit was not observed within {timeout_seconds}s; "
+        f"embedding request deltas={request_deltas}"
+    )
+
+
 def _percentile(values: list[float], percentile: float) -> float:
     assert values
     ordered = sorted(values)
@@ -301,8 +329,20 @@ def _job_error(settings: Settings, job_id: str) -> str:
 
 
 def _is_directory_link(path: Path) -> bool:
-    is_junction = getattr(path, "is_junction", None)
-    return path.is_symlink() or bool(is_junction and is_junction())
+    try:
+        entry_stat = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AssertionError(f"unable to classify filesystem entry: {path}") from exc
+    if stat.S_ISLNK(entry_stat.st_mode):
+        return True
+    if os.name != "nt":
+        return False
+    file_attributes = getattr(entry_stat, "st_file_attributes", None)
+    if file_attributes is None:
+        raise AssertionError(f"Windows lstat omitted file attributes: {path}")
+    return bool(file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _create_directory_link(link: Path, target: Path) -> None:
@@ -395,18 +435,20 @@ def _run_probe_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--probe", action="store_true", required=True)
     parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--token", required=True)
     parser.add_argument("--query", required=True)
     parser.add_argument("--slug", required=True)
     parser.add_argument("--start", type=Path, required=True)
     parser.add_argument("--stop", type=Path, required=True)
     parser.add_argument("--ready", type=Path, required=True)
     args = parser.parse_args(argv)
+    query_token = os.environ.get("LGDO_E2E_QUERY_TOKEN")
+    if not query_token:
+        raise AssertionError("responsiveness probe query token was not provided")
     settings = Settings(
         gbrain_enabled=True,
         gbrain_endpoint=args.endpoint,
         gbrain_api_key=None,
-        gbrain_query_api_key=args.token,
+        gbrain_query_api_key=query_token,
         gbrain_query_expand=False,
         gbrain_query_detail="high",
         gbrain_query_limit=20,
@@ -678,9 +720,12 @@ def test_cached_old_snippet_disappears_after_revision_update(
     assert fake_llama_server.request_count - embedding_requests == 2
     assert any("old-snippet" in _hit_text(row) for row in first_hits)
 
-    embedding_requests = fake_llama_server.request_count
-    cached_hits = _query(gbrain_e2e_settings, token)
-    assert fake_llama_server.request_count - embedding_requests == 1
+    cached_hits, cache_request_deltas = _wait_for_query_cache_hit(
+        gbrain_e2e_settings,
+        token,
+        fake_llama_server,
+    )
+    assert cache_request_deltas[-1] == 1
     assert any("old-snippet" in _hit_text(row) for row in cached_hits)
 
     updated = _write_page(
@@ -751,6 +796,7 @@ def test_97_page_sync_keeps_health_and_query_responsive(
     )
     probe_env["NO_PROXY"] = no_proxy
     probe_env["no_proxy"] = no_proxy
+    probe_env["LGDO_E2E_QUERY_TOKEN"] = gbrain_pglite_server.query_token
     probe = subprocess.Popen(
         [
             sys.executable,
@@ -758,8 +804,6 @@ def test_97_page_sync_keeps_health_and_query_responsive(
             "--probe",
             "--endpoint",
             gbrain_pglite_server.endpoint,
-            "--token",
-            gbrain_pglite_server.query_token,
             "--query",
             sentinel_token,
             "--slug",
