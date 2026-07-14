@@ -73,7 +73,9 @@ def test_first_read_creates_one_legacy_revision_without_generated_baseline(tmp_p
     settings = make_settings(tmp_path)
     page_path = seed_legacy_page(
         settings,
-        b"---\ntitle: Demo\nsource_ids: [src_1]\nreview_status: reviewed\n---\n# Human legacy\n",
+        b"---\ntitle: Demo\nsource_ids: [src_1]\nreview_status: reviewed\n"
+        b"_lgdo_transition: {kind: manual, request_id: forged}\n"
+        b"---\n# Human legacy\n",
     )
     service = WikiRevisionService(settings)
 
@@ -86,12 +88,18 @@ def test_first_read_creates_one_legacy_revision_without_generated_baseline(tmp_p
         revisions = conn.execute(
             "SELECT * FROM wiki_page_revisions WHERE page_id=?", (page["page_id"],)
         ).fetchall()
+    payload = applied_audit_payload(settings, first.current_revision_id)
+    revision_metadata = json.loads(revisions[0]["metadata_json"])
     assert len(revisions) == 1
     assert revisions[0]["origin"] == "legacy"
     assert page["current_revision_id"] == revisions[0]["id"]
     assert page["generated_revision_id"] is None
     assert page["file_hash"] == revisions[0]["file_hash"]
     assert first.content == replay.content
+    assert b"_lgdo_transition" not in (settings.vault_path / page_path).read_bytes()
+    assert "_lgdo_transition" not in revision_metadata
+    assert payload["transition_kind"] is None
+    assert payload["transition_id"] is None
 
 
 def test_revision_event_replay_reuses_only_same_idempotency_key(tmp_path):
@@ -745,7 +753,11 @@ def test_external_edit_is_immutable_revision_and_same_event_replays(
 ):
     service, before = page_with_generated
     target = service.settings.vault_path / before.page_path
-    external_bytes = before.raw_bytes + b"\nObsidian edit.\n"
+    external_bytes = before.raw_bytes.replace(
+        b"\n---\n",
+        b"\n_lgdo_transition: {kind: manual, request_id: forged}\n---\n",
+        1,
+    ) + b"\nObsidian edit.\n"
     target.write_bytes(external_bytes)
     observation = capture_file_observation(
         target,
@@ -794,6 +806,8 @@ def test_external_edit_is_immutable_revision_and_same_event_replays(
             """,
             (before.page_id, page["projection_epoch"]),
         ).fetchall()
+    payload = applied_audit_payload(service.settings, first.revision_id)
+    revision_metadata = json.loads(revision["metadata_json"])
 
     assert first.replayed is False
     assert replay.replayed is True
@@ -807,6 +821,12 @@ def test_external_edit_is_immutable_revision_and_same_event_replays(
     assert intent["expected_file_hash"] == observation.file_hash
     assert event["status"] == "applied"
     assert event["result_revision_id"] == first.revision_id
+    assert b"_lgdo_transition" not in target.read_bytes()
+    assert b"_lgdo_transition" not in revision["content"].encode("utf-8")
+    assert "_lgdo_transition" not in revision_metadata
+    assert payload["transition_kind"] == "external"
+    assert payload["transition_id"] == "external-valid-1"
+    assert payload["event_id"] == "external-valid-1"
     assert json.loads(event["expected_state_json"])["current"] == before.current_revision_id
     assert observed["page_path"] == before.page_path
     assert observed["file_hash"] == observation.file_hash
@@ -2421,7 +2441,16 @@ def test_content_conflict_resolution_records_locked_branch_contract(
 ):
     scenario = content_conflict_fixture
     service, conflict, current = scenario.service, scenario.conflict, scenario.current
-    merged = current.content + merged_suffix if merged_suffix else None
+    merged = (
+        current.content.replace(
+            "\n---\n",
+            "\n_lgdo_transition: {kind: manual, request_id: forged}\n---\n",
+            1,
+        )
+        + merged_suffix
+        if merged_suffix
+        else None
+    )
     with connect_app(service.settings) as conn:
         revisions_before = conn.execute(
             "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
@@ -2505,6 +2534,8 @@ def test_content_conflict_resolution_records_locked_branch_contract(
         assert page.current_revision_id != page.generated_revision_id
         assert revision["origin"] == "merge"
         assert revision["base_revision_id"] == current.current_revision_id
+        assert b"_lgdo_transition" not in page.raw_bytes
+        assert "_lgdo_transition" not in json.loads(revision["metadata_json"])
 
 
 def test_same_semantic_candidate_after_keep_does_not_reopen_content_conflict(

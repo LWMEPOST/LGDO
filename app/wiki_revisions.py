@@ -17,6 +17,7 @@ from app.timeutil import now_iso
 from app.wiki_markdown import (
     FileObservationInput,
     MarkdownParseError,
+    ParsedWikiDocument,
     compute_file_hash,
     compute_semantic_hash,
     parse_wiki_bytes,
@@ -36,6 +37,13 @@ MutationStatus = Literal[
 ]
 
 VALID_REVIEW_STATUSES = frozenset({"draft", "reviewed", "stale", "rejected"})
+_TRANSITION_METADATA_KEY = "_lgdo_transition"
+
+
+def _strip_transition_marker(document: ParsedWikiDocument) -> bool:
+    had_marker = _TRANSITION_METADATA_KEY in document.frontmatter
+    document.frontmatter.pop(_TRANSITION_METADATA_KEY, None)
+    return had_marker
 
 
 def _copy_file_no_replace(
@@ -414,9 +422,11 @@ class WikiRevisionService:
                 )
                 if pending is not None:
                     metadata = json.loads(pending["metadata_json"] or "{}")
-                    source_semantic_hash = compute_semantic_hash(
-                        parse_wiki_bytes(command.content.encode("utf-8"))
+                    source_document = parse_wiki_bytes(
+                        command.content.encode("utf-8")
                     )
+                    _strip_transition_marker(source_document)
+                    source_semantic_hash = compute_semantic_hash(source_document)
                     if (
                         pending["origin"] == "generated"
                         and pending["semantic_hash"] == source_semantic_hash
@@ -491,6 +501,7 @@ class WikiRevisionService:
                 revision_id = f"wrev_{uuid.uuid4().hex}"
                 write_token = f"write_{uuid.uuid4().hex}"
                 document = parse_wiki_bytes(original)
+                _strip_transition_marker(document)
                 rendered = render_managed_frontmatter(
                     document,
                     page_id=page_id,
@@ -2297,6 +2308,7 @@ class WikiRevisionService:
                     else:
                         try:
                             document = parse_wiki_bytes(content)
+                            _strip_transition_marker(document)
                             source_ids = _source_ids(_plain(document.frontmatter))
                             status_value = document.frontmatter.get(
                                 "review_status",
@@ -2491,6 +2503,10 @@ class WikiRevisionService:
         if existing is not None:
             return RevisionRecord.from_row(existing)
         document = parse_wiki_bytes(content)
+        if _strip_transition_marker(document):
+            raise WikiRevisionError(
+                "reserved transition marker reached revision creation"
+            )
         old_number = int(page["revision_number"] or 0)
         next_number = old_number + 1
         record = RevisionRecord(
@@ -2737,6 +2753,7 @@ class WikiRevisionService:
             )
         try:
             document = parse_wiki_bytes(content)
+            _strip_transition_marker(document)
             _source_ids(_plain(document.frontmatter))
             _review_status(document.frontmatter.get("review_status"))
         except MarkdownParseError as exc:
@@ -2814,6 +2831,7 @@ class WikiRevisionService:
             document.frontmatter.get("review_status")
             or page.get("review_status")
         )
+        _strip_transition_marker(document)
         rendered = render_managed_frontmatter(
             document,
             page_id=page["page_id"],
@@ -4450,7 +4468,7 @@ class WikiRevisionService:
                     document.frontmatter[key] = value
                 if owner is not None:
                     document.frontmatter["owner"] = owner
-                document.frontmatter.pop("_lgdo_transition", None)
+                _strip_transition_marker(document)
                 if review_status_required:
                     status_value = review_status
                 elif "review_status" in document.frontmatter:
@@ -4469,7 +4487,7 @@ class WikiRevisionService:
                 )
                 final_document = parse_wiki_bytes(rendered)
                 metadata = _plain(final_document.frontmatter)
-                metadata["_lgdo_transition"] = {
+                metadata[_TRANSITION_METADATA_KEY] = {
                     "kind": transition_prefix,
                     "request_id": request_id,
                 }
@@ -4675,7 +4693,7 @@ class WikiRevisionService:
                 f"{command.source_hash}:{command.compiler_version}:"
             )
             source_document = parse_wiki_bytes(command.content.encode("utf-8"))
-            source_document.frontmatter.pop("_lgdo_transition", None)
+            _strip_transition_marker(source_document)
             candidate_semantic_hash = compute_semantic_hash(source_document)
             latest_generated = locked.conn.execute(
                 """
@@ -4719,7 +4737,7 @@ class WikiRevisionService:
                 revision_metadata = _plain(final_document.frontmatter)
                 revision_metadata["source_hash"] = command.source_hash
                 revision_metadata["compiler_version"] = command.compiler_version
-                revision_metadata["_lgdo_transition"] = {
+                revision_metadata[_TRANSITION_METADATA_KEY] = {
                     "kind": "compile",
                     "compile_job_id": command.compile_job_id,
                 }
@@ -5556,6 +5574,7 @@ class WikiRevisionService:
                     document = parse_wiki_bytes(
                         command.merged_content.encode("utf-8")
                     )
+                    _strip_transition_marker(document)
                     effective_status = _review_status(
                         document.frontmatter.get("review_status")
                         or locked.page.get("review_status")
@@ -5974,7 +5993,7 @@ class WikiRevisionService:
                 )
             return identity
 
-        transition = metadata.get("_lgdo_transition")
+        transition = metadata.get(_TRANSITION_METADATA_KEY)
         if not isinstance(transition, dict):
             return identity
         kind = transition.get("kind")
