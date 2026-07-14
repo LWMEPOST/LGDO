@@ -8,7 +8,7 @@
 # shape (id, slug, type, title) without source_id — the exact pre-v0.32.8
 # pattern that codex's plan review flagged.
 #
-# Usage: scripts/check-source-id-projection.sh
+# Usage: bash scripts/check-source-id-projection.sh
 # Exit:  0 when no matches, 1 when matches found.
 
 set -euo pipefail

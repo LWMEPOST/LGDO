@@ -68,7 +68,7 @@
     "check:no-double-retry": "scripts/check-no-double-retry.sh",
     "check:batch-audit-site": "scripts/check-batch-audit-site.sh",
     "check:worker-lock-renewal-shape": "scripts/check-worker-lock-renewal-shape.sh",
-    "check:source-id-projection": "scripts/check-source-id-projection.sh",
+    "check:source-id-projection": "bash scripts/check-source-id-projection.sh",
     "check:privacy": "scripts/check-privacy.sh",
     "check:proposal-pii": "scripts/check-proposal-pii.sh",
     "check:eval-glossary": "scripts/check-eval-glossary-fresh.sh",
