@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime as real_datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -185,6 +186,12 @@ def test_refresh_merges_all_json_configs_and_replaces_non_json_assets(tmp_path):
     )
     template_path = vault / "templates" / "Wiki Page.md"
     template_path.write_text("user drift\n", encoding="utf-8")
+    original_bytes = {
+        ".obsidian/app.json": app_path.read_bytes(),
+        ".obsidian/core-plugins.json": plugins_path.read_bytes(),
+        ".obsidian/templates.json": templates_path.read_bytes(),
+        "templates/Wiki Page.md": template_path.read_bytes(),
+    }
 
     result = ensure_obsidian_vault(vault, refresh=True)
 
@@ -207,7 +214,9 @@ def test_refresh_merges_all_json_configs_and_replaces_non_json_assets(tmp_path):
     assert templates_config == {"folder": "templates", "dateFormat": "YYYY-MM-DD"}
     assert template_path.read_bytes() == (obsidian.RESOURCE_ROOT / "templates" / "Wiki Page.md").read_bytes()
     assert result.backup_dir is not None
-    assert (result.backup_dir / "templates" / "Wiki Page.md").read_text(encoding="utf-8") == "user drift\n"
+    for relative_path, expected_bytes in original_bytes.items():
+        assert (result.backup_dir / relative_path).read_bytes() == expected_bytes
+    assert list(result.backup_dir.parent.iterdir()) == [result.backup_dir]
 
 
 def test_json_refresh_replace_failure_preserves_original_and_removes_temp(tmp_path, monkeypatch):
@@ -367,6 +376,49 @@ def test_cli_errors_are_json_on_stderr_and_return_two(tmp_path, capsys, monkeypa
     captured = capsys.readouterr()
     assert not captured.out
     assert json.loads(captured.err) == {"error": "cannot install"}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["install"],
+        ["unknown-command"],
+    ],
+    ids=["missing-required-argument", "unknown-command"],
+)
+def test_cli_parse_errors_are_single_json_on_stderr(argv, capsys):
+    assert main(argv) == 2
+
+    captured = capsys.readouterr()
+    assert not captured.out
+    error = json.loads(captured.err)
+    assert set(error) == {"error"}
+    assert error["error"]
+
+
+def test_module_cli_missing_argument_exits_two_with_json_stderr():
+    completed = subprocess.run(
+        [sys.executable, "-m", "app.obsidian", "install"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert not completed.stdout
+    error = json.loads(completed.stderr)
+    assert set(error) == {"error"}
+    assert error["error"]
+
+
+def test_benchmark_note_names_the_versioned_indexes_directory():
+    benchmark_source = (REPO_ROOT / "scripts" / "rag_benchmark_test_data.py").read_text(
+        encoding="utf-8"
+    )
+    assert "vault/raw, normalized, jsonl, wiki, indexes and logs materialized on disk" in benchmark_source
+    assert "vault/raw, normalized, jsonl, wiki, index and logs materialized on disk" not in benchmark_source
 
 
 def test_legacy_index_migration_moves_deduplicates_and_quarantines(tmp_path):

@@ -26,6 +26,15 @@ COPY_IF_MISSING = (
 )
 
 
+class _CliArgumentError(Exception):
+    pass
+
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _CliArgumentError(message)
+
+
 @dataclass(frozen=True)
 class ObsidianInstallResult:
     vault_path: Path
@@ -180,7 +189,7 @@ def _result_json(result: ObsidianInstallResult) -> dict[str, Any]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m app.obsidian")
+    parser = _JsonArgumentParser(prog="python -m app.obsidian")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     install_parser = subparsers.add_parser("install")
@@ -194,8 +203,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
     try:
+        args = _build_parser().parse_args(argv)
         if args.command == "install":
             payload = {
                 "operation": "install",

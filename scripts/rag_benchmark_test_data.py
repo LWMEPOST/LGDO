@@ -737,7 +737,7 @@ def collect_chain_metrics(
             "status": "ok",
             "metric": "vault_files",
             "value": obsidian_metrics["total_files"],
-            "note": "vault/raw, normalized, jsonl, wiki, index and logs materialized on disk",
+            "note": "vault/raw, normalized, jsonl, wiki, indexes and logs materialized on disk",
         },
         {
             "chain": "deepseek",
