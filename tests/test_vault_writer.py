@@ -968,6 +968,28 @@ def wiki_intent_fixture(tmp_path):
     with connect_app(settings) as conn:
         conn.execute(
             """
+            INSERT INTO sources(
+              id,domain,title,source_type,original_path,raw_path,content_hash,
+              size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "src_intent",
+                "product",
+                "Intent source",
+                "markdown",
+                "intent-source.md",
+                "raw/product/src_intent.md",
+                "a" * 64,
+                1,
+                "active",
+                "{}",
+                "t0",
+                "t0",
+            ),
+        )
+        conn.execute(
+            """
             INSERT INTO wiki_pages(
               path,domain,page_type,title,source_ids_json,review_status,created_at,updated_at
             ) VALUES (?,?,?,?,?,?,?,?)
@@ -1900,10 +1922,34 @@ def test_recovery_matrix_preserves_unknown_bytes_and_pointer_invariants(
             ).fetchone()
         assert revision["origin"] == "external"
         assert metadata["recovery_intent_id"] == scenario.intent_id
+        assert successor["revision_id"] == revision["id"]
         assert event["status"] == "prepared"
         assert event["observation_id"] == metadata["observation_id"]
-        assert event["result_revision_id"] == revision["id"]
+        assert event["result_revision_id"] is None
+        assert event["result_payload_json"] is None
         assert old_intent["executor_owner"] is None
+
+        finalized = IntentExecutor(
+            scenario.settings,
+            owner="matrix-successor-finalize",
+        ).execute(successor["id"])
+        with connect_app(scenario.settings) as conn:
+            terminal_event = conn.execute(
+                "SELECT * FROM vault_change_events WHERE id=?",
+                (metadata["vault_change_event_id"],),
+            ).fetchone()
+        terminal_payload = json.loads(terminal_event["result_payload_json"])
+        assert finalized is not None
+        assert finalized.intent_status == "applied"
+        assert terminal_event["status"] == "applied"
+        assert terminal_event["result_revision_id"] == revision["id"]
+        assert terminal_payload["revision_id"] == revision["id"]
+        assert terminal_payload["current_revision_id"] == revision["id"]
+        assert terminal_event["result_payload_json"] == json.dumps(
+            terminal_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     elif target_kind == "unknown" and backup_kind == "unknown":
         assert page["current_revision_id"] == scenario.current_revision_id
         assert page["pending_write_intent_id"] == scenario.intent_id
@@ -2465,7 +2511,8 @@ def test_ambiguous_recovery_conflict_can_resolve_through_successor_intent(
     assert audit_payload["primary_observation_id"] == metadata["observation_id"]
     assert metadata["recovery_intent_id"] == scenario.intent_id
     assert candidate_event["status"] == "prepared"
-    assert candidate_event["result_revision_id"] == candidate["id"]
+    assert candidate_event["result_revision_id"] is None
+    assert candidate_event["result_payload_json"] is None
 
     result = WikiRevisionService(scenario.settings).resolve_conflict(
         ResolveConflictCommand(
@@ -2517,8 +2564,19 @@ def test_ambiguous_recovery_conflict_can_resolve_through_successor_intent(
     assert scenario.target_path.read_bytes() == current["content"].encode("utf-8")
     if resolution == "keep_current":
         assert page["current_revision_id"] == scenario.current_revision_id
+        assert resolved_event["result_revision_id"] is None
+        assert resolved_event["result_payload_json"] is None
     else:
         assert page["current_revision_id"] == review["candidate_revision_id"]
+        terminal_payload = json.loads(resolved_event["result_payload_json"])
+        assert resolved_event["result_revision_id"] == candidate["id"]
+        assert terminal_payload["revision_id"] == candidate["id"]
+        assert terminal_payload["current_revision_id"] == candidate["id"]
+        assert resolved_event["result_payload_json"] == json.dumps(
+            terminal_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     replay = IntentExecutor(
         scenario.settings,
         owner=f"replay-resolved-{resolution}",
@@ -3010,7 +3068,8 @@ def test_retained_backup_each_hash_change_reconciles_one_concurrent_conflict(
     assert first_candidate["base_revision_id"] == scenario.current_revision_id
     assert first_event["status"] == "prepared"
     assert first_event["observation_id"] == first_observation["id"]
-    assert first_event["result_revision_id"] == first_candidate["id"]
+    assert first_event["result_revision_id"] is None
+    assert first_event["result_payload_json"] is None
 
     second_bytes = _valid_wiki_variant(
         scenario.backup_bytes,
@@ -3063,8 +3122,11 @@ def test_retained_backup_each_hash_change_reconciles_one_concurrent_conflict(
     assert pending[0]["candidate_revision_id"] != first_review["candidate_revision_id"]
     assert old_review["status"] == "superseded"
     assert old_event["status"] == "superseded"
+    assert old_event["result_revision_id"] is None
+    assert old_event["result_payload_json"] is None
     assert new_event["status"] == "prepared"
-    assert new_event["result_revision_id"] == new_candidate["id"]
+    assert new_event["result_revision_id"] is None
+    assert new_event["result_payload_json"] is None
     assert counts_after_second == (
         counts_after_first[0] + 1,
         counts_after_first[1] + 1,
@@ -3112,7 +3174,11 @@ def test_retained_backup_each_hash_change_reconciles_one_concurrent_conflict(
     assert cycled == [scenario.intent_id]
     assert len(cycled_pending) == 1
     assert second_event["status"] == "superseded"
+    assert second_event["result_revision_id"] is None
+    assert second_event["result_payload_json"] is None
     assert cycled_event["status"] == "prepared"
+    assert cycled_event["result_revision_id"] is None
+    assert cycled_event["result_payload_json"] is None
     assert cycled_event["id"] != first_event["id"]
     assert counts_after_cycle == (
         counts_after_second[0],

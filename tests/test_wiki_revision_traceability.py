@@ -27,6 +27,30 @@ def traceable_generated_page(tmp_path):
     page_path = "wiki/product/faq/traceability.md"
     (settings.vault_path / page_path).parent.mkdir(parents=True)
     init_app_db(settings)
+    timestamp = "2026-07-15T00:00:00+00:00"
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,title,source_type,original_path,raw_path,content_hash,
+              size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "src_trace",
+                "product",
+                "Trace source",
+                "markdown",
+                "src_trace.md",
+                "raw/product/src_trace.md",
+                "a" * 64,
+                1,
+                "active",
+                "{}",
+                timestamp,
+                timestamp,
+            ),
+        )
 
     service = WikiRevisionService(settings)
     generated = service.apply_generated_candidate(
@@ -114,6 +138,7 @@ def test_revision_lifecycle_is_auditable_reachable_and_immutable(
         status_page.page_path,
         capture_file_observation(old_target, max_content_bytes=1_000_000),
     )
+    assert external.status == "applied"
     remember_revision(external.revision_id)
     external_page = service.get_page(status_page.page_path)
 
@@ -139,6 +164,8 @@ def test_revision_lifecycle_is_auditable_reachable_and_immutable(
         renamed_path,
         capture_file_observation(renamed_target, max_content_bytes=1_000_000),
     )
+    assert restored.status == "applied"
+    assert restored.revision_id != external.revision_id
     remember_revision(restored.revision_id)
     restored_page = service.get_page(renamed_path)
 
@@ -246,6 +273,7 @@ def test_revision_lifecycle_is_auditable_reachable_and_immutable(
         "trace-manual",
         "trace-status",
         "trace-external",
+        "trace-restore",
         "trace-resolve",
     }
     applied_expectations = (
@@ -278,11 +306,18 @@ def test_revision_lifecycle_is_auditable_reachable_and_immutable(
             status.revision_id,
         ),
         (
+            "trace-restore",
+            "external",
+            restored,
+            "external",
+            external.revision_id,
+        ),
+        (
             "trace-resolve",
             "conflict_resolution",
             resolved,
             "merge",
-            external.revision_id,
+            restored.revision_id,
         ),
     )
     for transition_id, kind, result, origin, base_revision_id in applied_expectations:
@@ -299,7 +334,8 @@ def test_revision_lifecycle_is_auditable_reachable_and_immutable(
     )
     for request_id in ("trace-manual", "trace-status", "trace-resolve"):
         assert applied_by_transition[request_id]["request_id"] == request_id
-    assert applied_by_transition["trace-external"]["event_id"] == "trace-external"
+    for event_id in ("trace-external", "trace-restore"):
+        assert applied_by_transition[event_id]["event_id"] == event_id
 
     prepared_audits = [
         payload
@@ -354,15 +390,6 @@ def test_revision_lifecycle_is_auditable_reachable_and_immutable(
     assert deleted_audit["page_id"] == page_id
     assert deleted_audit["current_revision_id"] == deleted.revision_id
     assert deleted_audit["path"] == renamed_path
-
-    restored_audit = one_audit(
-        "wiki_external_change_reused_current",
-        "event_id",
-        "trace-restore",
-    )
-    assert restored_audit["page_id"] == page_id
-    assert restored_audit["revision_id"] == restored.revision_id
-    assert restored_audit["observation_id"] == restored.observation_id
 
     prepared_resolution = one_audit(
         "wiki_conflict_resolution_prepared",

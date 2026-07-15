@@ -12,20 +12,567 @@ from app.db import connect_app, connect_app_write, init_app_db
 from app.ingest import scan_sources
 from app.models import CompileRequest, ScanRequest
 from app.wiki import compile_wiki
-from app.wiki_markdown import MarkdownParseError, capture_file_observation
+from app.wiki_markdown import (
+    MarkdownParseError,
+    capture_file_observation,
+    parse_wiki_bytes,
+)
 from app.wiki_revisions import (
+    SYNC_ISSUE_REFS_METADATA_KEY,
     CompileCandidateCommand,
     ManualSaveCommand,
     MetadataUpdateCommand,
+    MutationResult,
     PageReadResult,
     ResolveConflictCommand,
     RevisionConflict,
     StatusUpdateCommand,
     WikiRevisionError,
     WikiRevisionService,
+    _decode_sync_issue_refs,
+    _upsert_sync_issue_locked,
     canonical_state_json,
 )
 from app.vault_writer import IntentExecutor
+
+
+def external_page_bytes(
+    *,
+    title="External",
+    source_ids=(),
+    domain="product",
+    body="Body",
+) -> bytes:
+    rendered_sources = ", ".join(source_ids)
+    return (
+        "---\n"
+        f"title: {title}\n"
+        f"source_ids: [{rendered_sources}]\n"
+        f"domain: {domain}\n"
+        "page_type: feature\n"
+        "review_status: draft\n"
+        "owner:\n"
+        "---\n"
+        f"# {title}\n{body}\n"
+    ).encode("utf-8")
+
+
+def seed_source(settings, source_id: str, *, domain="product", status="active") -> None:
+    timestamp = "2026-07-15T00:00:00+00:00"
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,title,source_type,original_path,raw_path,content_hash,
+              size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                source_id,
+                domain,
+                source_id,
+                "markdown",
+                source_id,
+                f"raw/{domain}/{source_id}.md",
+                "a" * 64,
+                1,
+                status,
+                "{}",
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
+def test_mutation_result_round_trips_nullable_page_and_sync_issue():
+    result = MutationResult(
+        page_id=None,
+        page_path="wiki/product/broken.md",
+        status="invalid",
+        sync_issue_id="visi_broken",
+    )
+    assert MutationResult.from_event_payload(result.to_event_payload()) == result
+
+
+def test_external_new_page_accepts_empty_sources_and_creates_managed_revision(tmp_path):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    page_path = "wiki/product/new-empty.md"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(external_page_bytes(source_ids=()))
+    service = WikiRevisionService(settings)
+
+    applied = service.ingest_external_change(
+        "external-new-empty",
+        page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+
+    with connect_app(settings) as conn:
+        page = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE path=?", (page_path,)
+            ).fetchone()
+        )
+        revision = dict(
+            conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (page["current_revision_id"],),
+            ).fetchone()
+        )
+    assert applied.status == "applied"
+    assert applied.page_id == page["page_id"]
+    assert json.loads(page["source_ids_json"]) == []
+    assert revision["origin"] == "external"
+
+
+@pytest.mark.parametrize(
+    ("source_id", "status", "expected_code"),
+    [
+        ("src_missing", None, "unknown_source"),
+        ("src_inactive", "inactive", "inactive_source"),
+    ],
+)
+def test_external_sources_must_exist_and_be_active(
+    tmp_path, source_id, status, expected_code
+):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    if status is not None:
+        seed_source(settings, source_id, status=status)
+    page_path = "wiki/product/source-check.md"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(external_page_bytes(source_ids=(source_id,)))
+
+    service = WikiRevisionService(settings)
+    event_id = f"external-{expected_code}"
+    observation = capture_file_observation(
+        target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+    )
+    result = service.ingest_external_change(event_id, page_path, observation)
+    replay = service.ingest_external_change(event_id, page_path, observation)
+
+    assert result.status == "invalid"
+    assert result.page_id is None
+    assert result.sync_issue_id
+    assert replay.replayed is True
+    assert replay.to_event_payload() | {"replayed": False} == result.to_event_payload()
+    with connect_app(settings) as conn:
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "wiki_pages",
+                "wiki_page_revisions",
+                "vault_write_intents",
+                "review_items",
+                "knowledge_projection_jobs",
+            )
+        }
+        assert counts == {table: 0 for table in counts}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vault_sync_issues WHERE page_path=?",
+            (page_path,),
+        ).fetchone()[0] == 1
+
+
+def test_active_source_from_another_domain_is_valid(tmp_path):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    seed_source(settings, "src_support", domain="support", status="active")
+    page_path = "wiki/product/cross-domain.md"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(
+        external_page_bytes(source_ids=("src_support",), domain="product")
+    )
+    result = WikiRevisionService(settings).ingest_external_change(
+        "external-cross-domain",
+        page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert result.status == "applied"
+    assert result.page_id is not None
+
+
+def test_unknown_invalid_external_file_has_no_fake_domain_rows(tmp_path):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    page_path = "wiki/product/unknown-invalid.md"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"---\ntitle: [broken\n---\n# Broken\n")
+    result = WikiRevisionService(settings).ingest_external_change(
+        "external-unknown-invalid",
+        page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    with connect_app(settings) as conn:
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "wiki_pages",
+                "wiki_page_revisions",
+                "vault_write_intents",
+                "review_items",
+                "knowledge_projection_jobs",
+            )
+        }
+        observation_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_file_observations WHERE page_path=?",
+            (page_path,),
+        ).fetchone()[0]
+        event = conn.execute(
+            "SELECT status,result_payload_json FROM vault_change_events WHERE id=?",
+            ("external-unknown-invalid",),
+        ).fetchone()
+        issue_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM vault_sync_issues
+            WHERE page_path=? AND status='open'
+            """,
+            (page_path,),
+        ).fetchone()[0]
+    assert result.page_id is None
+    assert result.sync_issue_id
+    assert counts == {table: 0 for table in counts}
+    assert observation_count == 1
+    assert issue_count == 1
+    assert event["status"] == "invalid"
+    assert json.loads(event["result_payload_json"])["sync_issue_id"] == result.sync_issue_id
+    replay = WikiRevisionService(settings).ingest_external_change(
+        "external-unknown-invalid",
+        page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert replay.replayed is True
+    assert replay.sync_issue_id == result.sync_issue_id
+
+
+OPTIONAL_MUTATION_RESULT_ID_FIELDS = (
+    "page_id",
+    "revision_id",
+    "current_revision_id",
+    "generated_revision_id",
+    "candidate_revision_id",
+    "write_intent_id",
+    "conflict_review_id",
+    "observation_id",
+    "audit_revision_id",
+    "sync_issue_id",
+)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        *[(field_name, 0) for field_name in OPTIONAL_MUTATION_RESULT_ID_FIELDS],
+        pytest.param("projection_job_ids", 0, id="jobs-int"),
+        pytest.param("projection_job_ids", False, id="jobs-bool"),
+        pytest.param("projection_job_ids", "job_1", id="jobs-string"),
+        pytest.param("projection_job_ids", ["job_1", 2], id="jobs-mixed"),
+        pytest.param("replayed", "false", id="stored-replayed-string"),
+        pytest.param("replayed", 0, id="stored-replayed-zero"),
+        pytest.param("replayed", 1, id="stored-replayed-one"),
+        pytest.param("replayed", None, id="stored-replayed-null"),
+        pytest.param("page_path", 0, id="page-path-int"),
+        pytest.param("page_path", False, id="page-path-bool"),
+        pytest.param("page_path", None, id="page-path-null"),
+    ],
+)
+def test_corrupt_terminal_result_payload_fails_as_revision_conflict(
+    legacy_page_fixture, field_name, bad_value
+):
+    service, before = legacy_page_fixture
+    (service.settings.vault_path / before.page_path).unlink()
+    result = service.delete_page("delete-corrupt-result", before.page_path)
+    assert result.status == "deleted"
+    with connect_app(service.settings) as conn:
+        row = conn.execute(
+            "SELECT result_payload_json FROM vault_change_events WHERE id=?",
+            ("delete-corrupt-result",),
+        ).fetchone()
+        payload = json.loads(row["result_payload_json"])
+        payload[field_name] = bad_value
+        conn.execute(
+            "UPDATE vault_change_events SET result_payload_json=? WHERE id=?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                "delete-corrupt-result",
+            ),
+        )
+    with pytest.raises(RevisionConflict, match="vault event result payload is invalid"):
+        service.delete_page("delete-corrupt-result", before.page_path)
+
+
+@pytest.mark.parametrize("bad_replayed", ["false", 0, 1, None])
+def test_mutation_result_codec_rejects_non_boolean_replay_argument(bad_replayed):
+    payload = MutationResult(
+        page_id=None,
+        page_path="wiki/product/invalid.md",
+        status="invalid",
+    ).to_event_payload()
+    with pytest.raises(RevisionConflict, match="vault event result payload is invalid"):
+        MutationResult.from_event_payload(payload, replayed=bad_replayed)
+
+
+def test_mutation_result_codec_rejects_unhashable_status():
+    payload = MutationResult(
+        page_id=None,
+        page_path="wiki/product/invalid.md",
+        status="invalid",
+    ).to_event_payload()
+    payload["status"] = []
+    with pytest.raises(RevisionConflict, match="vault event result payload is invalid"):
+        MutationResult.from_event_payload(payload)
+
+
+def test_legacy_pending_external_intent_recovers_without_fabricated_event_result(
+    legacy_page_fixture, monkeypatch
+):
+    service, before = legacy_page_fixture
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(before.raw_bytes + b"\nLegacy pending recovery.\n")
+
+    def interrupt_execute(self, intent_id):
+        raise RuntimeError("stop after external preparation")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(IntentExecutor, "execute", interrupt_execute)
+        with pytest.raises(RuntimeError, match="stop after external preparation"):
+            service.ingest_external_change(
+                "legacy-pending-intent",
+                before.page_path,
+                capture_file_observation(
+                    target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+                ),
+            )
+    with connect_app(service.settings) as conn:
+        prepared_intent = conn.execute(
+            """
+            SELECT i.id,i.status,i.revision_id
+            FROM wiki_pages AS p
+            JOIN vault_write_intents AS i ON i.id=p.pending_write_intent_id
+            WHERE p.page_id=?
+            """,
+            (before.page_id,),
+        ).fetchone()
+        assert prepared_intent["status"] == "pending"
+        prepared_intent_id = prepared_intent["id"]
+        prepared_revision_id = prepared_intent["revision_id"]
+        conn.execute(
+            """
+            UPDATE vault_change_events
+            SET payload_digest='',result_revision_id=?,result_payload_json=NULL
+            WHERE id='legacy-pending-intent'
+            """,
+            (prepared_revision_id,),
+        )
+    IntentExecutor(service.settings).reconcile_all()
+    with connect_app(service.settings) as conn:
+        event = conn.execute(
+            """
+            SELECT status,payload_digest,result_revision_id,result_payload_json
+            FROM vault_change_events WHERE id='legacy-pending-intent'
+            """
+        ).fetchone()
+        intent = conn.execute(
+            """
+            SELECT status FROM vault_write_intents WHERE id=?
+            """,
+            (prepared_intent_id,),
+        ).fetchone()
+    assert intent["status"] == "applied"
+    assert event["status"] == "legacy_applied_unreplayable"
+    assert event["payload_digest"] == ""
+    assert event["result_revision_id"] == prepared_revision_id
+    assert event["result_payload_json"] is None
+    with pytest.raises(
+        RevisionConflict,
+        match="legacy vault event has no authoritative result payload",
+    ):
+        service.ingest_external_change(
+            "legacy-pending-intent",
+            before.page_path,
+            capture_file_observation(
+                target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+            ),
+        )
+
+
+def test_legacy_pending_external_intent_rejects_different_result_revision(
+    legacy_page_fixture, monkeypatch
+):
+    service, before = legacy_page_fixture
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(before.raw_bytes + b"\nLegacy mismatched result.\n")
+
+    def interrupt_execute(self, intent_id):
+        raise RuntimeError("stop after external preparation")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(IntentExecutor, "execute", interrupt_execute)
+        with pytest.raises(RuntimeError, match="stop after external preparation"):
+            service.ingest_external_change(
+                "legacy-mismatched-result",
+                before.page_path,
+                capture_file_observation(
+                    target,
+                    max_content_bytes=1_000_000,
+                    prefix_bytes=64 * 1024,
+                ),
+            )
+    with connect_app(service.settings) as conn:
+        page_before = conn.execute(
+            """
+            SELECT current_revision_id,pending_write_intent_id,projection_epoch
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (before.page_id,),
+        ).fetchone()
+        prepared_intent = conn.execute(
+            "SELECT revision_id FROM vault_write_intents WHERE id=?",
+            (page_before["pending_write_intent_id"],),
+        ).fetchone()
+        assert prepared_intent["revision_id"] != before.current_revision_id
+        conn.execute(
+            """
+            UPDATE vault_change_events
+            SET payload_digest='',result_revision_id=?,result_payload_json=NULL
+            WHERE id='legacy-mismatched-result'
+            """,
+            (before.current_revision_id,),
+        )
+
+    IntentExecutor(service.settings).reconcile_all()
+
+    with connect_app(service.settings) as conn:
+        page_after = conn.execute(
+            """
+            SELECT current_revision_id,pending_write_intent_id,projection_epoch
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (before.page_id,),
+        ).fetchone()
+        intent_after = conn.execute(
+            "SELECT status FROM vault_write_intents WHERE id=?",
+            (page_before["pending_write_intent_id"],),
+        ).fetchone()
+        event_after = conn.execute(
+            """
+            SELECT status,result_revision_id,result_payload_json
+            FROM vault_change_events WHERE id='legacy-mismatched-result'
+            """
+        ).fetchone()
+    assert tuple(page_after) == tuple(page_before)
+    assert intent_after["status"] == "recovery_required"
+    assert tuple(event_after) == ("prepared", before.current_revision_id, None)
+
+
+def test_recovery_candidate_result_is_written_only_at_terminal_finalize(
+    legacy_page_fixture,
+):
+    service, before = legacy_page_fixture
+    event_id = "recovery-candidate-terminal-result"
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(before.raw_bytes + b"\nRecovered external bytes.\n")
+    captured = capture_file_observation(
+        target,
+        max_content_bytes=1_000_000,
+        prefix_bytes=64 * 1024,
+    )
+    target.write_bytes(before.raw_bytes)
+
+    def prepare_candidate():
+        with service.coordinator.lock_page(before.page_path) as locked:
+            observation = service._persist_observation_locked(
+                locked.conn,
+                locked.page,
+                captured,
+            )
+            expected_state_json = canonical_state_json(
+                service._canonical_state_locked(locked.conn, locked.page)
+            )
+            return service._create_external_candidate_locked(
+                locked.conn,
+                locked.page,
+                observation=observation,
+                event_id=event_id,
+                expected_state_json=expected_state_json,
+                actor="vault-recovery",
+                metadata_extra={"recovery_source": "target"},
+            )
+
+    def stored_event():
+        with connect_app(service.settings) as conn:
+            return dict(
+                conn.execute(
+                    "SELECT * FROM vault_change_events WHERE id=?",
+                    (event_id,),
+                ).fetchone()
+            )
+
+    first_candidate = prepare_candidate()
+    with service.coordinator.lock_page(before.page_path) as locked:
+        review_id = service._seed_concurrent_review_locked(
+            locked.conn,
+            locked.page,
+            candidate=first_candidate,
+            event_id=event_id,
+        )
+    first_event = stored_event()
+
+    replayed_candidate = prepare_candidate()
+    with service.coordinator.lock_page(before.page_path) as locked:
+        replayed_review_id = service._seed_concurrent_review_locked(
+            locked.conn,
+            locked.page,
+            candidate=replayed_candidate,
+            event_id=event_id,
+        )
+    replayed_event = stored_event()
+
+    assert first_candidate.id == replayed_candidate.id
+    assert review_id == replayed_review_id
+    for event in (first_event, replayed_event):
+        assert event["status"] == "prepared"
+        assert event["result_revision_id"] is None
+        assert event["result_payload_json"] is None
+
+    resolved = service.resolve_conflict(
+        ResolveConflictCommand(
+            review_id=review_id,
+            resolution="accept_candidate",
+            merged_content=None,
+            expected_current_revision_id=before.current_revision_id,
+            expected_generated_revision_id=before.generated_revision_id,
+            request_id="accept-recovery-candidate",
+            actor="recovery-admin",
+            note=None,
+        )
+    )
+    terminal_event = stored_event()
+    terminal_payload = json.loads(terminal_event["result_payload_json"])
+
+    assert resolved.status == "resolved"
+    assert terminal_event["status"] == "applied"
+    assert terminal_event["result_revision_id"] == first_candidate.id
+    assert terminal_payload["revision_id"] == first_candidate.id
+    assert terminal_payload["current_revision_id"] == first_candidate.id
+    assert terminal_event["result_payload_json"] == json.dumps(
+        terminal_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def make_settings(tmp_path: Path):
@@ -41,6 +588,7 @@ def make_settings(tmp_path: Path):
 def seed_legacy_page(settings, content: bytes) -> str:
     page_path = "wiki/product/faq/demo.md"
     (settings.vault_path / page_path).write_bytes(content)
+    seed_source(settings, "src_1")
     with connect_app(settings) as conn:
         conn.execute(
             """
@@ -1549,6 +2097,101 @@ def test_pending_external_event_retries_after_transition_transaction_rollback(
     assert len(jobs) == 2
 
 
+def test_corrupt_pending_external_result_rolls_back_preparation(
+    page_with_generated,
+    monkeypatch,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    external_bytes = before.raw_bytes + b"\nCorrupt pending event result.\n"
+    target.write_bytes(external_bytes)
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    event_id = "external-corrupt-pending-result"
+    original_canonical_state = service._canonical_state_locked
+    calls = 0
+
+    def fail_first_canonical_state(conn, page):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated transition crash")
+        return original_canonical_state(conn, page)
+
+    monkeypatch.setattr(
+        service,
+        "_canonical_state_locked",
+        fail_first_canonical_state,
+    )
+    with pytest.raises(RuntimeError, match="simulated transition crash"):
+        service.ingest_external_change(event_id, before.page_path, observation)
+    monkeypatch.setattr(
+        service,
+        "_canonical_state_locked",
+        original_canonical_state,
+    )
+
+    def snapshot():
+        with connect_app(service.settings) as conn:
+            return {
+                "event": dict(
+                    conn.execute(
+                        "SELECT * FROM vault_change_events WHERE id=?",
+                        (event_id,),
+                    ).fetchone()
+                ),
+                "page": tuple(
+                    conn.execute(
+                        """
+                        SELECT current_revision_id,pending_write_intent_id,
+                               revision_number,projection_epoch,file_hash
+                        FROM wiki_pages WHERE page_id=?
+                        """,
+                        (before.page_id,),
+                    ).fetchone()
+                ),
+                "external_revisions": conn.execute(
+                    """
+                    SELECT COUNT(*) FROM wiki_page_revisions
+                    WHERE page_id=? AND origin='external'
+                    """,
+                    (before.page_id,),
+                ).fetchone()[0],
+                "external_intents": conn.execute(
+                    """
+                    SELECT COUNT(*) FROM vault_write_intents AS intent
+                    JOIN wiki_page_revisions AS revision
+                      ON revision.id=intent.revision_id
+                    WHERE revision.page_id=? AND revision.origin='external'
+                    """,
+                    (before.page_id,),
+                ).fetchone()[0],
+            }
+
+    with connect_app(service.settings) as conn:
+        corrupt_revision_id = "wrev_inconsistent_pending_result"
+        conn.execute(
+            """
+            UPDATE vault_change_events SET result_revision_id=?
+            WHERE id=? AND status='pending' AND payload_digest<>''
+              AND result_payload_json IS NULL
+            """,
+            (corrupt_revision_id, event_id),
+        )
+    before_retry = snapshot()
+    assert before_retry["event"]["payload_digest"]
+    assert before_retry["event"]["result_revision_id"] == corrupt_revision_id
+
+    with pytest.raises(RevisionConflict):
+        service.ingest_external_change(event_id, before.page_path, observation)
+
+    after_retry = snapshot()
+    assert after_retry == before_retry
+    assert target.read_bytes() == external_bytes
+
+
 def test_pending_invalid_event_keeps_original_expected_state_after_crash(
     page_with_generated,
     monkeypatch,
@@ -1686,13 +2329,13 @@ def test_pending_external_event_resumes_matching_prepared_intent(
             "SELECT * FROM wiki_pages WHERE page_id=?",
             (before.page_id,),
         ).fetchone()
-        revision = conn.execute(
-            "SELECT * FROM wiki_page_revisions WHERE id=?",
-            (pending_event["result_revision_id"],),
-        ).fetchone()
         intent = conn.execute(
             "SELECT * FROM vault_write_intents WHERE id=?",
             (page["pending_write_intent_id"],),
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?",
+            (intent["revision_id"],),
         ).fetchone()
         jobs_before = conn.execute(
             """
@@ -1703,7 +2346,8 @@ def test_pending_external_event_resumes_matching_prepared_intent(
         ).fetchone()[0]
     revision_metadata = json.loads(revision["metadata_json"])
 
-    assert pending_event["status"] == "pending"
+    assert pending_event["status"] == "prepared"
+    assert pending_event["result_revision_id"] is None
     assert pending_event["observation_id"] == revision_metadata["observation_id"]
     assert revision_metadata["vault_change_event_id"] == event_id
     assert revision["origin"] == "external"
@@ -3420,30 +4064,31 @@ def test_delete_and_restore_same_revision_each_create_new_projection_epoch(
     )
     assert deleted_page["projection_epoch"] == before.projection_epoch + 1
     assert restored.status == "applied"
-    assert restored.revision_id == before.current_revision_id
-    assert restored.write_intent_id is None
+    assert restored.revision_id != before.current_revision_id
+    assert restored.write_intent_id is not None
     assert restored_replay.replayed is True
-    assert restored_replay.revision_id == before.current_revision_id
-    assert after.current_revision_id == before.current_revision_id
+    assert restored_replay.revision_id == restored.revision_id
+    assert after.current_revision_id == restored.revision_id
     assert after.generated_revision_id == before.generated_revision_id
     assert (
         after.accepted_generated_revision_id
         == before.accepted_generated_revision_id
     )
-    assert after.raw_bytes == original
+    assert after.raw_bytes != original
+    assert parse_wiki_bytes(after.raw_bytes).body == parse_wiki_bytes(original).body
     assert after.lifecycle_status == "active"
     assert after.sync_error is None
     assert after.projection_epoch == before.projection_epoch + 2
     assert stored["deleted_at"] is None
     assert stored["observed_file_hash"] == observation.file_hash
-    assert revisions_after == revision_count_before
+    assert revisions_after == revision_count_before + 1
     assert {event["id"]: event["status"] for event in events} == {
         "delete-1": "applied",
         "restore-1": "applied",
     }
     assert {event["id"]: event["result_revision_id"] for event in events} == {
         "delete-1": before.current_revision_id,
-        "restore-1": before.current_revision_id,
+        "restore-1": restored.revision_id,
     }
     assert {
         (
@@ -3460,13 +4105,13 @@ def test_delete_and_restore_same_revision_each_create_new_projection_epoch(
             before.projection_epoch + 2,
             "rag",
             "upsert",
-            before.current_revision_id,
+            restored.revision_id,
         ),
         (
             before.projection_epoch + 2,
             "gbrain",
             "upsert",
-            before.current_revision_id,
+            restored.revision_id,
         ),
     }
 
@@ -3756,8 +4401,8 @@ def test_pending_delete_loser_supersedes_after_winner_restore(
         ).fetchone()
     assert loser["status"] == "superseded"
     assert page["lifecycle_status"] == "active"
-    assert page["current_revision_id"] == before.current_revision_id
-    assert target.read_bytes() == before.raw_bytes
+    assert page["current_revision_id"] != before.current_revision_id
+    assert target.read_bytes() != before.raw_bytes
 
 
 @pytest.mark.parametrize("lifecycle", ["deleted", "invalid"])
@@ -3846,3 +4491,655 @@ def test_ensure_projection_jobs_rebuilds_desired_delete_without_old_epoch(
         page_before["rag_visible_revision_id"],
         page_before["rag_visible_epoch"],
     )
+
+
+def test_deleted_identical_bytes_restore_creates_new_external_revision(
+    legacy_page_fixture,
+):
+    service, before = legacy_page_fixture
+    (service.settings.vault_path / before.page_path).unlink()
+    service.delete_page("delete-before-restore", before.page_path)
+    target = service.settings.vault_path / before.page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(before.raw_bytes)
+    restored = service.ingest_external_change(
+        "restore-identical",
+        before.page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert restored.status == "applied"
+    assert restored.revision_id != before.current_revision_id
+    with connect_app(service.settings) as conn:
+        revision = conn.execute(
+            "SELECT origin FROM wiki_page_revisions WHERE id=?",
+            (restored.revision_id,),
+        ).fetchone()
+    assert revision["origin"] == "external"
+
+
+def test_invalid_identical_historical_bytes_restore_creates_new_external_revision(
+    legacy_page_fixture,
+):
+    service, before = legacy_page_fixture
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(b"---\ntitle: [broken\n---\n# Broken\n")
+    invalid = service.ingest_external_change(
+        "invalid-before-identical-restore",
+        before.page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert invalid.status == "invalid"
+    target.write_bytes(before.raw_bytes)
+    restored = service.ingest_external_change(
+        "invalid-identical-restore",
+        before.page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert restored.status == "applied"
+    assert restored.revision_id != before.current_revision_id
+
+
+def test_relocate_with_edit_is_one_external_revision_and_atomic(
+    legacy_page_fixture,
+):
+    service, before = legacy_page_fixture
+    old_path = before.page_path
+    new_path = "wiki/product/faq/relocated.md"
+    old_target = service.settings.vault_path / old_path
+    new_target = service.settings.vault_path / new_path
+    new_target.parent.mkdir(parents=True, exist_ok=True)
+    edited = before.raw_bytes.replace(b"# Demo", b"# Relocated")
+    old_target.rename(new_target)
+    new_target.write_bytes(edited)
+    result = service.relocate_external_change(
+        "relocate-edited",
+        old_path,
+        new_path,
+        before.page_id,
+        capture_file_observation(
+            new_target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert result.status == "applied"
+    assert result.revision_id != before.current_revision_id
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?", (before.page_id,)
+        ).fetchone()
+        revision = conn.execute(
+            "SELECT * FROM wiki_page_revisions WHERE id=?", (result.revision_id,)
+        ).fetchone()
+    assert page["path"] == new_path
+    assert revision["origin"] == "external"
+    assert revision["page_path"] == new_path
+
+
+def test_exact_rename_stays_audit_only(legacy_page_fixture):
+    service, before = legacy_page_fixture
+    new_path = "wiki/product/faq/exact-renamed.md"
+    old_target = service.settings.vault_path / before.page_path
+    new_target = service.settings.vault_path / new_path
+    new_target.parent.mkdir(parents=True, exist_ok=True)
+    old_target.rename(new_target)
+    result = service.rename_page("rename-exact", before.page_path, new_path)
+    assert result.status == "renamed"
+    assert result.current_revision_id == before.current_revision_id
+    assert result.audit_revision_id != before.current_revision_id
+
+
+def test_finalize_external_revision_syncs_all_page_fields_and_clears_owner(
+    legacy_page_fixture,
+):
+    service, before = legacy_page_fixture
+    seed_source(service.settings, "src_cross", domain="support", status="active")
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(
+        external_page_bytes(
+            title="Changed title",
+            source_ids=("src_cross",),
+            domain="operations",
+            body="Changed",
+        ).replace(b"page_type: feature", b"page_type: policy")
+    )
+    applied = service.ingest_external_change(
+        "finalize-six-fields",
+        before.page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert applied.status == "applied"
+    with connect_app(service.settings) as conn:
+        page = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?", (before.page_id,)
+            ).fetchone()
+        )
+    assert (
+        page["title"],
+        page["domain"],
+        page["page_type"],
+        json.loads(page["source_ids_json"]),
+        page["review_status"],
+        page["owner"],
+    ) == ("Changed title", "operations", "policy", ["src_cross"], "draft", None)
+
+
+class StopAfterRepairInstall(RuntimeError):
+    pass
+
+
+def create_real_invalid_issue(service, event_id: str, page_path: str):
+    target = service.settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"---\ntitle: [broken\n---\n# Broken\n")
+    invalid = service.ingest_external_change(
+        event_id,
+        page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert invalid.status == "invalid"
+    assert invalid.sync_issue_id is not None
+    with connect_app(service.settings) as conn:
+        issue = dict(
+            conn.execute(
+                "SELECT * FROM vault_sync_issues WHERE id=?",
+                (invalid.sync_issue_id,),
+            ).fetchone()
+        )
+    assert issue["status"] == "open"
+    assert issue["generation"] == 1
+    return target, issue
+
+
+def prepare_real_repair_without_finalize(
+    monkeypatch, service, event_id: str, page_path: str, target
+):
+    installed: dict[str, str] = {}
+
+    def install_only(executor, intent_id):
+        installed["intent_id"] = intent_id
+        installed["owner"] = executor.owner
+        assert executor.claim(intent_id, lease_seconds=30)
+        executor.capture_and_install(intent_id, stop_after="installed")
+        raise StopAfterRepairInstall("repair installed before finalize")
+
+    observation = capture_file_observation(
+        target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(IntentExecutor, "execute", install_only)
+        with pytest.raises(
+            StopAfterRepairInstall,
+            match="repair installed before finalize",
+        ):
+            service.ingest_external_change(event_id, page_path, observation)
+    return installed
+
+
+@pytest.mark.parametrize("bump_after_prepare", [False, True])
+def test_successful_repair_resolves_only_captured_issue_generation(
+    tmp_path, monkeypatch, bump_after_prepare
+):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    service = WikiRevisionService(settings)
+    page_path = "wiki/product/repair.md"
+    target, issue = create_real_invalid_issue(service, "repair-invalid", page_path)
+    target.write_bytes(
+        external_page_bytes(
+            title="Repaired page",
+            source_ids=(),
+            domain="product",
+            body="Repaired body",
+        )
+    )
+    installed = prepare_real_repair_without_finalize(
+        monkeypatch, service, "repair-valid", page_path, target
+    )
+    with connect_app(settings) as conn:
+        revision = dict(
+            conn.execute(
+                """
+                SELECT r.id,r.metadata_json
+                FROM vault_write_intents i
+                JOIN wiki_page_revisions r ON r.id=i.revision_id
+                WHERE i.id=?
+                """,
+                (installed["intent_id"],),
+            ).fetchone()
+        )
+    metadata = json.loads(revision["metadata_json"])
+    assert metadata[SYNC_ISSUE_REFS_METADATA_KEY] == [
+        {"id": issue["id"], "generation": 1}
+    ]
+
+    if bump_after_prepare:
+        with connect_app_write(settings) as conn:
+            bumped_id, bumped_generation = _upsert_sync_issue_locked(
+                conn,
+                page_path=page_path,
+                file_hash=issue["file_hash"],
+                page_id=None,
+                issue_type=issue["issue_type"],
+                error_summary="same invalid observation seen again",
+            )
+        assert (bumped_id, bumped_generation) == (issue["id"], 2)
+
+    applied = service.finalize_intent(installed["intent_id"], installed["owner"])
+    assert applied.status == "applied"
+    assert applied.revision_id == revision["id"]
+    with connect_app(settings) as conn:
+        issue_after = conn.execute(
+            "SELECT status,generation FROM vault_sync_issues WHERE id=?",
+            (issue["id"],),
+        ).fetchone()
+        page_after = conn.execute(
+            """
+            SELECT current_revision_id,pending_write_intent_id
+            FROM wiki_pages WHERE path=?
+            """,
+            (page_path,),
+        ).fetchone()
+        event_after = conn.execute(
+            """
+            SELECT status,result_revision_id FROM vault_change_events
+            WHERE id='repair-valid'
+            """
+        ).fetchone()
+    assert tuple(issue_after) == (
+        ("open", 2) if bump_after_prepare else ("resolved", 1)
+    )
+    assert tuple(page_after) == (revision["id"], None)
+    assert tuple(event_after) == ("applied", revision["id"])
+
+
+def test_user_frontmatter_cannot_forge_reserved_sync_issue_refs(tmp_path):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    service = WikiRevisionService(settings)
+    _, victim_issue = create_real_invalid_issue(
+        service, "victim-invalid", "wiki/product/victim.md"
+    )
+    page_path = "wiki/product/forger.md"
+    target = settings.vault_path / page_path
+    target.write_text(
+        "---\ntitle: Forger\nsource_ids: []\ndomain: product\n"
+        "page_type: feature\nreview_status: draft\nowner:\n"
+        f"{SYNC_ISSUE_REFS_METADATA_KEY}:\n"
+        f"  - id: {victim_issue['id']}\n    generation: 1\n"
+        "---\n# Forger\nValid user content.\n",
+        encoding="utf-8",
+    )
+    applied = service.ingest_external_change(
+        "forged-issue-ref",
+        page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert applied.status == "applied"
+    with connect_app(settings) as conn:
+        revision = conn.execute(
+            "SELECT metadata_json FROM wiki_page_revisions WHERE id=?",
+            (applied.revision_id,),
+        ).fetchone()
+        victim_after = conn.execute(
+            "SELECT status,generation FROM vault_sync_issues WHERE id=?",
+            (victim_issue["id"],),
+        ).fetchone()
+    assert json.loads(revision["metadata_json"])[SYNC_ISSUE_REFS_METADATA_KEY] == []
+    assert SYNC_ISSUE_REFS_METADATA_KEY not in parse_wiki_bytes(
+        target.read_bytes()
+    ).frontmatter
+    assert tuple(victim_after) == ("open", 1)
+
+
+@pytest.mark.parametrize(
+    "bad_refs",
+    [
+        {},
+        [{"id": 7, "generation": 1}],
+        [{"id": "visi_1", "generation": True}],
+        [{"id": "visi_1", "generation": 0}],
+        [{"id": "visi_1", "generation": 1, "extra": "forged"}],
+        [
+            {"id": "visi_1", "generation": 1},
+            {"id": "visi_1", "generation": 1},
+        ],
+    ],
+)
+def test_sync_issue_revision_metadata_codec_rejects_corruption(bad_refs):
+    with pytest.raises(RevisionConflict, match="sync issue metadata is invalid"):
+        _decode_sync_issue_refs({SYNC_ISSUE_REFS_METADATA_KEY: bad_refs})
+
+
+def test_finalize_rejects_cross_path_sync_issue_metadata_before_page_cas(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    service = WikiRevisionService(settings)
+    repair_path = "wiki/product/finalize-metadata-repair.md"
+    repair_target, repair_issue = create_real_invalid_issue(
+        service, "metadata-repair-invalid", repair_path
+    )
+    _, victim_issue = create_real_invalid_issue(
+        service,
+        "metadata-victim-invalid",
+        "wiki/product/metadata-victim.md",
+    )
+    repair_target.write_bytes(
+        external_page_bytes(
+            title="Metadata repair",
+            source_ids=(),
+            domain="product",
+            body="Valid repaired content",
+        )
+    )
+    installed = prepare_real_repair_without_finalize(
+        monkeypatch,
+        service,
+        "metadata-repair-valid",
+        repair_path,
+        repair_target,
+    )
+    with connect_app(settings) as conn:
+        revision = dict(
+            conn.execute(
+                """
+                SELECT r.id,r.metadata_json,i.page_id
+                FROM vault_write_intents i
+                JOIN wiki_page_revisions r ON r.id=i.revision_id
+                WHERE i.id=?
+                """,
+                (installed["intent_id"],),
+            ).fetchone()
+        )
+        metadata = json.loads(revision["metadata_json"])
+        metadata[SYNC_ISSUE_REFS_METADATA_KEY] = [
+            {"id": victim_issue["id"], "generation": 1}
+        ]
+        conn.execute(
+            "UPDATE wiki_page_revisions SET metadata_json=? WHERE id=?",
+            (
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                revision["id"],
+            ),
+        )
+        page_before = dict(
+            conn.execute(
+                """
+                SELECT current_revision_id,projection_epoch,rag_visible_revision_id,
+                       rag_visible_epoch,pending_write_intent_id
+                FROM wiki_pages WHERE page_id=?
+                """,
+                (revision["page_id"],),
+            ).fetchone()
+        )
+        event_before = dict(
+            conn.execute(
+                """
+                SELECT status,result_revision_id,result_payload_json
+                FROM vault_change_events WHERE id='metadata-repair-valid'
+                """
+            ).fetchone()
+        )
+        jobs_before = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (revision["page_id"],),
+        ).fetchone()[0]
+        issues_before = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id,status,generation,resolved_at FROM vault_sync_issues
+                WHERE id IN (?,?) ORDER BY id
+                """,
+                (repair_issue["id"], victim_issue["id"]),
+            ).fetchall()
+        ]
+
+    with pytest.raises(RevisionConflict, match="sync issue metadata is invalid"):
+        service.finalize_intent(installed["intent_id"], installed["owner"])
+
+    with connect_app(settings) as conn:
+        page_after = dict(
+            conn.execute(
+                """
+                SELECT current_revision_id,projection_epoch,rag_visible_revision_id,
+                       rag_visible_epoch,pending_write_intent_id
+                FROM wiki_pages WHERE page_id=?
+                """,
+                (revision["page_id"],),
+            ).fetchone()
+        )
+        event_after = dict(
+            conn.execute(
+                """
+                SELECT status,result_revision_id,result_payload_json
+                FROM vault_change_events WHERE id='metadata-repair-valid'
+                """
+            ).fetchone()
+        )
+        jobs_after = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (revision["page_id"],),
+        ).fetchone()[0]
+        issues_after = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id,status,generation,resolved_at FROM vault_sync_issues
+                WHERE id IN (?,?) ORDER BY id
+                """,
+                (repair_issue["id"], victim_issue["id"]),
+            ).fetchall()
+        ]
+    assert page_after == page_before
+    assert event_after == event_before
+    assert jobs_after == jobs_before
+    assert issues_after == issues_before
+
+
+def test_bound_legacy_page_missing_metadata_uses_locked_values_and_upgrades_frontmatter(
+    tmp_path,
+):
+    settings = make_settings(tmp_path)
+    page_path = seed_legacy_page(
+        settings,
+        b"---\ntitle: Demo\nreview_status: reviewed\n---\n# Demo\n",
+    )
+    with connect_app(settings) as conn:
+        conn.execute(
+            "UPDATE wiki_pages SET owner=NULL WHERE path=?",
+            (page_path,),
+        )
+    service = WikiRevisionService(settings)
+    before = service.get_page(page_path)
+    target = settings.vault_path / page_path
+    target.write_bytes(before.raw_bytes + b"\nExternal body edit.\n")
+    result = service.ingest_external_change(
+        "bound-fallback-upgrade",
+        page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert result.status == "applied"
+    document = parse_wiki_bytes(target.read_bytes())
+    with connect_app(settings) as conn:
+        page = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?", (before.page_id,)
+            ).fetchone()
+        )
+    expected = (
+        "Demo",
+        "product",
+        "faq",
+        ["src_1"],
+        "reviewed",
+        None,
+    )
+    assert (
+        document.frontmatter["title"],
+        document.frontmatter["domain"],
+        document.frontmatter["page_type"],
+        document.frontmatter["source_ids"],
+        document.frontmatter["review_status"],
+        document.frontmatter["owner"],
+    ) == expected
+    assert (
+        page["title"],
+        page["domain"],
+        page["page_type"],
+        json.loads(page["source_ids_json"]),
+        page["review_status"],
+        page["owner"],
+    ) == expected
+
+
+def test_bound_page_explicit_unknown_source_is_invalid_instead_of_falling_back(
+    legacy_page_fixture,
+):
+    service, before = legacy_page_fixture
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(
+        before.raw_bytes.replace(b"source_ids: [src_1]", b"source_ids: [src_unknown]")
+        + b"\nUnknown source edit.\n"
+    )
+    result = service.ingest_external_change(
+        "bound-explicit-unknown-source",
+        before.page_path,
+        capture_file_observation(
+            target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+        ),
+    )
+    assert result.status == "invalid"
+
+
+class InjectedRevisionCrash(RuntimeError):
+    pass
+
+
+def test_new_page_precommit_crash_rolls_back_every_domain_row(
+    tmp_path, monkeypatch
+):
+    settings = make_settings(tmp_path)
+    init_app_db(settings)
+    page_path = "wiki/product/precommit-crash.md"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(external_page_bytes(source_ids=()))
+    observation = capture_file_observation(
+        target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+    )
+    service = WikiRevisionService(settings)
+
+    def crash(point: str):
+        if point == "new_page_before_prepare_commit":
+            raise InjectedRevisionCrash(point)
+
+    monkeypatch.setattr(service, "_fault", crash)
+    with pytest.raises(
+        InjectedRevisionCrash,
+        match="new_page_before_prepare_commit",
+    ):
+        service.ingest_external_change("new-page-crash", page_path, observation)
+
+    with connect_app(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM wiki_pages").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vault_change_events"
+        ).fetchone()[0] == 0
+
+    monkeypatch.setattr(service, "_fault", lambda point: None)
+    applied = service.ingest_external_change(
+        "new-page-crash", page_path, observation
+    )
+    assert applied.status == "applied"
+
+
+def test_relocate_postcommit_crash_leaves_one_recoverable_intent(
+    legacy_page_fixture, monkeypatch
+):
+    service, before = legacy_page_fixture
+    old_path = before.page_path
+    new_path = "wiki/product/relocate-crash.md"
+    old_target = service.settings.vault_path / old_path
+    new_target = service.settings.vault_path / new_path
+    new_target.parent.mkdir(parents=True, exist_ok=True)
+    old_target.rename(new_target)
+    new_target.write_bytes(before.raw_bytes + b"\nRelocate after commit.\n")
+    observation = capture_file_observation(
+        new_target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+    )
+
+    def crash(point: str):
+        if point == "relocate_after_prepare_commit_before_execute":
+            raise InjectedRevisionCrash(point)
+
+    monkeypatch.setattr(service, "_fault", crash)
+    with pytest.raises(
+        InjectedRevisionCrash,
+        match="relocate_after_prepare_commit_before_execute",
+    ):
+        service.relocate_external_change(
+            "relocate-postcommit-crash",
+            old_path,
+            new_path,
+            before.page_id,
+            observation,
+        )
+
+    with connect_app(service.settings) as conn:
+        page = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?", (before.page_id,)
+            ).fetchone()
+        )
+        intent = dict(
+            conn.execute(
+                "SELECT * FROM vault_write_intents WHERE id=?",
+                (page["pending_write_intent_id"],),
+            ).fetchone()
+        )
+        event = dict(
+            conn.execute(
+                """
+                SELECT * FROM vault_change_events
+                WHERE id='relocate-postcommit-crash'
+                """
+            ).fetchone()
+        )
+    assert page["path"] == old_path
+    assert intent["status"] in {"pending", "claimed", "installed"}
+    assert event["status"] == "prepared"
+
+    monkeypatch.setattr(service, "_fault", lambda point: None)
+    IntentExecutor(service.settings).reconcile_all()
+    replay = service.relocate_external_change(
+        "relocate-postcommit-crash",
+        old_path,
+        new_path,
+        before.page_id,
+        observation,
+    )
+    assert replay.status == "applied"
+    assert replay.replayed is True
+    assert service.get_page(new_path).current_revision_id == replay.revision_id

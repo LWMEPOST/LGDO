@@ -1,26 +1,221 @@
 import sqlite3
-import socket
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.aliases import DEFAULT_ENTITY_ALIASES
-from app.db import connect_postgres
+from app.db import connect_postgres, init_app_db, init_postgres_schema
 from app.main import app
 from app.migration import migrate_sqlite_to_postgres
 
 
-def pg_available() -> bool:
+TEST_DATABASE_PREFIX = "lgdo_migration_"
+
+
+def postgres_capability() -> tuple[bool, str]:
+    admin = get_settings().model_copy(deep=True)
     try:
-        with socket.create_connection(("localhost", 5432), timeout=1):
-            return True
-    except OSError:
-        return False
+        with connect_postgres(
+            admin,
+            database="postgres",
+            autocommit=True,
+        ) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(rolsuper OR rolcreatedb, FALSE)
+                FROM pg_roles WHERE rolname=current_user
+                """
+            )
+            role = cur.fetchone()
+    except Exception as exc:
+        return (
+            False,
+            f"PostgreSQL maintenance connection failed ({type(exc).__name__})",
+        )
+    if role is None or not role[0]:
+        return False, "PostgreSQL maintenance role lacks CREATEDB"
+    return True, ""
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
-def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, monkeypatch):
+def _create_owned_database(admin, database_name: str, mark_owned) -> None:
+    from psycopg import sql
+
+    with connect_postgres(
+        admin,
+        database="postgres",
+        autocommit=True,
+    ) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_database WHERE datname=%s",
+            (database_name,),
+        )
+        if cur.fetchone() is not None:
+            raise AssertionError(
+                f"refusing to reuse migration database {database_name}"
+            )
+        mark_owned()
+        cur.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
+        )
+
+
+def _drop_owned_database(admin, database_name: str) -> None:
+    from psycopg import sql
+
+    identifier = sql.Identifier(database_name)
+    stages = (
+        (
+            "alter",
+            sql.SQL("ALTER DATABASE {} WITH ALLOW_CONNECTIONS false").format(
+                identifier
+            ),
+            None,
+        ),
+        (
+            "terminate",
+            """
+            SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE datname=%s AND pid<>pg_backend_pid()
+            """,
+            (database_name,),
+        ),
+        (
+            "drop",
+            sql.SQL("DROP DATABASE IF EXISTS {}").format(identifier),
+            None,
+        ),
+    )
+    errors: list[tuple[str, Exception]] = []
+    for stage, statement, params in stages:
+        try:
+            with connect_postgres(
+                admin,
+                database="postgres",
+                autocommit=True,
+            ) as conn, conn.cursor() as cur:
+                if params is None:
+                    cur.execute(statement)
+                else:
+                    cur.execute(statement, params)
+        except Exception as exc:
+            errors.append((stage, exc))
+    database_exists = None
+    try:
+        with connect_postgres(
+            admin,
+            database="postgres",
+            autocommit=True,
+        ) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_database WHERE datname=%s",
+                (database_name,),
+            )
+            database_exists = cur.fetchone() is not None
+    except Exception as exc:
+        errors.append(("verify", exc))
+    summary = ", ".join(
+        f"{stage}={type(error).__name__}" for stage, error in errors
+    )
+    if database_exists:
+        raise AssertionError(
+            f"migration database leaked: {database_name}; {summary}"
+        ) from (errors[0][1] if errors else None)
+    if errors:
+        raise RuntimeError(
+            f"migration database cleanup failed: {summary}"
+        ) from errors[0][1]
+
+
+@pytest.fixture
+def postgres_database():
+    available, reason = postgres_capability()
+    if not available:
+        pytest.skip(reason)
+    admin = get_settings().model_copy(deep=True)
+    database_name = f"{TEST_DATABASE_PREFIX}{uuid.uuid4().hex[:24]}"
+    owned = False
+
+    def mark_owned() -> None:
+        nonlocal owned
+        owned = True
+
+    try:
+        _create_owned_database(admin, database_name, mark_owned)
+        yield database_name
+    finally:
+        if owned:
+            _drop_owned_database(admin, database_name)
+
+
+def empty_migration_pair(tmp_path, monkeypatch, postgres_database):
+    settings = get_settings()
+    sqlite_path = tmp_path / "data/source.db"
+    monkeypatch.setattr(settings, "database_backend", "sqlite")
+    monkeypatch.setattr(settings, "database_path", sqlite_path)
+    monkeypatch.setattr(settings, "postgres_database", postgres_database)
+    monkeypatch.setattr(settings, "vault_path", tmp_path / "vault")
+    monkeypatch.setattr(settings, "upload_path", tmp_path / "uploads")
+    init_app_db(settings)
+    init_postgres_schema(settings)
+    return settings, sqlite_path
+
+
+def test_migrates_populated_vault_sync_issue(
+    tmp_path,
+    monkeypatch,
+    postgres_database,
+):
+    settings, sqlite_path = empty_migration_pair(
+        tmp_path,
+        monkeypatch,
+        postgres_database,
+    )
+    expected = (
+        "visi_migration",
+        "wiki/product/broken.md",
+        "f" * 64,
+        None,
+        "invalid_frontmatter",
+        "invalid yaml",
+        "open",
+        3,
+        "2026-07-15T00:00:00+00:00",
+        "2026-07-15T00:01:00+00:00",
+        None,
+    )
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO vault_sync_issues(
+              id,page_path,file_hash,page_id,issue_type,error_summary,status,
+              generation,first_seen_at,last_seen_at,resolved_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            expected,
+        )
+
+    result = migrate_sqlite_to_postgres(settings, sqlite_path)
+
+    assert result["tables"]["vault_sync_issues"] == 1
+    with connect_postgres(settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id,page_path,file_hash,page_id,issue_type,error_summary,status,
+                   generation,first_seen_at,last_seen_at,resolved_at
+            FROM vault_sync_issues WHERE id=%s
+            """,
+            (expected[0],),
+        )
+        assert cur.fetchone() == expected
+
+
+def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(
+    tmp_path,
+    monkeypatch,
+    postgres_database,
+):
     sample_dir = tmp_path / "samples"
     sample_dir.mkdir()
     (sample_dir / "refund_policy.md").write_text(
@@ -122,33 +317,8 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     )
     assert alias_response.status_code == 200
 
-    monkeypatch.setattr(settings, "postgres_database", "lgdo_migration_test")
-    from app.db import init_postgres_schema
-
+    monkeypatch.setattr(settings, "postgres_database", postgres_database)
     init_postgres_schema(settings)
-    with connect_postgres(settings) as conn:
-        with conn.cursor() as cur:
-            for table in [
-                "audit_logs",
-                "auth_sessions",
-                "accounts",
-                "feedback",
-                "knowledge_gaps",
-                "query_logs",
-                "knowledge_projection_jobs",
-                "vault_write_intents",
-                "vault_change_events",
-                "wiki_file_observations",
-                "wiki_page_revisions",
-                "review_items",
-                "wiki_pages",
-                "ingest_reports",
-                "document_chunks",
-                "sources",
-                "eval_questions",
-                "entity_aliases",
-            ]:
-                cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
 
     result = migrate_sqlite_to_postgres(settings, sqlite_path)
     assert result["tables"]["sources"] == 2
@@ -198,8 +368,11 @@ def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(tmp_path, mo
     assert answer_after.json()["citations"][0]["source_id"] == expected_source_id
 
 
-@pytest.mark.skipif(not pg_available(), reason="PostgreSQL 5432 is not available")
-def test_migration_endpoint_returns_table_counts(tmp_path, monkeypatch):
+def test_migration_endpoint_returns_table_counts(
+    tmp_path,
+    monkeypatch,
+    postgres_database,
+):
     sample_dir = tmp_path / "samples"
     sample_dir.mkdir()
     (sample_dir / "refund_policy.md").write_text("# 退款政策\n\n用户 7 天内可以申请退款。", encoding="utf-8")
@@ -209,34 +382,13 @@ def test_migration_endpoint_returns_table_counts(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "database_backend", "sqlite")
     monkeypatch.setattr(settings, "rag_store_backend", "sqlite")
     monkeypatch.setattr(settings, "database_path", sqlite_path)
-    monkeypatch.setattr(settings, "postgres_database", "lgdo_migration_endpoint_test")
-    monkeypatch.setattr(settings, "postgres_password", "postgres")
+    monkeypatch.setattr(settings, "postgres_database", postgres_database)
     monkeypatch.setattr(settings, "vault_path", tmp_path / "vault")
     monkeypatch.setattr(settings, "upload_path", tmp_path / "uploads")
     monkeypatch.setattr(settings, "deepseek_api_key", None)
     monkeypatch.setattr(settings, "deepseek_model", None)
 
-    from app.db import init_postgres_schema
-
     init_postgres_schema(settings)
-    with connect_postgres(settings) as conn:
-        with conn.cursor() as cur:
-            for table in [
-                "audit_logs",
-                "auth_sessions",
-                "accounts",
-                "feedback",
-                "knowledge_gaps",
-                "query_logs",
-                "review_items",
-                "wiki_pages",
-                "ingest_reports",
-                "document_chunks",
-                "sources",
-                "eval_questions",
-                "entity_aliases",
-            ]:
-                cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
 
     client = TestClient(app)
     scan = client.post(

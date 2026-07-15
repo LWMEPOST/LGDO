@@ -26,6 +26,7 @@ MAIN_TABLES = [
     "wiki_page_revisions",
     "wiki_file_observations",
     "vault_change_events",
+    "vault_sync_issues",
     "vault_write_intents",
     "knowledge_projection_jobs",
     "wiki_chunks",
@@ -46,6 +47,7 @@ TABLE_PRIMARY_KEYS: dict[str, str | tuple[str, ...]] = {
     "vault_write_intents": "id",
     "wiki_file_observations": "id",
     "vault_change_events": "id",
+    "vault_sync_issues": "id",
     "knowledge_projection_jobs": "id",
     "wiki_chunks": "id",
     "gbrain_page_projections": "id",
@@ -178,8 +180,28 @@ CREATE TABLE IF NOT EXISTS wiki_file_observations (
 CREATE TABLE IF NOT EXISTS vault_change_events (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, page_path TEXT NOT NULL, old_page_path TEXT,
   observation_id TEXT, expected_state_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending',
-  result_revision_id TEXT, detected_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  result_revision_id TEXT, payload_digest TEXT NOT NULL DEFAULT '', result_payload_json TEXT,
+  detected_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS vault_sync_issues (
+  id TEXT PRIMARY KEY,
+  page_path TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  page_id TEXT,
+  issue_type TEXT NOT NULL,
+  error_summary TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  generation INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  resolved_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_sync_issue_open_identity
+ON vault_sync_issues(page_path, file_hash, issue_type)
+WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_vault_sync_issue_status
+ON vault_sync_issues(status, issue_type, page_path);
 
 CREATE TABLE IF NOT EXISTS knowledge_projection_jobs (
   id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, target TEXT NOT NULL,
@@ -565,8 +587,32 @@ CREATE TABLE IF NOT EXISTS wiki_file_observations (
 CREATE TABLE IF NOT EXISTS vault_change_events (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, page_path TEXT NOT NULL, old_page_path TEXT,
   observation_id TEXT, expected_state_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending',
-  result_revision_id TEXT, detected_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  result_revision_id TEXT, payload_digest TEXT NOT NULL DEFAULT '', result_payload_json TEXT,
+  detected_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+ALTER TABLE vault_change_events
+ADD COLUMN IF NOT EXISTS payload_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE vault_change_events
+ADD COLUMN IF NOT EXISTS result_payload_json TEXT;
+
+CREATE TABLE IF NOT EXISTS vault_sync_issues (
+  id TEXT PRIMARY KEY,
+  page_path TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  page_id TEXT,
+  issue_type TEXT NOT NULL,
+  error_summary TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  generation INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  resolved_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_sync_issue_open_identity
+ON vault_sync_issues(page_path, file_hash, issue_type)
+WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_vault_sync_issue_status
+ON vault_sync_issues(status, issue_type, page_path);
 
 CREATE TABLE IF NOT EXISTS knowledge_projection_jobs (
   id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, target TEXT NOT NULL,
@@ -909,6 +955,11 @@ REVIEW_ITEM_ADDITIONS = {
     "resolved_at": "TEXT",
 }
 
+VAULT_CHANGE_EVENT_ADDITIONS = {
+    "payload_digest": "TEXT NOT NULL DEFAULT ''",
+    "result_payload_json": "TEXT",
+}
+
 WIKI_PAGE_COLUMNS = [
     "path",
     "page_id",
@@ -1056,6 +1107,13 @@ def _ensure_sqlite_revision_schema(conn: sqlite3.Connection) -> None:
     for name, definition in REVIEW_ITEM_ADDITIONS.items():
         if name not in review_columns:
             conn.execute(f'ALTER TABLE review_items ADD COLUMN "{name}" {definition}')
+
+    event_columns = _sqlite_table_info(conn, "vault_change_events")
+    for name, definition in VAULT_CHANGE_EVENT_ADDITIONS.items():
+        if name not in event_columns:
+            conn.execute(
+                f'ALTER TABLE vault_change_events ADD COLUMN "{name}" {definition}'
+            )
 
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_wiki_pages_page_id "

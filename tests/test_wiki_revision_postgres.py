@@ -8,8 +8,10 @@ from app.config import get_settings
 from app.db import (
     PgCompatConnection,
     connect_app,
+    connect_app_write,
     connect_postgres,
     init_postgres_schema,
+    json_dump,
 )
 from app.ingest import scan_sources
 from app.models import CompileRequest, ScanRequest
@@ -21,6 +23,7 @@ from app.wiki_revisions import (
     RevisionConflict,
     WikiRevisionService,
 )
+from app.vault_writer import IntentExecutor
 
 
 TEST_DATABASE_PREFIX = "lgdo_t16_"
@@ -652,3 +655,397 @@ def test_concurrent_manual_saves_with_same_revision_have_one_postgres_winner(
         ).fetchone()
     assert page["current_revision_id"] == current.current_revision_id
     assert page["pending_write_intent_id"] == mutations[0].write_intent_id
+
+
+def test_postgres_external_schema_has_payload_issue_and_partial_indexes(
+    postgres_settings,
+):
+    with connect_postgres(postgres_settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name='vault_change_events'
+            """
+        )
+        columns = {row[0] for row in cur.fetchall()}
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename='vault_sync_issues'"
+        )
+        indexes = {row[0] for row in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT is_nullable FROM information_schema.columns
+            WHERE table_name='wiki_file_observations' AND column_name='page_id'
+            """
+        )
+        observation_page_id_nullable = cur.fetchone()[0]
+    assert {"payload_digest", "result_payload_json"} <= columns
+    assert "idx_vault_sync_issue_open_identity" in indexes
+    assert observation_page_id_nullable == "YES"
+
+
+def test_concurrent_postgres_external_create_replays_one_event_without_duplicates(
+    postgres_settings,
+):
+    settings = postgres_settings
+    page_path = "wiki/product/concurrent-external.md"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(
+        b"---\ntitle: Concurrent external\nsource_ids: []\n"
+        b"domain: product\npage_type: feature\nreview_status: draft\nowner:\n"
+        b"---\n# Concurrent external\nBody\n"
+    )
+    observation = capture_file_observation(
+        target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+    )
+
+    def ingest(_worker: int):
+        return WikiRevisionService(settings).ingest_external_change(
+            "pg-create-shared-event", page_path, observation
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(ingest, (1, 2)))
+    with connect_postgres(settings) as conn, conn.cursor() as cur:
+        cur.execute("SELECT page_id FROM wiki_pages WHERE path=%s", (page_path,))
+        pages = cur.fetchall()
+        cur.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_path=%s",
+            (page_path,),
+        )
+        revisions = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM vault_write_intents i
+            JOIN wiki_page_revisions r ON r.id=i.revision_id WHERE r.page_path=%s
+            """,
+            (page_path,),
+        )
+        intents = cur.fetchone()[0]
+    assert len(pages) == 1
+    assert revisions == 1
+    assert intents == 1
+    assert [result.status for result in outcomes] == ["applied", "applied"]
+    assert sorted(result.replayed for result in outcomes) == [False, True]
+    assert len({result.page_id for result in outcomes}) == 1
+
+
+@pytest.mark.parametrize("source_mutation", ["deactivate", "delete"])
+def test_postgres_source_mutation_wins_against_finalize_without_advancing_state(
+    monkeypatch, postgres_settings, source_mutation
+):
+    settings = postgres_settings
+    suffix = source_mutation
+    source_id = f"src_finalize_race_{suffix}"
+    page_id = f"page_finalize_race_{suffix}"
+    page_path = f"wiki/product/finalize-source-race-{suffix}.md"
+    event_id = f"pg-finalize-source-race-{suffix}"
+    timestamp = "2026-07-15T00:00:00+00:00"
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "---\ntitle: Source race\n"
+        f"source_ids: [{source_id}]\nlgdo_page_id: {page_id}\n"
+        "domain: product\npage_type: policy\nreview_status: draft\nowner:\n"
+        "---\n# Source race\nBefore finalize.\n",
+        encoding="utf-8",
+    )
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,title,source_type,original_path,raw_path,content_hash,
+              size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                source_id,
+                "product",
+                "Source race",
+                "markdown",
+                "obsidian",
+                f"raw/product/{suffix}.md",
+                "a" * 64,
+                1,
+                "active",
+                "{}",
+                timestamp,
+                timestamp,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              owner,created_at,updated_at,lifecycle_status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,'active')
+            """,
+            (
+                page_path,
+                page_id,
+                "product",
+                "policy",
+                "Source race",
+                json_dump([source_id]),
+                "draft",
+                None,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    service = WikiRevisionService(settings)
+    before = service.get_page(page_path)
+    target.write_bytes(before.raw_bytes + b"\nPrepared external repair.\n")
+    observation = capture_file_observation(
+        target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+    )
+    installed: dict[str, str] = {}
+
+    def install_without_finalize(executor, intent_id):
+        installed["intent_id"] = intent_id
+        installed["owner"] = executor.owner
+        assert executor.claim(intent_id, lease_seconds=30)
+        executor.capture_and_install(intent_id, stop_after="installed")
+        raise RuntimeError("stop after install before finalize")
+
+    monkeypatch.setattr(IntentExecutor, "execute", install_without_finalize)
+    with pytest.raises(RuntimeError, match="stop after install before finalize"):
+        service.ingest_external_change(event_id, page_path, observation)
+
+    with connect_app(settings) as conn:
+        page_before_finalize = dict(
+            conn.execute(
+                """
+                SELECT current_revision_id,projection_epoch,rag_visible_revision_id,
+                       rag_visible_epoch,pending_write_intent_id
+                FROM wiki_pages WHERE page_id=?
+                """,
+                (page_id,),
+            ).fetchone()
+        )
+        event_before_finalize = dict(
+            conn.execute(
+                """
+                SELECT status,result_revision_id,result_payload_json
+                FROM vault_change_events WHERE id=?
+                """,
+                (event_id,),
+            ).fetchone()
+        )
+        jobs_before_finalize = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (page_id,),
+        ).fetchone()[0]
+    assert page_before_finalize["current_revision_id"] == before.current_revision_id
+    assert page_before_finalize["pending_write_intent_id"] == installed["intent_id"]
+    assert event_before_finalize == {
+        "status": "prepared",
+        "result_revision_id": None,
+        "result_payload_json": None,
+    }
+
+    source_lock_held = threading.Event()
+    release_source_mutation = threading.Event()
+    share_lock_attempted = threading.Event()
+    original_execute = PgCompatConnection.execute
+
+    def observe_share_lock(self, query, params=None):
+        normalized = " ".join(query.split())
+        if (
+            normalized.startswith("SELECT id,status FROM sources WHERE id IN")
+            and normalized.endswith("FOR SHARE")
+        ):
+            share_lock_attempted.set()
+        return original_execute(self, query, params)
+
+    monkeypatch.setattr(PgCompatConnection, "execute", observe_share_lock)
+
+    def mutate_source_first():
+        with connect_app_write(settings) as conn:
+            if source_mutation == "deactivate":
+                changed = conn.execute(
+                    "UPDATE sources SET status='inactive' WHERE id=?", (source_id,)
+                )
+            else:
+                changed = conn.execute(
+                    "DELETE FROM sources WHERE id=?", (source_id,)
+                )
+            assert changed.rowcount == 1
+            source_lock_held.set()
+            if not release_source_mutation.wait(timeout=10):
+                raise AssertionError("source mutation was not released")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        mutation_future = pool.submit(mutate_source_first)
+        assert source_lock_held.wait(timeout=10)
+        finalize_future = pool.submit(
+            service.finalize_intent,
+            installed["intent_id"],
+            installed["owner"],
+        )
+        try:
+            assert share_lock_attempted.wait(timeout=10)
+            assert not finalize_future.done()
+        finally:
+            release_source_mutation.set()
+        mutation_future.result(timeout=20)
+        with pytest.raises(RevisionConflict, match="sources are no longer active"):
+            finalize_future.result(timeout=20)
+
+    with connect_app(settings) as conn:
+        page_after = dict(
+            conn.execute(
+                """
+                SELECT current_revision_id,projection_epoch,rag_visible_revision_id,
+                       rag_visible_epoch,pending_write_intent_id
+                FROM wiki_pages WHERE page_id=?
+                """,
+                (page_id,),
+            ).fetchone()
+        )
+        event_after = dict(
+            conn.execute(
+                """
+                SELECT status,result_revision_id,result_payload_json
+                FROM vault_change_events WHERE id=?
+                """,
+                (event_id,),
+            ).fetchone()
+        )
+        jobs_after = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (page_id,),
+        ).fetchone()[0]
+    assert page_after == page_before_finalize
+    assert event_after == event_before_finalize
+    assert jobs_after == jobs_before_finalize
+
+
+def test_postgres_relocate_pending_intent_fences_manual_save(
+    monkeypatch, postgres_settings
+):
+    settings = postgres_settings
+    old_path = "wiki/product/relocate-race.md"
+    new_path = "wiki/product/relocate-race-new.md"
+    old_target = settings.vault_path / old_path
+    new_target = settings.vault_path / new_path
+    old_target.parent.mkdir(parents=True, exist_ok=True)
+    old_target.write_text(
+        "---\ntitle: Relocate race\nsource_ids: []\ndomain: product\n"
+        "page_type: feature\nreview_status: draft\nowner:\n"
+        "---\n# Relocate race\nBefore.\n",
+        encoding="utf-8",
+    )
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                old_path,
+                "product",
+                "feature",
+                "Relocate race",
+                "[]",
+                "draft",
+                "t0",
+                "t0",
+            ),
+        )
+    before = WikiRevisionService(settings).get_page(old_path)
+    new_target.parent.mkdir(parents=True, exist_ok=True)
+    old_target.rename(new_target)
+    new_target.write_bytes(before.raw_bytes + b"\nEdited during relocate.\n")
+    observation = capture_file_observation(
+        new_target, max_content_bytes=1_000_000, prefix_bytes=64 * 1024
+    )
+    prepared = threading.Event()
+    release = threading.Event()
+    relocate_service = WikiRevisionService(settings)
+
+    def block_after_prepare(point: str):
+        if point != "relocate_after_prepare_commit_before_execute":
+            return
+        prepared.set()
+        if not release.wait(timeout=10):
+            raise AssertionError("manual-save race did not release relocate")
+
+    monkeypatch.setattr(relocate_service, "_fault", block_after_prepare)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            relocate_service.relocate_external_change,
+            "pg-relocate-race",
+            old_path,
+            new_path,
+            before.page_id,
+            observation,
+        )
+        try:
+            assert prepared.wait(timeout=10)
+            with connect_app(settings) as conn:
+                pending_intent_id = conn.execute(
+                    """
+                    SELECT pending_write_intent_id FROM wiki_pages WHERE page_id=?
+                    """,
+                    (before.page_id,),
+                ).fetchone()["pending_write_intent_id"]
+            with pytest.raises(RevisionConflict) as conflict:
+                WikiRevisionService(settings).prepare_manual_save(
+                    ManualSaveCommand(
+                        page_path=old_path,
+                        content=before.content + "\nManual loser.\n",
+                        expected_revision_id=before.current_revision_id,
+                        request_id="pg-manual-loser",
+                        actor="postgres-test",
+                        owner=None,
+                        note=None,
+                        review_status="draft",
+                    ),
+                    execute_intent=False,
+                )
+            assert conflict.value.pending_intent_id == pending_intent_id
+        finally:
+            release.set()
+        relocated = future.result(timeout=20)
+
+    assert relocated.status == "applied"
+    with connect_app(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT p.path,p.current_revision_id,p.pending_write_intent_id,
+                   r.origin,r.page_path
+            FROM wiki_pages p
+            JOIN wiki_page_revisions r ON r.id=p.current_revision_id
+            WHERE p.page_id=?
+            """,
+            (before.page_id,),
+        ).fetchone()
+        external_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_page_revisions
+            WHERE page_id=? AND origin='external'
+            """,
+            (before.page_id,),
+        ).fetchone()[0]
+    assert tuple(
+        row[key]
+        for key in (
+            "path",
+            "current_revision_id",
+            "pending_write_intent_id",
+            "origin",
+            "page_path",
+        )
+    ) == (
+        new_path,
+        relocated.revision_id,
+        None,
+        "external",
+        new_path,
+    )
+    assert external_count == 1

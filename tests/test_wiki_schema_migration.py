@@ -1,6 +1,11 @@
 import sqlite3
 
-from app.db import MAIN_TABLES, TABLE_PRIMARY_KEYS, init_db
+import pytest
+
+from app.config import Settings
+from app.db import MAIN_TABLES, TABLE_PRIMARY_KEYS, connect_app, init_app_db, init_db
+from app.wiki_markdown import compute_file_hash, compute_semantic_hash, parse_wiki_bytes
+from app.wiki_revisions import RevisionConflict, WikiRevisionService
 
 
 REVISION_TABLES = {
@@ -8,8 +13,150 @@ REVISION_TABLES = {
     "vault_write_intents",
     "wiki_file_observations",
     "vault_change_events",
+    "vault_sync_issues",
     "knowledge_projection_jobs",
 }
+
+
+def schema_settings(tmp_path) -> Settings:
+    return Settings(
+        _env_file=None,
+        database_backend="sqlite",
+        database_path=tmp_path / "schema.db",
+        vault_path=tmp_path / "vault",
+        projection_worker_enabled=False,
+    )
+
+
+def test_external_event_schema_has_payload_and_terminal_result_columns(tmp_path):
+    settings = schema_settings(tmp_path)
+    init_app_db(settings)
+    with connect_app(settings) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info('vault_change_events')")
+        }
+        issue_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info('vault_sync_issues')")
+        }
+        observation_columns = {
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info('wiki_file_observations')")
+        }
+    assert {"payload_digest", "result_payload_json"} <= columns
+    assert {"id", "page_id", "file_hash", "generation", "resolved_at"} <= issue_columns
+    assert observation_columns["page_id"][3] == 0
+
+
+def seed_legacy_page_at(settings, page_path: str) -> None:
+    page_id = "page_legacy_migration"
+    revision_id = "wrev_legacy_migration"
+    timestamp = "2026-07-14T00:00:00+00:00"
+    content = (
+        "---\nid: page_legacy_migration\nlgdo_page_id: page_legacy_migration\n"
+        "lgdo_revision_id: wrev_legacy_migration\ntitle: Legacy\nsource_ids: []\n"
+        "domain: product\npage_type: feature\nreview_status: draft\nowner:\n"
+        "---\n# Legacy\n"
+    )
+    target = settings.vault_path / page_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              owner,created_at,updated_at,current_revision_id,revision_number,
+              file_hash,semantic_hash,projection_epoch,lifecycle_status
+            ) VALUES (?,?,'product','feature','Legacy','[]','draft',NULL,?,?,?,1,?,?,1,'active')
+            """,
+            (
+                page_path,
+                page_id,
+                timestamp,
+                timestamp,
+                revision_id,
+                compute_file_hash(content.encode("utf-8")),
+                compute_semantic_hash(parse_wiki_bytes(content.encode("utf-8"))),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_page_revisions(
+              id,page_id,page_path,revision_number,file_hash,semantic_hash,content,
+              origin,source_ids_json,metadata_json,idempotency_key,created_at
+            ) VALUES (?,?,?,1,?,?,?,'legacy','[]','{}',?,?)
+            """,
+            (
+                revision_id,
+                page_id,
+                page_path,
+                compute_file_hash(content.encode("utf-8")),
+                compute_semantic_hash(parse_wiki_bytes(content.encode("utf-8"))),
+                content,
+                "legacy:migration",
+                timestamp,
+            ),
+        )
+
+
+def test_legacy_vault_events_are_upgraded_but_never_reconstructed_from_page_state(
+    tmp_path,
+):
+    settings = schema_settings(tmp_path)
+    with sqlite3.connect(settings.database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE vault_change_events (
+              id TEXT PRIMARY KEY,kind TEXT NOT NULL,page_path TEXT NOT NULL,
+              old_page_path TEXT,observation_id TEXT,expected_state_json TEXT NOT NULL DEFAULT '{}',
+              status TEXT NOT NULL DEFAULT 'pending',result_revision_id TEXT,
+              detected_at TEXT NOT NULL,updated_at TEXT NOT NULL
+            )
+            """
+        )
+        for event_id, status in (
+            ("legacy-terminal", "applied"),
+            ("legacy-pending", "pending"),
+        ):
+            conn.execute(
+                """
+                INSERT INTO vault_change_events(
+                  id,kind,page_path,expected_state_json,status,detected_at,updated_at
+                ) VALUES (?,'delete','wiki/product/legacy.md','{}',?,'2026-07-14','2026-07-14')
+                """,
+                (event_id, status),
+            )
+    init_app_db(settings)
+    seed_legacy_page_at(settings, "wiki/product/legacy.md")
+    service = WikiRevisionService(settings)
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT id,payload_digest,result_payload_json
+            FROM vault_change_events ORDER BY id
+            """
+        ).fetchall()
+        before = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE path='wiki/product/legacy.md'"
+            ).fetchone()
+        )
+    assert [
+        (row["payload_digest"], row["result_payload_json"]) for row in rows
+    ] == [("", None), ("", None)]
+    for event_id in ("legacy-terminal", "legacy-pending"):
+        with pytest.raises(
+            RevisionConflict,
+            match="legacy vault event has no authoritative result payload",
+        ):
+            service.delete_page(event_id, "wiki/product/legacy.md")
+    with connect_app(settings) as conn:
+        after = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE path='wiki/product/legacy.md'"
+            ).fetchone()
+        )
+    assert after == before
 
 
 def table_info(conn: sqlite3.Connection, table: str) -> dict[str, sqlite3.Row]:
