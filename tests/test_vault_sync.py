@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -10,6 +11,7 @@ from app.db import connect_app, connect_app_write, init_app_db
 from app.vault_events import VaultEventStore
 from app.vault_sync import VaultSyncService
 from app.vault_watcher import VaultFsEvent
+from app.wiki_markdown import FileObservationInput
 
 
 @pytest.fixture
@@ -159,6 +161,17 @@ def remove_page(settings, page_path: str) -> None:
         target.unlink()
 
 
+def observation_for(content: bytes, *, mtime_ns: int = 1) -> FileObservationInput:
+    return FileObservationInput(
+        file_hash=hashlib.sha256(content).hexdigest(),
+        size_bytes=len(content),
+        mtime_ns=mtime_ns,
+        content_bytes=content,
+        content_prefix=None,
+        content_truncated=False,
+    )
+
+
 async def handle(
     service: VaultSyncService,
     events: list[VaultFsEvent],
@@ -239,6 +252,59 @@ async def test_edited_pending_rename_uses_relocate_evidence(settings):
 
     assert [call[0] for call in revisions.calls] == ["relocate"]
     assert revisions.calls[0][2:5] == (old_path, new_path, page_id)
+
+
+@pytest.mark.asyncio
+async def test_pending_rename_uses_fresh_observation_under_page_lock(
+    settings,
+    monkeypatch,
+):
+    page_id = "page_fresh_rename"
+    old_path = "wiki/product/fresh-old.md"
+    new_path = "wiki/product/fresh-new.md"
+    original = managed_bytes(page_id)
+    edited = managed_bytes(page_id, body="Edited before page lock")
+    seed_page(
+        settings,
+        page_id=page_id,
+        page_path=old_path,
+        content=original,
+    )
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+    detected_at = datetime(2026, 7, 15, 2, 30, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    write_page(settings, new_path, original)
+    exact_observation = observation_for(original, mtime_ns=1)
+    edited_observation = observation_for(edited, mtime_ns=2)
+    observations = 0
+
+    async def change_before_page_lock(path, *_args, **_kwargs):
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            path.write_bytes(edited)
+            return exact_observation
+        return edited_observation
+
+    monkeypatch.setattr(
+        "app.vault_sync.wait_for_stable_observation",
+        change_before_page_lock,
+    )
+
+    await handle(
+        service,
+        [VaultFsEvent("add", new_path)],
+        detected_at=detected_at + timedelta(milliseconds=100),
+    )
+
+    assert observations == 2
+    assert [call[0] for call in revisions.calls] == ["relocate"]
+    assert revisions.calls[0][-1] == edited_observation.file_hash
 
 
 @pytest.mark.asyncio
@@ -420,6 +486,90 @@ async def test_page_lock_waiter_repeated_cancellation_does_not_leak(settings):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_revision_mutation_holds_page_lock_until_finalized(
+    settings,
+    monkeypatch,
+):
+    page_path = "wiki/product/cancelled-mutation.md"
+    content = external_page_bytes(title="Cancelled mutation")
+    observation = observation_for(content)
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    async def stable_observation(*_args, **_kwargs):
+        return observation
+
+    monkeypatch.setattr(
+        "app.vault_sync.wait_for_stable_observation",
+        stable_observation,
+    )
+
+    class BlockingRevisionService(FakeRevisionService):
+        def ingest_external_change(self, event_id, path, observed):
+            self.calls.append(("ingest", event_id, path, observed.file_hash))
+            if len(self.calls) == 1:
+                first_entered.set()
+                if not release_first.wait(timeout=5):
+                    raise RuntimeError("blocked mutation was not released")
+            else:
+                second_entered.set()
+            return FakeResult("applied")
+
+    revisions = BlockingRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+    first_at = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
+    first = asyncio.create_task(
+        handle(
+            service,
+            [VaultFsEvent("modify", page_path)],
+            detected_at=first_at,
+        )
+    )
+    while not first_entered.is_set():
+        await asyncio.sleep(0)
+
+    first.cancel()
+    await asyncio.sleep(0)
+    first.cancel()
+    second = asyncio.create_task(
+        handle(
+            service,
+            [VaultFsEvent("modify", page_path)],
+            detected_at=first_at + timedelta(seconds=1),
+        )
+    )
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert first.done() is False
+        assert second_entered.is_set() is False
+    finally:
+        release_first.set()
+
+    first_result, second_result = await asyncio.gather(
+        first,
+        second,
+        return_exceptions=True,
+    )
+    assert isinstance(first_result, asyncio.CancelledError)
+    assert second_result is None
+    with connect_app(settings) as conn:
+        statuses = [
+            row["status"]
+            for row in conn.execute(
+                """
+                SELECT status FROM vault_watch_occurrences
+                WHERE page_path=? ORDER BY detected_at,id
+                """,
+                (page_path,),
+            ).fetchall()
+        ]
+    assert statuses == ["applied", "applied"]
+    assert service._page_locks == {}
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_pending_rename_persists_issue_without_moving(settings):
     page_id = "page_ambiguous_rename"
     old_path = "wiki/product/ambiguous-old.md"
@@ -505,3 +655,86 @@ async def test_ambiguous_pending_rename_persists_issue_without_moving(settings):
         )
     assert revisions.calls == []
     assert replayed_issue["generation"] == 2
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_candidates_are_rechecked_under_page_lock(
+    settings,
+    monkeypatch,
+):
+    page_id = "page_ambiguous_race"
+    old_path = "wiki/product/ambiguous-race-old.md"
+    other_old_path = "wiki/product/ambiguous-race-other.md"
+    new_path = "wiki/product/ambiguous-race-new.md"
+    content = managed_bytes(page_id)
+    seed_page(
+        settings,
+        page_id=page_id,
+        page_path=old_path,
+        content=content,
+    )
+    detected_at = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
+    store = VaultEventStore(settings)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions, events=store)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    second_delete = store.begin_occurrence(
+        "delete",
+        other_old_path,
+        detected_at=detected_at,
+    )
+    second = store.get_or_create_pending_delete(
+        occurrence_id=second_delete.id,
+        page_id=page_id,
+        old_page_path=other_old_path,
+        file_hash=hashlib.sha256(content).hexdigest(),
+        semantic_hash=None,
+        detected_at=detected_at,
+        expires_at=detected_at + timedelta(seconds=5),
+    )
+    store.finish_occurrence(second_delete.id, "deferred", page_id=page_id)
+    write_page(settings, new_path, content)
+
+    original_find = store.find_pending_deletes
+    reads = 0
+
+    def cancel_candidate_after_initial_read(*, page_id):
+        nonlocal reads
+        candidates = original_find(page_id=page_id)
+        reads += 1
+        if reads == 1:
+            assert len(candidates) == 2
+            assert store.cancel_delete(second.id, "vocc_racing_cancel") is True
+        return candidates
+
+    monkeypatch.setattr(
+        store,
+        "find_pending_deletes",
+        cancel_candidate_after_initial_read,
+    )
+
+    await handle(
+        service,
+        [VaultFsEvent("add", new_path)],
+        detected_at=detected_at + timedelta(milliseconds=100),
+    )
+
+    assert [call[0] for call in revisions.calls] == ["rename"]
+    with connect_app(settings) as conn:
+        occurrence = conn.execute(
+            """
+            SELECT status,sync_issue_id FROM vault_watch_occurrences
+            WHERE kind='add' AND page_path=?
+            """,
+            (new_path,),
+        ).fetchone()
+        issue_count = conn.execute(
+            "SELECT COUNT(*) FROM vault_sync_issues WHERE page_path=?",
+            (new_path,),
+        ).fetchone()[0]
+    assert tuple(occurrence) == ("renamed", None)
+    assert issue_count == 0

@@ -161,6 +161,29 @@ class VaultSyncService:
             error_summary=error_summary,
         )
 
+    async def _await_revision_mutation(
+        self,
+        mutation: Any,
+        *args: Any,
+    ) -> tuple[Any, bool]:
+        worker = asyncio.create_task(asyncio.to_thread(mutation, *args))
+        cancellation_requested = False
+        while True:
+            try:
+                result = await asyncio.shield(worker)
+                return result, cancellation_requested
+            except asyncio.CancelledError:
+                cancellation_requested = True
+            except Exception:
+                if cancellation_requested:
+                    raise asyncio.CancelledError from None
+                raise
+
+    @staticmethod
+    def _propagate_cancellation(cancellation_requested: bool) -> None:
+        if cancellation_requested:
+            raise asyncio.CancelledError
+
     def _same_path_evidence(
         self,
         candidate: PendingVaultDelete,
@@ -208,13 +231,14 @@ class VaultSyncService:
         occurrence: VaultWatchOccurrence,
         observation: FileObservationInput,
     ) -> None:
-        result = await asyncio.to_thread(
+        result, cancellation_requested = await self._await_revision_mutation(
             self.revisions.ingest_external_change,
             occurrence.id,
             occurrence.page_path,
             observation,
         )
         self._finish_result(occurrence, result)
+        self._propagate_cancellation(cancellation_requested)
 
     async def _process_add_or_modify(
         self,
@@ -233,6 +257,14 @@ class VaultSyncService:
         same_path = self.events.find_pending_delete_for_path(occurrence.page_path)
         if same_path is not None:
             async with self._page_lock(same_path.page_id):
+                observation = await wait_for_stable_observation(
+                    absolute_path,
+                    self.limits,
+                    timeout_seconds=(
+                        self.settings.vault_watch_stability_timeout_seconds
+                    ),
+                    poll_interval=stability_poll_interval,
+                )
                 pending = self._same_path_evidence(
                     same_path,
                     occurrence,
@@ -244,7 +276,7 @@ class VaultSyncService:
                         "same-path save evidence changed",
                         current_revision_id=None,
                     )
-                result = await asyncio.to_thread(
+                result, cancellation_requested = await self._await_revision_mutation(
                     self.revisions.ingest_external_change,
                     occurrence.id,
                     occurrence.page_path,
@@ -259,68 +291,90 @@ class VaultSyncService:
                         else "reappeared after delete grace"
                     ),
                 )
+                self._propagate_cancellation(cancellation_requested)
             return
 
         page_id = self._managed_page_id(observation)
-        candidates = (
+        if page_id is not None:
             self.events.find_pending_deletes(page_id=page_id)
-            if page_id is not None
-            else []
-        )
-        if len(candidates) == 1:
-            candidate = candidates[0]
-            async with self._page_lock(candidate.page_id):
+        lock_key = page_id or occurrence.page_path
+        while True:
+            async with self._page_lock(lock_key):
+                observation = await wait_for_stable_observation(
+                    absolute_path,
+                    self.limits,
+                    timeout_seconds=(
+                        self.settings.vault_watch_stability_timeout_seconds
+                    ),
+                    poll_interval=stability_poll_interval,
+                )
+                page_id = self._managed_page_id(observation)
+                fresh_lock_key = page_id or occurrence.page_path
+                if fresh_lock_key != lock_key:
+                    lock_key = fresh_lock_key
+                    continue
+
+                candidates = (
+                    self.events.find_pending_deletes(page_id=page_id)
+                    if page_id is not None
+                    else []
+                )
+                if not candidates:
+                    await self._ingest(occurrence, observation)
+                    return
+                if len(candidates) > 1:
+                    candidate_paths = ", ".join(
+                        candidate.old_page_path for candidate in candidates
+                    )
+                    issue = self.events.upsert_sync_issue(
+                        page_path=occurrence.page_path,
+                        file_hash=observation.file_hash,
+                        page_id=page_id,
+                        issue_type="ambiguous_rename",
+                        error_summary=(
+                            "multiple pending deletes match managed page identity: "
+                            f"{candidate_paths}"
+                        ),
+                    )
+                    self.events.finish_occurrence(
+                        occurrence.id,
+                        "invalid",
+                        page_id=page_id,
+                        sync_issue_id=issue.id,
+                    )
+                    return
+
+                candidate = candidates[0]
                 pending = self._rename_evidence(
                     candidate,
                     occurrence,
                     absolute_path,
                 )
                 if observation.file_hash == pending.file_hash:
-                    result = await asyncio.to_thread(
-                        self.revisions.rename_page,
-                        occurrence.id,
-                        pending.old_page_path,
-                        occurrence.page_path,
+                    result, cancellation_requested = (
+                        await self._await_revision_mutation(
+                            self.revisions.rename_page,
+                            occurrence.id,
+                            pending.old_page_path,
+                            occurrence.page_path,
+                        )
                     )
                 else:
-                    result = await asyncio.to_thread(
-                        self.revisions.relocate_external_change,
-                        occurrence.id,
-                        pending.old_page_path,
-                        occurrence.page_path,
-                        pending.page_id,
-                        observation,
+                    result, cancellation_requested = (
+                        await self._await_revision_mutation(
+                            self.revisions.relocate_external_change,
+                            occurrence.id,
+                            pending.old_page_path,
+                            occurrence.page_path,
+                            pending.page_id,
+                            observation,
+                        )
                     )
                 if result.status in {"renamed", "applied", "ignored"}:
                     self.events.cancel_delete(pending.id, occurrence.id)
                 self._finish_result(occurrence, result)
-            return
-
-        if len(candidates) > 1:
-            candidate_paths = ", ".join(
-                candidate.old_page_path for candidate in candidates
-            )
-            issue = self.events.upsert_sync_issue(
-                page_path=occurrence.page_path,
-                file_hash=observation.file_hash,
-                page_id=page_id,
-                issue_type="ambiguous_rename",
-                error_summary=(
-                    "multiple pending deletes match managed page identity: "
-                    f"{candidate_paths}"
-                ),
-            )
-            self.events.finish_occurrence(
-                occurrence.id,
-                "invalid",
-                page_id=page_id,
-                sync_issue_id=issue.id,
-            )
-            return
-
-        lock_key = page_id or occurrence.page_path
-        async with self._page_lock(lock_key):
-            await self._ingest(occurrence, observation)
+                self._propagate_cancellation(cancellation_requested)
+                return
 
     async def _handle_occurrence(
         self,
