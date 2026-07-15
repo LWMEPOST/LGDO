@@ -122,7 +122,7 @@ function installFetch({
   role?: string;
   vaultStatusResponse?: Promise<Response>;
   reconcilePostResponse?: Promise<Response>;
-  reconcileJobs?: Array<{ job_id: string; status: string; result: Record<string, number> | null; error_summary: string | null }>;
+  reconcileJobs?: Array<Error | { job_id: string; status: string; result: Record<string, number> | null; error_summary: string | null }>;
 } = {}) {
   const requests: Array<{ path: string; method: string }> = [];
   const authorizations: Array<{ path: string; value: string | null }> = [];
@@ -212,7 +212,9 @@ function installFetch({
       return jsonResponse({ job_id: "reconcile-1", status: "queued", result: null, error_summary: null }, 202, "Accepted");
     }
     if (path === "/api/internal/vault/reconcile/reconcile-1" && method === "GET" && reconcileJobs.length) {
-      return jsonResponse(reconcileJobs.shift());
+      const response = reconcileJobs.shift();
+      if (response instanceof Error) throw response;
+      return jsonResponse(response);
     }
 
     throw new Error(`Unexpected request: ${method} ${path}`);
@@ -488,5 +490,83 @@ describe("App vault integration", () => {
 
     expect(requests.filter(({ path }) => path === "/api/internal/vault/reconcile/reconcile-1"))
       .toHaveLength(0);
+  });
+
+  it("retries a failed reconcile poll with backoff until the job is terminal", async () => {
+    const { requests } = installFetch({
+      role: "admin",
+      reconcileJobs: [
+        new Error("对账状态暂时不可用"),
+        { job_id: "reconcile-1", status: "succeeded", result: { repaired: 1 }, error_summary: null },
+      ],
+    });
+    setAuthToken("test-token");
+
+    render(<App />);
+
+    expect(await screen.findByText("LGDO Console")).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("知识"));
+    const button = await screen.findByRole("button", { name: "立即对账" });
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(button);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(screen.getByText("对账状态暂时不可用")).toBeInTheDocument();
+    expect(screen.getByText("对账排队中")).toBeInTheDocument();
+    expect(button).toBeDisabled();
+    expect(requests.filter(({ path }) => path === "/api/internal/vault/reconcile/reconcile-1")).toHaveLength(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(requests.filter(({ path }) => path === "/api/internal/vault/reconcile/reconcile-1")).toHaveLength(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(screen.getByText("对账已完成")).toBeInTheDocument();
+    expect(button).toBeEnabled();
+    expect(requests.filter(({ path }) => path === "/api/internal/vault/reconcile/reconcile-1")).toHaveLength(2);
+  });
+
+  it("tracks an active reconcile job when vault status is unavailable", async () => {
+    const { requests } = installFetch({
+      role: "admin",
+      vaultUnavailable: true,
+      reconcileJobs: [
+        { job_id: "reconcile-1", status: "succeeded", result: { repaired: 1 }, error_summary: null },
+      ],
+    });
+    setAuthToken("test-token");
+
+    render(<App />);
+
+    expect(await screen.findByText("LGDO Console")).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("知识"));
+    expect(screen.getByText("同步状态未知")).toBeInTheDocument();
+    const button = await screen.findByRole("button", { name: "立即对账" });
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(button);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(screen.getByText("对账排队中")).toBeInTheDocument();
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(requests.filter(({ path, method }) => path === "/api/internal/vault/reconcile" && method === "POST"))
+      .toHaveLength(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(screen.getByText("对账已完成")).toBeInTheDocument();
+    expect(button).toBeEnabled();
   });
 });

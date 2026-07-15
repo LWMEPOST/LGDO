@@ -1,7 +1,7 @@
 import { ExternalLink, RefreshCw } from "lucide-react";
 
 import { Field, Item, List, Panel } from "../components/common";
-import type { AuthUser, EditorState, SpaceFilter, VaultStatus, WikiPage } from "../types";
+import type { AuthUser, EditorState, SpaceFilter, VaultReconcileJob, VaultStatus, WikiPage } from "../types";
 import { translatePageType, translateReviewStatus } from "../utils/format";
 import { countPagesByType } from "../utils/space";
 
@@ -16,6 +16,7 @@ export function WikiTask({
   markPageStale,
   openInObsidian,
   requestReconcile,
+  reconcileJob,
   vaultStatus,
   currentUser,
   showToast,
@@ -30,13 +31,14 @@ export function WikiTask({
   markPageStale: (path?: string) => Promise<void>;
   openInObsidian: (path: string) => Promise<void>;
   requestReconcile: () => Promise<void>;
+  reconcileJob: VaultReconcileJob | null;
   vaultStatus: VaultStatus | null;
   currentUser: AuthUser;
   showToast: (message: string) => void;
 }) {
   const buckets = countPagesByType(pages);
   const canReconcile = currentUser.role === "admin" || currentUser.role === "owner" || currentUser.acl_tags.includes("*");
-  const reconcile = vaultStatus?.reconcile;
+  const reconcile = reconcileJob ?? vaultStatus?.reconcile;
   const reconcileActive = reconcile?.status === "queued" || reconcile?.status === "running";
   const reconcileLabel = reconcile && ({
     queued: "对账排队中",
@@ -71,10 +73,10 @@ export function WikiTask({
         <div aria-live="polite" className={`sync-status ${syncTone}`} role="status">
           <div className="sync-status-copy">
             <strong>{syncLabel}</strong>
-            {vaultStatus && (
+            {(vaultStatus || reconcileLabel) && (
               <div className="sync-status-metrics">
-                <span>{vaultStatus.pending_occurrences} 个待处理事件</span>
-                <span>{vaultStatus.open_issues} 个同步问题</span>
+                {vaultStatus && <span>{vaultStatus.pending_occurrences} 个待处理事件</span>}
+                {vaultStatus && <span>{vaultStatus.open_issues} 个同步问题</span>}
                 {reconcileLabel && <span>{reconcileLabel}</span>}
                 {reconcile?.status === "failed" && reconcile.error_summary && <span>{reconcile.error_summary}</span>}
               </div>

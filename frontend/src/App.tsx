@@ -42,6 +42,7 @@ import {
 } from "./utils/space";
 
 const VAULT_RECONCILE_POLL_MS = 1_000;
+const VAULT_RECONCILE_MAX_BACKOFF_MS = 8_000;
 
 function reconcileStatusRank(status: string) {
   if (status === "queued") return 0;
@@ -64,6 +65,7 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
   const [gaps, setGaps] = useState<KnowledgeGap[]>([]);
   const [ragStatus, setRagStatus] = useState<RagStatus | null>(null);
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
+  const [trackedReconcileJob, setTrackedReconcileJob] = useState<VaultReconcileJob | null>(null);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [accounts, setAccounts] = useState<AccountRecord[]>([]);
   const [authLoading, setAuthLoading] = useState(true);
@@ -105,15 +107,18 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
   const reconcileTimerRef = useRef<number | null>(null);
   const reconcileJobRef = useRef<VaultReconcileJob | null>(null);
   const reconcileRequestGenerationRef = useRef<number | null>(null);
+  const reconcilePollFailureCountRef = useRef(0);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [sourcePreview, setSourcePreview] = useState<SourcePreview | null>(null);
   const [sourcePreviewLoading, setSourcePreviewLoading] = useState(false);
 
-  function resetVaultReconcileTracking() {
+  function resetVaultReconcileTracking(clearReactiveState = true) {
     if (reconcileTimerRef.current !== null) window.clearTimeout(reconcileTimerRef.current);
     reconcileTimerRef.current = null;
     reconcileJobRef.current = null;
     reconcileRequestGenerationRef.current = null;
+    reconcilePollFailureCountRef.current = 0;
+    if (clearReactiveState) setTrackedReconcileJob(null);
   }
 
   useEffect(() => {
@@ -121,7 +126,7 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
     return () => {
       mountedRef.current = false;
       sessionGenerationRef.current += 1;
-      resetVaultReconcileTracking();
+      resetVaultReconcileTracking(false);
     };
   }, []);
 
@@ -159,13 +164,22 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
     return job;
   }
 
+  function trackReconcileJob(job: VaultReconcileJob) {
+    const tracked = mergeTrackedReconcile(job);
+    setTrackedReconcileJob(tracked);
+    return tracked;
+  }
+
   function mergeVaultStatus(snapshot: VaultStatus) {
     const tracked = reconcileJobRef.current;
-    if (!tracked) return snapshot;
+    if (!tracked) {
+      if (snapshot.reconcile) trackReconcileJob(snapshot.reconcile);
+      return snapshot;
+    }
     if (!snapshot.reconcile || snapshot.reconcile.job_id !== tracked.job_id) {
       return { ...snapshot, reconcile: tracked };
     }
-    const reconcile = mergeTrackedReconcile(snapshot.reconcile);
+    const reconcile = trackReconcileJob(snapshot.reconcile);
     return reconcile === snapshot.reconcile ? snapshot : { ...snapshot, reconcile };
   }
 
@@ -178,14 +192,20 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
     }
   }
 
-  function scheduleVaultReconcilePoll(jobId: string, generation: number) {
+  function scheduleVaultReconcilePoll(jobId: string, generation: number, delay = VAULT_RECONCILE_POLL_MS) {
     if (reconcileTimerRef.current !== null) window.clearTimeout(reconcileTimerRef.current);
     reconcileTimerRef.current = window.setTimeout(() => {
       reconcileTimerRef.current = null;
+      if (
+        !isCurrentGeneration(generation)
+        || reconcileJobRef.current?.job_id !== jobId
+        || !isActiveReconcile(reconcileJobRef.current)
+      ) return;
       void api<VaultReconcileJob>(`/api/internal/vault/reconcile/${encodeURIComponent(jobId)}`)
         .then((response) => {
           if (!isCurrentGeneration(generation) || reconcileJobRef.current?.job_id !== jobId) return;
-          const job = mergeTrackedReconcile(response);
+          reconcilePollFailureCountRef.current = 0;
+          const job = trackReconcileJob(response);
           setVaultStatus((current) => current ? { ...current, reconcile: job } : current);
           if (isActiveReconcile(job)) {
             scheduleVaultReconcilePoll(jobId, generation);
@@ -194,10 +214,23 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
           }
         })
         .catch((error) => {
-          if (!isCurrentGeneration(generation) || reconcileJobRef.current?.job_id !== jobId) return;
-          showToast(error instanceof Error ? error.message : "Vault 对账状态查询失败");
+          if (
+            !isCurrentGeneration(generation)
+            || reconcileJobRef.current?.job_id !== jobId
+            || !isActiveReconcile(reconcileJobRef.current)
+          ) return;
+          const previousFailures = reconcilePollFailureCountRef.current;
+          reconcilePollFailureCountRef.current = Math.min(previousFailures + 1, 3);
+          if (previousFailures === 0) {
+            showToast(error instanceof Error ? error.message : "Vault 对账状态查询失败");
+          }
+          const retryDelay = Math.min(
+            VAULT_RECONCILE_POLL_MS * (2 ** reconcilePollFailureCountRef.current),
+            VAULT_RECONCILE_MAX_BACKOFF_MS,
+          );
+          scheduleVaultReconcilePoll(jobId, generation, retryDelay);
         });
-    }, VAULT_RECONCILE_POLL_MS);
+    }, delay);
   }
 
   async function bootstrapAuth() {
@@ -414,12 +447,14 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
 
   async function requestVaultReconcile() {
     const generation = sessionGenerationRef.current;
+    if (reconcileJobRef.current && isActiveReconcile(reconcileJobRef.current)) return;
     if (reconcileRequestGenerationRef.current === generation) return;
     reconcileRequestGenerationRef.current = generation;
     try {
       const job = await api<VaultReconcileJob>("/api/internal/vault/reconcile", { method: "POST" });
       if (!isCurrentGeneration(generation)) return;
-      const trackedJob = mergeTrackedReconcile(job);
+      const trackedJob = trackReconcileJob(job);
+      reconcilePollFailureCountRef.current = 0;
       setVaultStatus((current) => current ? { ...current, reconcile: trackedJob } : null);
       showToast(`Vault 对账已进入${job.status}`);
       if (isActiveReconcile(trackedJob)) {
@@ -724,6 +759,7 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
         markPageStale={markPageStale}
         openInObsidian={openInObsidian}
         requestReconcile={requestVaultReconcile}
+        reconcileJob={trackedReconcileJob}
         vaultStatus={vaultStatus}
         currentUser={currentUser}
         showToast={showToast}

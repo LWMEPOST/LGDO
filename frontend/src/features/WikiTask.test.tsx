@@ -86,6 +86,7 @@ function renderWikiTask(overrides: Partial<WikiTaskProps> = {}) {
     markPageStale: vi.fn(async () => undefined),
     openInObsidian: vi.fn(async () => undefined),
     requestReconcile: vi.fn(async () => undefined),
+    reconcileJob: null,
     vaultStatus: healthyVaultStatus,
     currentUser: viewer,
     showToast: vi.fn(),
