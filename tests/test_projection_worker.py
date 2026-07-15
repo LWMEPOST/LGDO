@@ -968,6 +968,64 @@ def test_reconcile_lease_loss_cancels_inventory_before_finish(
     assert persisted.lease_owner == service._reconcile_owner
 
 
+def test_simultaneous_inventory_and_owner_cancel_requeues_reconcile(
+    settings,
+    monkeypatch,
+):
+    settings.vault_reconcile_lease_seconds = 0.03
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+
+    def lose_lease(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(events, "renew_reconcile", lose_lease)
+
+    async def exercise():
+        inventory_cancel_started = asyncio.Event()
+        release_inventory = asyncio.Event()
+
+        async def blocked_inventory(**_kwargs):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                inventory_cancel_started.set()
+                await release_inventory.wait()
+                raise
+
+        monkeypatch.setattr(service, "reconcile_startup", blocked_inventory)
+        job = service.request_reconcile("admin")
+        owner_task = service._reconcile_tasks[job.id]
+        await inventory_cancel_started.wait()
+
+        # Queue child completion before stop cancels the owner task. Both are
+        # observed by _cancel_and_await in the same event-loop turn.
+        release_inventory.set()
+        stop_task = asyncio.create_task(service.stop())
+        await stop_task
+        await asyncio.sleep(0)
+
+        assert owner_task.cancelled()
+        with pytest.raises(asyncio.CancelledError):
+            owner_task.result()
+        live_reconcile_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and task.get_name().startswith("vault-reconcile")
+        ]
+        assert live_reconcile_tasks == []
+        return job
+
+    job = asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert persisted is not None
+    assert persisted.status == "queued"
+    assert persisted.lease_owner is None
+    assert service._reconcile_tasks == {}
+
+
 def test_reconcile_heartbeat_error_is_lease_loss_without_failing_job(
     settings,
     monkeypatch,
@@ -1191,6 +1249,82 @@ def test_stop_cancels_owned_reconcile_and_requeues_its_lease(
     assert persisted.status == "queued"
     assert persisted.lease_owner is None
     assert service._reconcile_tasks == {}
+
+
+def test_completed_reconcile_tasks_are_evicted_and_stop_request_is_safe(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+
+    async def completed_inventory(**_kwargs):
+        return {"ingested": 0, "failed": 0, "projection_jobs": 0}
+
+    monkeypatch.setattr(service, "reconcile_startup", completed_inventory)
+
+    async def exercise() -> None:
+        job_ids: list[str] = []
+        for index in range(5):
+            job = service.request_reconcile(f"admin-{index}")
+            job_ids.append(job.id)
+            task = service._reconcile_tasks[job.id]
+            await task
+            await asyncio.sleep(0)
+        assert len(set(job_ids)) == 5
+        assert service._reconcile_tasks == {}
+
+        watcher_stop_started = asyncio.Event()
+        release_watcher_stop = asyncio.Event()
+        inventory_started = asyncio.Event()
+
+        class BlockingWatcher:
+            async def stop(self):
+                watcher_stop_started.set()
+                await release_watcher_stop.wait()
+
+        async def blocked_inventory(**_kwargs):
+            inventory_started.set()
+            await asyncio.Future()
+
+        service._watcher = BlockingWatcher()
+        monkeypatch.setattr(service, "reconcile_startup", blocked_inventory)
+        stop_task = asyncio.create_task(service.stop())
+        await watcher_stop_started.wait()
+        concurrent_job = service.request_reconcile("during-stop")
+        await inventory_started.wait()
+        release_watcher_stop.set()
+        await stop_task
+        await asyncio.sleep(0)
+
+        persisted = events.get_reconcile(concurrent_job.id)
+        assert persisted is not None
+        assert persisted.status == "queued"
+        assert service._reconcile_tasks == {}
+
+    asyncio.run(exercise())
+
+
+def test_old_reconcile_done_callback_cannot_remove_replacement(settings):
+    service = VaultSyncService(settings)
+
+    async def exercise() -> None:
+        old_task = asyncio.create_task(asyncio.sleep(0))
+        await old_task
+        replacement = asyncio.create_task(asyncio.Event().wait())
+        job_id = "vrec_replacement"
+        service._reconcile_tasks[job_id] = replacement
+
+        service._consume_reconcile_task(job_id, old_task)
+
+        assert service._reconcile_tasks[job_id] is replacement
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
+        service._consume_reconcile_task(job_id, replacement)
+        assert job_id not in service._reconcile_tasks
+        service._consume_reconcile_task(job_id, old_task)
+
+    asyncio.run(exercise())
 
 
 def test_vault_runtime_reports_idle_watcher_as_running(settings):

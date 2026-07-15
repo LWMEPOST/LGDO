@@ -114,15 +114,26 @@ class VaultSyncService:
     async def _cancel_and_await(task: asyncio.Task[Any] | None) -> bool:
         if task is None:
             return False
+        owner_task = asyncio.current_task()
+        cancelling_baseline = (
+            owner_task.cancelling() if owner_task is not None else 0
+        )
         task.cancel()
         cancellation_requested = False
         while not task.done():
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
+                current_cancelling = (
+                    owner_task.cancelling() if owner_task is not None else 0
+                )
+                if current_cancelling > cancelling_baseline:
+                    cancellation_requested = True
+                    cancelling_baseline = current_cancelling
                 if task.done() and task.cancelled():
                     break
-                cancellation_requested = True
+                if owner_task is None:
+                    cancellation_requested = True
             except Exception:
                 break
         if task.done() and not task.cancelled():
@@ -328,14 +339,18 @@ class VaultSyncService:
                     if work_cancelled or heartbeat_cancelled:
                         raise asyncio.CancelledError
 
-    @staticmethod
-    def _consume_reconcile_task(task: asyncio.Task[None]) -> None:
-        if task.cancelled():
-            return
-        try:
-            task.exception()
-        except Exception:
-            pass
+    def _consume_reconcile_task(
+        self,
+        job_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        if not task.cancelled():
+            try:
+                task.exception()
+            except Exception:
+                pass
+        if self._reconcile_tasks.get(job_id) is task:
+            self._reconcile_tasks.pop(job_id, None)
 
     def _ensure_reconcile_task(self, job_id: str) -> asyncio.Task[None]:
         task = self._reconcile_tasks.get(job_id)
@@ -344,7 +359,12 @@ class VaultSyncService:
                 self._run_reconcile_job(job_id),
                 name=f"vault-reconcile-{job_id}",
             )
-            task.add_done_callback(self._consume_reconcile_task)
+            task.add_done_callback(
+                lambda completed, requested_job_id=job_id: self._consume_reconcile_task(
+                    requested_job_id,
+                    completed,
+                )
+            )
             self._reconcile_tasks[job_id] = task
         return task
 
