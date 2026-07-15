@@ -2869,81 +2869,18 @@ class WikiRevisionService:
         )
         if observed.rowcount != 1:
             raise WikiRevisionError("current-byte observation status CAS failed")
-        previous_epoch = int(page.get("projection_epoch") or 0)
-        next_epoch = previous_epoch + 1
-        lifecycle_changed = page.get("lifecycle_status") != "active"
-        restored = locked.conn.execute(
-            """
-            UPDATE wiki_pages
-            SET lifecycle_status='active',deleted_at=NULL,sync_error=NULL,
-                observed_file_hash=?,projection_epoch=?,
-                rag_visible_revision_id=NULL,rag_visible_epoch=NULL,updated_at=?
-            WHERE page_id=? AND path=? AND current_revision_id=?
-              AND projection_epoch=? AND pending_write_intent_id IS NULL
-            """,
-            (
-                observation["file_hash"],
-                next_epoch,
-                timestamp,
-                page["page_id"],
-                page["path"],
-                page["current_revision_id"],
-                previous_epoch,
-            ),
-        )
-        if restored.rowcount != 1:
-            raise RevisionConflict(
-                "page changed while reusing current observed bytes",
-                current_revision_id=page.get("current_revision_id"),
-                pending_intent_id=page.get("pending_write_intent_id"),
-            )
-        page.update(
-            lifecycle_status="active",
-            deleted_at=None,
-            sync_error=None,
-            observed_file_hash=observation["file_hash"],
-            projection_epoch=next_epoch,
-            rag_visible_revision_id=None,
-            rag_visible_epoch=None,
-        )
-        locked.conn.execute(
-            """
-            UPDATE review_items
-            SET status='superseded',resolved_at=?,updated_at=?
-            WHERE page_id=? AND issue_type='invalid_frontmatter'
-              AND status='pending'
-            """,
-            (timestamp, timestamp, page["page_id"]),
-        )
-        self._reconcile_pending_reviews_locked(
-            locked.conn,
-            page["page_id"],
-            allow_conflicts=not lifecycle_changed,
-        )
-        self.outbox.supersede_stale(
-            locked.conn,
-            page["page_id"],
-            next_epoch,
-        )
-        jobs = self.outbox.enqueue_pair_for_state(
-            locked.conn,
-            page,
-            "upsert",
-            {"path": page["path"]},
-        )
         terminal_result = MutationResult(
             page_id=page["page_id"],
             page_path=page["path"],
-            status="applied",
+            status="ignored",
             revision_id=page["current_revision_id"],
             current_revision_id=page["current_revision_id"],
             generated_revision_id=page.get("generated_revision_id"),
             observation_id=observation["id"],
-            projection_job_ids=tuple(jobs),
         )
-        applied = locked.conn.execute(
+        ignored = locked.conn.execute(
             """
-            UPDATE vault_change_events SET expected_state_json=?,status='applied',
+            UPDATE vault_change_events SET expected_state_json=?,status='ignored',
                 result_revision_id=?,result_payload_json=?,updated_at=?
             WHERE id=? AND observation_id=? AND status='pending'
             """,
@@ -2956,19 +2893,20 @@ class WikiRevisionService:
                 observation["id"],
             ),
         )
-        if applied.rowcount != 1:
+        if ignored.rowcount != 1:
             raise RevisionConflict(
                 "external event changed while reusing current bytes",
                 current_revision_id=page.get("current_revision_id"),
             )
         audit(
             locked.conn,
-            "wiki_external_change_reused_current",
+            "wiki_external_change_ignored",
             {
                 "event_id": event_id,
                 "observation_id": observation["id"],
                 "page_id": page["page_id"],
                 "revision_id": page["current_revision_id"],
+                "status": "ignored",
             },
             timestamp,
         )
@@ -3444,7 +3382,7 @@ class WikiRevisionService:
             raise pending_conflict
         if prepared is None:
             raise WikiRevisionError("external change did not produce a result")
-        if prepared.status in {"invalid", "applied"}:
+        if prepared.status in {"invalid", "applied", "ignored"}:
             return prepared
 
         from app.vault_writer import IntentExecutor

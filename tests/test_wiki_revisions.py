@@ -1603,6 +1603,94 @@ def test_valid_external_change_applied_audit_preserves_event_identity(
     assert payload["base_revision_id"] == before.current_revision_id
 
 
+def test_active_exact_current_observation_is_terminal_ignored_noop(
+    page_with_generated,
+):
+    service, before = page_with_generated
+    target = service.settings.vault_path / before.page_path
+    target.write_bytes(before.raw_bytes)
+    with connect_app(service.settings) as conn:
+        conn.execute(
+            """
+            UPDATE wiki_pages
+            SET rag_visible_revision_id=current_revision_id,
+                rag_visible_epoch=projection_epoch
+            WHERE page_id=?
+            """,
+            (before.page_id,),
+        )
+        revision_count_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        job_count_before = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+
+    observation = capture_file_observation(
+        target,
+        max_content_bytes=1024 * 1024,
+    )
+    result = service.ingest_external_change(
+        "external-exact-current-ignored",
+        before.page_path,
+        observation,
+    )
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        revision_count_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        job_count_after = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_projection_jobs WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            ("external-exact-current-ignored",),
+        ).fetchone()
+        stored_observation = conn.execute(
+            "SELECT * FROM wiki_file_observations WHERE id=?",
+            (result.observation_id,),
+        ).fetchone()
+        audits = conn.execute(
+            """
+            SELECT payload_json FROM audit_logs
+            WHERE event_type='wiki_external_change_ignored'
+            """
+        ).fetchall()
+
+    assert result.status == "ignored"
+    assert result.revision_id == before.current_revision_id
+    assert result.current_revision_id == before.current_revision_id
+    assert result.projection_job_ids == ()
+    assert event["status"] == "ignored"
+    assert stored_observation["parse_status"] == "valid"
+    assert stored_observation["error_code"] is None
+    assert revision_count_after == revision_count_before
+    assert job_count_after == job_count_before
+    assert page["projection_epoch"] == before.projection_epoch
+    assert page["rag_visible_revision_id"] == before.current_revision_id
+    assert page["rag_visible_epoch"] == before.projection_epoch
+    event_result = json.loads(event["result_payload_json"])
+    assert event_result["status"] == "ignored"
+    assert event_result["projection_job_ids"] == []
+    audit_payloads = [json.loads(row["payload_json"]) for row in audits]
+    audit_payload = next(
+        payload
+        for payload in audit_payloads
+        if payload.get("event_id") == "external-exact-current-ignored"
+    )
+    assert audit_payload["status"] == "ignored"
+    assert audit_payload["revision_id"] == before.current_revision_id
+
+
 def test_external_edit_is_immutable_revision_and_same_event_replays(
     page_with_generated,
 ):

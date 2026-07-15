@@ -285,8 +285,13 @@ class ProjectionWorker:
             nonlocal succeeded, failed, superseded
             for job in jobs:
                 try:
+                    project = (
+                        self._project_rag_delete
+                        if job.operation == "delete"
+                        else projector.project
+                    )
                     projection_task = asyncio.create_task(
-                        asyncio.to_thread(projector.project, job, self.worker_id)
+                        asyncio.to_thread(project, job, self.worker_id)
                     )
                     try:
                         await asyncio.shield(projection_task)
@@ -321,7 +326,66 @@ class ProjectionWorker:
             superseded=superseded,
         )
 
+    def _project_rag_delete(self, job: ProjectionJob, worker_id: str) -> None:
+        superseded = False
+        with connect_app_write(self.settings) as conn:
+            suffix = (
+                " FOR UPDATE"
+                if self.settings.database_backend == "postgres"
+                else ""
+            )
+            page = conn.execute(
+                """
+                SELECT lifecycle_status,projection_epoch
+                FROM wiki_pages WHERE page_id=?
+                """
+                + suffix,
+                (job.page_id,),
+            ).fetchone()
+            matches_delete = bool(
+                page is not None
+                and page["lifecycle_status"] in {"deleted", "invalid"}
+                and int(page["projection_epoch"] or 0) == job.projection_epoch
+            )
+            if not matches_delete:
+                if not self.outbox.finish_claimed(
+                    conn,
+                    job_id=job.id,
+                    worker_id=worker_id,
+                    status="superseded",
+                    last_error="delete no longer matches page lifecycle or epoch",
+                ):
+                    raise RagProjectionLeaseLost(job.id)
+                superseded = True
+            else:
+                cleared = conn.execute(
+                    """
+                    UPDATE wiki_pages
+                    SET rag_visible_revision_id=NULL,rag_visible_epoch=NULL
+                    WHERE page_id=? AND lifecycle_status IN ('deleted','invalid')
+                      AND projection_epoch=?
+                    """,
+                    (job.page_id, job.projection_epoch),
+                )
+                if cleared.rowcount != 1:
+                    raise RagProjectionLeaseLost(job.id)
+                conn.execute(
+                    "DELETE FROM wiki_chunks WHERE page_id=?",
+                    (job.page_id,),
+                )
+                if not self.outbox.finish_claimed(
+                    conn,
+                    job_id=job.id,
+                    worker_id=worker_id,
+                    status="succeeded",
+                ):
+                    raise RagProjectionLeaseLost(job.id)
+        if superseded:
+            raise ProjectionSuperseded(job.id)
+
     async def _run_gbrain_once(self) -> WorkerRunResult:
+        if not self.settings.gbrain_enabled:
+            return WorkerRunResult(target="gbrain")
         jobs = self._claim("gbrain")
         if not jobs:
             return WorkerRunResult(target="gbrain")

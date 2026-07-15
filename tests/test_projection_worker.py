@@ -50,7 +50,9 @@ def settings(tmp_path) -> Settings:
         database_backend="sqlite",
         database_path=tmp_path / "projection-worker.db",
         vault_path=tmp_path / "vault",
+        gbrain_enabled=True,
         gbrain_endpoint="https://gbrain.example/mcp",
+        gbrain_query_api_key="query-token",
         gbrain_projection_api_key="projection-token",
         gbrain_managed_source_id="lgdo-managed",
         projection_worker_enabled=True,
@@ -823,6 +825,205 @@ def test_worker_rejects_a_late_rag_result_after_lease_loss(settings, monkeypatch
     )
 
 
+def test_rag_delete_removes_all_page_chunks_and_finishes_atomically(settings):
+    outbox = ProjectionOutbox(settings)
+    page_id = "page-rag-delete"
+    epoch = 4
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,projection_epoch,
+              lifecycle_status,rag_visible_revision_id,rag_visible_epoch
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/delete.md",
+                page_id,
+                "product",
+                "policy",
+                "Delete",
+                "[]",
+                "draft",
+                "t0",
+                "t0",
+                "wrev-old",
+                epoch,
+                "deleted",
+                None,
+                None,
+            ),
+        )
+        for chunk_epoch in (2, 3):
+            conn.execute(
+                """
+                INSERT INTO wiki_chunks(
+                  id,page_id,revision_id,projection_epoch,chunk_index,page_path,
+                  domain,title,text,token_json,embedding_json,embedding_model,
+                  source_ids_json,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    f"chunk-delete-{chunk_epoch}",
+                    page_id,
+                    "wrev-old",
+                    chunk_epoch,
+                    0,
+                    "wiki/product/delete.md",
+                    "product",
+                    "Delete",
+                    f"old chunk {chunk_epoch}",
+                    "[]",
+                    "[]",
+                    "local-hash-v1",
+                    "[]",
+                    "t0",
+                    "t0",
+                ),
+            )
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="delete",
+            page_id=page_id,
+            revision_id=None,
+            projection_epoch=epoch,
+            payload={"path": "wiki/product/delete.md", "reason": "deleted"},
+        )
+
+    worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+    result = asyncio.run(worker.run_once("rag"))
+
+    with connect_app(settings) as conn:
+        job = conn.execute(
+            "SELECT status,lease_owner FROM knowledge_projection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        page = conn.execute(
+            """
+            SELECT lifecycle_status,projection_epoch,rag_visible_revision_id,
+                   rag_visible_epoch
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (page_id,),
+        ).fetchone()
+        chunks = conn.execute(
+            "SELECT COUNT(*) FROM wiki_chunks WHERE page_id=?",
+            (page_id,),
+        ).fetchone()[0]
+    assert (result.claimed, result.succeeded, result.superseded) == (1, 1, 0)
+    assert tuple(job) == ("succeeded", None)
+    assert tuple(page) == ("deleted", epoch, None, None)
+    assert chunks == 0
+
+
+def test_stale_rag_delete_is_superseded_without_deleting_restored_chunks(settings):
+    outbox = ProjectionOutbox(settings)
+    page_id = "page-rag-restored"
+    delete_epoch = 5
+    restored_epoch = 6
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,projection_epoch,
+              lifecycle_status,rag_visible_revision_id,rag_visible_epoch
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/restored.md",
+                page_id,
+                "product",
+                "policy",
+                "Restored",
+                "[]",
+                "draft",
+                "t0",
+                "t0",
+                "wrev-old",
+                delete_epoch,
+                "deleted",
+                None,
+                None,
+            ),
+        )
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="delete",
+            page_id=page_id,
+            revision_id=None,
+            projection_epoch=delete_epoch,
+            payload={"path": "wiki/product/restored.md", "reason": "deleted"},
+        )
+        conn.execute(
+            """
+            UPDATE wiki_pages
+            SET current_revision_id='wrev-restored',projection_epoch=?,
+                lifecycle_status='active',rag_visible_revision_id='wrev-restored',
+                rag_visible_epoch=?
+            WHERE page_id=?
+            """,
+            (restored_epoch, restored_epoch, page_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_chunks(
+              id,page_id,revision_id,projection_epoch,chunk_index,page_path,
+              domain,title,text,token_json,embedding_json,embedding_model,
+              source_ids_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "chunk-restored",
+                page_id,
+                "wrev-restored",
+                restored_epoch,
+                0,
+                "wiki/product/restored.md",
+                "product",
+                "Restored",
+                "restored content must remain",
+                "[]",
+                "[]",
+                "local-hash-v1",
+                "[]",
+                "t1",
+                "t1",
+            ),
+        )
+
+    worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+    result = asyncio.run(worker.run_once("rag"))
+
+    with connect_app(settings) as conn:
+        job = conn.execute(
+            "SELECT status FROM knowledge_projection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        restored = conn.execute(
+            """
+            SELECT text FROM wiki_chunks
+            WHERE id='chunk-restored' AND page_id=? AND revision_id='wrev-restored'
+              AND projection_epoch=?
+            """,
+            (page_id, restored_epoch),
+        ).fetchone()
+    assert (result.claimed, result.succeeded, result.superseded) == (1, 0, 1)
+    assert job["status"] == "superseded"
+    assert restored["text"] == "restored content must remain"
+
+
 def test_job_enqueued_during_active_gbrain_batch_remains_pending(settings, monkeypatch):
     first = _job("first", "gbrain")
     second = _job("second", "gbrain")
@@ -914,6 +1115,29 @@ def test_missing_gbrain_endpoint_marks_failed_and_reports_degraded(settings, mon
     assert status.gbrain["configured"] is False
     assert status.gbrain["degraded"] is True
     assert status.gbrain["failed"] == 1
+
+
+def test_disabled_gbrain_does_not_claim_with_complete_residual_configuration(
+    settings,
+    monkeypatch,
+):
+    settings.gbrain_enabled = False
+    job = _job("disabled-gbrain", "gbrain")
+    outbox = ScriptedOutbox(gbrain=[[job]])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("disabled GBrain must not construct clients or repositories")
+
+    monkeypatch.setattr(projection_worker, "GBrainBatchRepository", forbidden)
+    monkeypatch.setattr(projection_worker, "GBrainProjectionClient", forbidden)
+    monkeypatch.setattr("app.gbrain_projection.httpx.AsyncClient", forbidden)
+    worker = projection_worker.ProjectionWorker(settings, outbox=outbox, now=lambda: NOW)
+
+    result = asyncio.run(worker.run_once("gbrain"))
+
+    assert result == projection_worker.WorkerRunResult(target="gbrain")
+    assert outbox.claims == []
+    assert outbox.batches["gbrain"] == [[job]]
 
 
 def test_reconcile_lease_loss_cancels_inventory_before_finish(
