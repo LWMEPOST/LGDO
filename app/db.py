@@ -27,6 +27,9 @@ MAIN_TABLES = [
     "wiki_file_observations",
     "vault_change_events",
     "vault_sync_issues",
+    "vault_watch_occurrences",
+    "pending_vault_deletes",
+    "vault_reconcile_jobs",
     "vault_write_intents",
     "knowledge_projection_jobs",
     "wiki_chunks",
@@ -39,6 +42,8 @@ MAIN_TABLES = [
     "audit_logs",
 ]
 
+assert len(MAIN_TABLES) == len(set(MAIN_TABLES)), "MAIN_TABLES must be unique"
+
 TABLE_PRIMARY_KEYS: dict[str, str | tuple[str, ...]] = {
     "sources": "id",
     "wiki_pages": "path",
@@ -48,6 +53,9 @@ TABLE_PRIMARY_KEYS: dict[str, str | tuple[str, ...]] = {
     "wiki_file_observations": "id",
     "vault_change_events": "id",
     "vault_sync_issues": "id",
+    "vault_watch_occurrences": "id",
+    "pending_vault_deletes": "id",
+    "vault_reconcile_jobs": "id",
     "knowledge_projection_jobs": "id",
     "wiki_chunks": "id",
     "gbrain_page_projections": "id",
@@ -202,6 +210,61 @@ ON vault_sync_issues(page_path, file_hash, issue_type)
 WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_vault_sync_issue_status
 ON vault_sync_issues(status, issue_type, page_path);
+
+CREATE TABLE IF NOT EXISTS vault_watch_occurrences (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  page_path TEXT NOT NULL,
+  old_page_path TEXT,
+  payload_digest TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  result_page_id TEXT,
+  result_revision_id TEXT,
+  sync_issue_id TEXT,
+  error_summary TEXT,
+  detected_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vault_watch_occurrence_pending_add
+ON vault_watch_occurrences(kind, status, detected_at);
+
+CREATE TABLE IF NOT EXISTS pending_vault_deletes (
+  id TEXT PRIMARY KEY,
+  occurrence_id TEXT NOT NULL UNIQUE,
+  page_id TEXT NOT NULL,
+  old_page_path TEXT NOT NULL,
+  file_hash TEXT,
+  semantic_hash TEXT,
+  detected_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  matched_occurrence_id TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_vault_delete_due
+ON pending_vault_deletes(status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_vault_delete_active_absence
+ON pending_vault_deletes(page_id, old_page_path) WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS vault_reconcile_jobs (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL DEFAULT 'full',
+  requested_by TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  result_json TEXT,
+  error_summary TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_reconcile_single_flight
+ON vault_reconcile_jobs(scope) WHERE status IN ('queued', 'running');
+CREATE INDEX IF NOT EXISTS idx_vault_reconcile_claim
+ON vault_reconcile_jobs(status, lease_expires_at, created_at);
 
 CREATE TABLE IF NOT EXISTS knowledge_projection_jobs (
   id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, target TEXT NOT NULL,
@@ -613,6 +676,61 @@ ON vault_sync_issues(page_path, file_hash, issue_type)
 WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_vault_sync_issue_status
 ON vault_sync_issues(status, issue_type, page_path);
+
+CREATE TABLE IF NOT EXISTS vault_watch_occurrences (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  page_path TEXT NOT NULL,
+  old_page_path TEXT,
+  payload_digest TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  result_page_id TEXT,
+  result_revision_id TEXT,
+  sync_issue_id TEXT,
+  error_summary TEXT,
+  detected_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vault_watch_occurrence_pending_add
+ON vault_watch_occurrences(kind, status, detected_at);
+
+CREATE TABLE IF NOT EXISTS pending_vault_deletes (
+  id TEXT PRIMARY KEY,
+  occurrence_id TEXT NOT NULL UNIQUE,
+  page_id TEXT NOT NULL,
+  old_page_path TEXT NOT NULL,
+  file_hash TEXT,
+  semantic_hash TEXT,
+  detected_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  matched_occurrence_id TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_vault_delete_due
+ON pending_vault_deletes(status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_vault_delete_active_absence
+ON pending_vault_deletes(page_id, old_page_path) WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS vault_reconcile_jobs (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL DEFAULT 'full',
+  requested_by TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  result_json TEXT,
+  error_summary TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_reconcile_single_flight
+ON vault_reconcile_jobs(scope) WHERE status IN ('queued', 'running');
+CREATE INDEX IF NOT EXISTS idx_vault_reconcile_claim
+ON vault_reconcile_jobs(status, lease_expires_at, created_at);
 
 CREATE TABLE IF NOT EXISTS knowledge_projection_jobs (
   id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, target TEXT NOT NULL,

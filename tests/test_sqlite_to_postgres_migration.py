@@ -6,9 +6,15 @@ from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.aliases import DEFAULT_ENTITY_ALIASES
-from app.db import connect_postgres, init_app_db, init_postgres_schema
+from app.db import (
+    MAIN_TABLES,
+    TABLE_PRIMARY_KEYS,
+    connect_postgres,
+    init_app_db,
+    init_postgres_schema,
+)
 from app.main import app
-from app.migration import migrate_sqlite_to_postgres
+from app.migration import _KNOWN_COLUMNS, migrate_sqlite_to_postgres
 
 
 TEST_DATABASE_PREFIX = "lgdo_migration_"
@@ -162,7 +168,72 @@ def empty_migration_pair(tmp_path, monkeypatch, postgres_database):
     return settings, sqlite_path
 
 
-def test_migrates_populated_vault_sync_issue(
+def test_vault_coordination_migration_metadata_is_registered():
+    expected = {
+        "vault_sync_issues": {
+            "id",
+            "page_path",
+            "file_hash",
+            "page_id",
+            "issue_type",
+            "error_summary",
+            "status",
+            "generation",
+            "first_seen_at",
+            "last_seen_at",
+            "resolved_at",
+        },
+        "vault_watch_occurrences": {
+            "id",
+            "kind",
+            "page_path",
+            "old_page_path",
+            "payload_digest",
+            "status",
+            "result_page_id",
+            "result_revision_id",
+            "sync_issue_id",
+            "error_summary",
+            "detected_at",
+            "updated_at",
+        },
+        "pending_vault_deletes": {
+            "id",
+            "occurrence_id",
+            "page_id",
+            "old_page_path",
+            "file_hash",
+            "semantic_hash",
+            "detected_at",
+            "expires_at",
+            "status",
+            "matched_occurrence_id",
+            "updated_at",
+        },
+        "vault_reconcile_jobs": {
+            "id",
+            "scope",
+            "requested_by",
+            "status",
+            "attempts",
+            "lease_owner",
+            "lease_expires_at",
+            "result_json",
+            "error_summary",
+            "created_at",
+            "started_at",
+            "finished_at",
+            "updated_at",
+        },
+    }
+
+    assert [table for table in MAIN_TABLES if table in expected] == list(expected)
+    for table, columns in expected.items():
+        assert TABLE_PRIMARY_KEYS[table] == "id"
+        assert _KNOWN_COLUMNS[table] == columns
+
+
+def test_migrates_populated_vault_coordination_tables(
     tmp_path,
     monkeypatch,
     postgres_database,
@@ -172,43 +243,146 @@ def test_migrates_populated_vault_sync_issue(
         monkeypatch,
         postgres_database,
     )
-    expected = (
-        "visi_migration",
-        "wiki/product/broken.md",
-        "f" * 64,
-        None,
-        "invalid_frontmatter",
-        "invalid yaml",
-        "open",
-        3,
-        "2026-07-15T00:00:00+00:00",
-        "2026-07-15T00:01:00+00:00",
-        None,
-    )
+    t0 = "2026-07-15T00:00:00+00:00"
+    rows = {
+        "vault_sync_issues": (
+            (
+                "id",
+                "page_path",
+                "file_hash",
+                "page_id",
+                "issue_type",
+                "error_summary",
+                "status",
+                "generation",
+                "first_seen_at",
+                "last_seen_at",
+                "resolved_at",
+            ),
+            (
+                "visi_coord",
+                "wiki/product/old.md",
+                "a" * 64,
+                "page_coord",
+                "watch_failure",
+                "denied",
+                "open",
+                2,
+                t0,
+                t0,
+                None,
+            ),
+        ),
+        "vault_watch_occurrences": (
+            (
+                "id",
+                "kind",
+                "page_path",
+                "old_page_path",
+                "payload_digest",
+                "status",
+                "result_page_id",
+                "result_revision_id",
+                "sync_issue_id",
+                "error_summary",
+                "detected_at",
+                "updated_at",
+            ),
+            (
+                "vocc_coord",
+                "delete",
+                "wiki/product/old.md",
+                None,
+                "b" * 64,
+                "pending",
+                None,
+                None,
+                "visi_coord",
+                None,
+                t0,
+                t0,
+            ),
+        ),
+        "pending_vault_deletes": (
+            (
+                "id",
+                "occurrence_id",
+                "page_id",
+                "old_page_path",
+                "file_hash",
+                "semantic_hash",
+                "detected_at",
+                "expires_at",
+                "status",
+                "matched_occurrence_id",
+                "updated_at",
+            ),
+            (
+                "vdel_coord",
+                "vocc_coord",
+                "page_coord",
+                "wiki/product/old.md",
+                "c" * 64,
+                "d" * 64,
+                t0,
+                "2026-07-15T00:00:05+00:00",
+                "pending",
+                None,
+                t0,
+            ),
+        ),
+        "vault_reconcile_jobs": (
+            (
+                "id",
+                "scope",
+                "requested_by",
+                "status",
+                "attempts",
+                "lease_owner",
+                "lease_expires_at",
+                "result_json",
+                "error_summary",
+                "created_at",
+                "started_at",
+                "finished_at",
+                "updated_at",
+            ),
+            (
+                "vrec_coord",
+                "full",
+                "admin",
+                "succeeded",
+                1,
+                None,
+                None,
+                '{"ingested":2}',
+                None,
+                t0,
+                t0,
+                t0,
+                t0,
+            ),
+        ),
+    }
     with sqlite3.connect(sqlite_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO vault_sync_issues(
-              id,page_path,file_hash,page_id,issue_type,error_summary,status,
-              generation,first_seen_at,last_seen_at,resolved_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            expected,
-        )
+        for table, (columns, values) in rows.items():
+            placeholders = ",".join("?" for _ in columns)
+            conn.execute(
+                f"INSERT INTO {table}({','.join(columns)}) "
+                f"VALUES ({placeholders})",
+                values,
+            )
 
     result = migrate_sqlite_to_postgres(settings, sqlite_path)
 
-    assert result["tables"]["vault_sync_issues"] == 1
     with connect_postgres(settings) as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id,page_path,file_hash,page_id,issue_type,error_summary,status,
-                   generation,first_seen_at,last_seen_at,resolved_at
-            FROM vault_sync_issues WHERE id=%s
-            """,
-            (expected[0],),
-        )
-        assert cur.fetchone() == expected
+        for table, (columns, values) in rows.items():
+            assert result["tables"][table] == 1
+            cur.execute(
+                f"SELECT {','.join(columns)} FROM {table} WHERE id=%s",
+                (values[0],),
+            )
+            assert cur.fetchone() == values
 
 
 def test_migrate_sqlite_metadata_to_postgres_preserves_core_queries(

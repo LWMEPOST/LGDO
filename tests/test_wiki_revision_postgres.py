@@ -1,6 +1,7 @@
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -23,6 +24,7 @@ from app.wiki_revisions import (
     RevisionConflict,
     WikiRevisionService,
 )
+from app.vault_events import VaultEventStore
 from app.vault_writer import IntentExecutor
 
 
@@ -682,6 +684,168 @@ def test_postgres_external_schema_has_payload_issue_and_partial_indexes(
     assert {"payload_digest", "result_payload_json"} <= columns
     assert "idx_vault_sync_issue_open_identity" in indexes
     assert observation_page_id_nullable == "YES"
+
+
+def test_postgres_pending_vault_delete_and_vault_reconcile_indexes(
+    postgres_settings,
+):
+    with connect_postgres(postgres_settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT tablename,indexname FROM pg_indexes
+            WHERE tablename IN ('pending_vault_deletes','vault_reconcile_jobs')
+            """
+        )
+        indexes = {(row[0], row[1]) for row in cur.fetchall()}
+    assert (
+        "pending_vault_deletes",
+        "idx_pending_vault_delete_active_absence",
+    ) in indexes
+    assert (
+        "vault_reconcile_jobs",
+        "idx_vault_reconcile_single_flight",
+    ) in indexes
+
+
+def test_postgres_concurrent_duplicate_pending_vault_deletes_share_one_cycle(
+    postgres_settings,
+):
+    store = VaultEventStore(postgres_settings)
+    detected_at = datetime(2026, 7, 15, 1, 0, tzinfo=timezone.utc)
+    expires_at = detected_at + timedelta(seconds=5)
+
+    def create(occurrence_id: str):
+        return store.get_or_create_pending_delete(
+            occurrence_id=occurrence_id,
+            page_id="page_pg_delete",
+            old_page_path="wiki/product/pg-deleted.md",
+            file_hash="a" * 64,
+            semantic_hash="b" * 64,
+            detected_at=detected_at,
+            expires_at=expires_at,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        deletes = list(pool.map(create, ("vocc_pg_a", "vocc_pg_b")))
+
+    assert len({pending.id for pending in deletes}) == 1
+    with connect_app(postgres_settings) as conn:
+        pending_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM pending_vault_deletes
+            WHERE page_id=? AND old_page_path=? AND status='pending'
+            """,
+            ("page_pg_delete", "wiki/product/pg-deleted.md"),
+        ).fetchone()[0]
+    assert pending_count == 1
+
+
+def test_postgres_concurrent_vault_reconcile_requests_share_one_job(
+    postgres_settings,
+):
+    store = VaultEventStore(postgres_settings)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = list(pool.map(store.request_reconcile, ("manual", "startup")))
+
+    assert len({job.id for job in jobs}) == 1
+    assert {job.status for job in jobs} == {"queued"}
+    assert store.active_reconcile() == jobs[0]
+
+
+def test_postgres_expired_vault_reconcile_has_one_reclaim_winner(
+    postgres_settings,
+):
+    store = VaultEventStore(postgres_settings)
+    job = store.request_reconcile("manual")
+    started_at = datetime(2026, 7, 15, 2, 0, tzinfo=timezone.utc)
+    assert store.claim_reconcile(
+        job.id, "worker-a", now=started_at, lease_seconds=10
+    ) is True
+    assert store.claim_reconcile(
+        job.id,
+        "worker-b",
+        now=started_at + timedelta(seconds=9),
+        lease_seconds=10,
+    ) is False
+
+    reclaim_at = started_at + timedelta(seconds=11)
+
+    def reclaim(owner: str):
+        return owner, store.claim_reconcile(
+            job.id,
+            owner,
+            now=reclaim_at,
+            lease_seconds=10,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(reclaim, ("worker-b", "worker-c")))
+
+    winners = [owner for owner, won in outcomes if won]
+    assert len(winners) == 1
+    winner = winners[0]
+    claimed = store.get_reconcile(job.id)
+    assert claimed is not None
+    assert claimed.attempts == 2
+    assert claimed.lease_owner == winner
+    for loser in {"worker-a", "worker-b", "worker-c"} - {winner}:
+        assert store.finish_reconcile(job.id, loser, {"scanned": 1}) is False
+    assert store.finish_reconcile(job.id, winner, {"scanned": 2}) is True
+
+
+def test_postgres_restart_reuses_and_reclaims_same_vault_reconcile_job(
+    postgres_settings,
+):
+    store = VaultEventStore(postgres_settings)
+    job = store.request_reconcile("startup")
+    started_at = datetime(2026, 7, 15, 3, 0, tzinfo=timezone.utc)
+    assert store.claim_reconcile(
+        job.id, "worker-before-restart", now=started_at, lease_seconds=5
+    ) is True
+
+    restarted_store = VaultEventStore(postgres_settings)
+    restarted = restarted_store.request_reconcile("restart")
+
+    assert restarted.id == job.id
+    assert restarted.status == "running"
+    assert restarted_store.claim_reconcile(
+        job.id,
+        "worker-after-restart",
+        now=started_at + timedelta(seconds=6),
+        lease_seconds=5,
+    ) is True
+
+
+def test_postgres_vault_reconcile_renewal_blocks_takeover_until_extended_expiry(
+    postgres_settings,
+):
+    store = VaultEventStore(postgres_settings)
+    job = store.request_reconcile("admin")
+    started_at = datetime(2026, 7, 15, 4, 0, tzinfo=timezone.utc)
+    assert store.claim_reconcile(
+        job.id, "owner-a", now=started_at, lease_seconds=30
+    ) is True
+    assert store.renew_reconcile(
+        job.id,
+        "owner-a",
+        now=started_at + timedelta(seconds=20),
+        lease_seconds=30,
+    ) is True
+    assert store.claim_reconcile(
+        job.id,
+        "owner-b",
+        now=started_at + timedelta(seconds=31),
+        lease_seconds=30,
+    ) is False
+    assert store.claim_reconcile(
+        job.id,
+        "owner-b",
+        now=started_at + timedelta(seconds=51),
+        lease_seconds=30,
+    ) is True
+    assert store.finish_reconcile(job.id, "owner-a", {"ingested": 1}) is False
+    assert store.finish_reconcile(job.id, "owner-b", {"ingested": 1}) is True
 
 
 def test_concurrent_postgres_external_create_replays_one_event_without_duplicates(
