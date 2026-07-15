@@ -1531,3 +1531,167 @@ async def test_delete_expiry_release_failure_preserves_cancellation(settings):
 
     with pytest.raises(asyncio.CancelledError):
         await expiry
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_heartbeat_failure_preserves_cancellation(settings):
+    configured = settings.model_copy(
+        deep=True,
+        update={"vault_reconcile_lease_seconds": 3},
+    )
+    page_id = "page_heartbeat_failure_cancel"
+    page_path = "wiki/product/heartbeat-failure-cancel.md"
+    content = managed_bytes(page_id)
+    seed_page(configured, page_id=page_id, page_path=page_path, content=content)
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+    renew_attempted = threading.Event()
+
+    class RenewFailingStore(VaultEventStore):
+        def renew_delete_claim(self, *args, **kwargs):
+            renew_attempted.set()
+            raise RuntimeError("claim heartbeat database unavailable")
+
+    class BlockingDeleteRevisions(FakeRevisionService):
+        def delete_page(self, event_id, path):
+            self.calls.append(("delete", event_id, path))
+            mutation_entered.set()
+            if not release_mutation.wait(timeout=5):
+                raise RuntimeError("blocked heartbeat delete was not released")
+            return FakeResult("deleted", page_id=page_id)
+
+    service = VaultSyncService(
+        configured,
+        revisions=BlockingDeleteRevisions(),
+        events=RenewFailingStore(configured),
+    )
+    detected_at = datetime(2026, 7, 15, 16, 30, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", page_path)],
+        detected_at=detected_at,
+    )
+    expiry = asyncio.create_task(
+        service.expire_deletes(now=detected_at + timedelta(seconds=6))
+    )
+    while not mutation_entered.is_set() or not renew_attempted.is_set():
+        await asyncio.sleep(0)
+
+    expiry.cancel()
+    release_mutation.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await expiry
+    assert service.last_error == "claim heartbeat database unavailable"
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_complete_failure_preserves_cancellation(settings):
+    page_id = "page_complete_failure_cancel"
+    page_path = "wiki/product/complete-failure-cancel.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=page_path, content=content)
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+
+    class CompleteFailingStore(VaultEventStore):
+        def complete_delete(self, *args, **kwargs):
+            raise RuntimeError("claim completion database unavailable")
+
+    class BlockingDeleteRevisions(FakeRevisionService):
+        def delete_page(self, event_id, path):
+            self.calls.append(("delete", event_id, path))
+            mutation_entered.set()
+            if not release_mutation.wait(timeout=5):
+                raise RuntimeError("blocked completion delete was not released")
+            return FakeResult("deleted", page_id=page_id)
+
+    service = VaultSyncService(
+        settings,
+        revisions=BlockingDeleteRevisions(),
+        events=CompleteFailingStore(settings),
+    )
+    detected_at = datetime(2026, 7, 15, 17, 0, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", page_path)],
+        detected_at=detected_at,
+    )
+    expiry = asyncio.create_task(
+        service.expire_deletes(now=detected_at + timedelta(seconds=6))
+    )
+    while not mutation_entered.is_set():
+        await asyncio.sleep(0)
+
+    expiry.cancel()
+    release_mutation.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await expiry
+    assert service.last_error == "claim completion database unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay", [False, True], ids=["inventory", "replay"])
+async def test_startup_claim_finalization_failure_preserves_cancellation(
+    settings,
+    replay,
+):
+    page_id = f"page_startup_finalization_cancel_{replay}"
+    old_path = f"wiki/product/startup-finalization-old-{replay}.md"
+    new_path = f"wiki/product/startup-finalization-new-{replay}.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+
+    class FinalizationFailingStore(VaultEventStore):
+        def cancel_claimed_delete(self, *args, **kwargs):
+            raise RuntimeError("claim finalization database unavailable")
+
+    class BlockingRenameRevisions(FakeRevisionService):
+        def rename_page(self, event_id, source_path, target_path):
+            self.calls.append(("rename", event_id, source_path, target_path))
+            mutation_entered.set()
+            if not release_mutation.wait(timeout=5):
+                raise RuntimeError("blocked startup rename was not released")
+            return FakeResult("renamed", page_id=page_id)
+
+    store = FinalizationFailingStore(settings)
+    service = VaultSyncService(
+        settings,
+        revisions=BlockingRenameRevisions(),
+        events=store,
+    )
+    detected_at = datetime(2026, 7, 15, 17, 30, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    write_page(settings, new_path, content)
+    if replay:
+        store.begin_occurrence(
+            "rename",
+            new_path,
+            old_page_path=old_path,
+            detected_at=detected_at + timedelta(seconds=1),
+        )
+
+    startup = asyncio.create_task(
+        service.reconcile_startup(
+            stability_poll_interval=0.001,
+            reconcile_intents=False,
+        )
+    )
+    while not mutation_entered.is_set():
+        await asyncio.sleep(0)
+
+    startup.cancel()
+    await asyncio.sleep(0)
+    assert startup.done() is False
+    release_mutation.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    assert service.last_error == "claim finalization database unavailable"

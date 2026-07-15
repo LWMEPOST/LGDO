@@ -180,24 +180,60 @@ class VaultSyncService:
             )
         )
         cancellation_requested = False
+        mutation_cancelled = False
+        mutation_error: Exception | None = None
+        result: Any = None
         try:
             result, cancellation_requested = await self._await_revision_mutation(
                 mutation,
                 *args,
             )
-        finally:
-            stopped.set()
-            while not heartbeat.done():
-                try:
-                    await asyncio.shield(heartbeat)
-                except asyncio.CancelledError:
-                    cancellation_requested = True
-            claim_retained = await heartbeat
+        except asyncio.CancelledError:
+            mutation_cancelled = True
+            cancellation_requested = True
+        except Exception as exc:
+            mutation_error = exc
+
+        stopped.set()
+        claim_retained = False
+        heartbeat_error: Exception | None = None
+        while not heartbeat.done():
+            try:
+                claim_retained = await asyncio.shield(heartbeat)
+            except asyncio.CancelledError:
+                cancellation_requested = True
+            except Exception as exc:
+                heartbeat_error = exc
+        if heartbeat_error is None:
+            try:
+                claim_retained = heartbeat.result()
+            except Exception as exc:
+                heartbeat_error = exc
+
+        if heartbeat_error is not None:
+            if cancellation_requested:
+                self._record_delete_expiry_failure(pending, heartbeat_error)
+            else:
+                raise heartbeat_error
+        if mutation_error is not None:
+            if cancellation_requested:
+                raise asyncio.CancelledError from None
+            raise mutation_error
+        if heartbeat_error is not None:
+            if mutation_cancelled:
+                raise asyncio.CancelledError from None
+            return result, cancellation_requested
         if not claim_retained:
-            raise RevisionConflict(
+            claim_error = RevisionConflict(
                 "delete expiry lost its persistent claim",
                 current_revision_id=None,
             )
+            if cancellation_requested:
+                self._record_delete_expiry_failure(pending, claim_error)
+            else:
+                raise claim_error
+        if mutation_cancelled:
+            raise asyncio.CancelledError from None
         return result, cancellation_requested
 
     def _record_delete_expiry_failure(
@@ -268,13 +304,19 @@ class VaultSyncService:
                         )
                     )
                     if result.status in {"deleted", "ignored"}:
-                        if self.events.complete_delete(
-                            pending.id,
-                            owner,
-                            now=datetime.now(timezone.utc),
-                        ):
+                        try:
+                            claim_completed = self.events.complete_delete(
+                                pending.id,
+                                owner,
+                                now=datetime.now(timezone.utc),
+                            )
+                        except Exception as exc:
+                            if cancellation_requested:
+                                self._record_delete_expiry_failure(pending, exc)
+                                raise asyncio.CancelledError from None
+                            raise
+                        if claim_completed:
                             completed += 1
-                            claim_completed = True
                     else:
                         self._record_delete_expiry_failure(
                             pending,
@@ -496,17 +538,26 @@ class VaultSyncService:
                         *args,
                     )
                     if result.status in {"renamed", "applied", "ignored"}:
-                        claim_resolved = self.events.cancel_claimed_delete(
-                            claimed_pending.id,
-                            replay_owner,
-                            occurrence.id,
-                            now=datetime.now(timezone.utc),
-                        )
-                        if not claim_resolved:
-                            raise RevisionConflict(
-                                "startup move replay lost its pending delete claim",
-                                current_revision_id=None,
+                        try:
+                            claim_resolved = self.events.cancel_claimed_delete(
+                                claimed_pending.id,
+                                replay_owner,
+                                occurrence.id,
+                                now=datetime.now(timezone.utc),
                             )
+                            if not claim_resolved:
+                                raise RevisionConflict(
+                                    "startup move replay lost its pending delete claim",
+                                    current_revision_id=None,
+                                )
+                        except Exception as exc:
+                            if cancellation_requested:
+                                self._record_delete_expiry_failure(
+                                    claimed_pending,
+                                    exc,
+                                )
+                                raise asyncio.CancelledError from None
+                            raise
                 self._finish_result(occurrence, result)
                 self._propagate_cancellation(cancellation_requested)
         finally:
@@ -823,17 +874,26 @@ class VaultSyncService:
                         *args,
                     )
                     if result.status in {"renamed", "applied", "ignored"}:
-                        claim_resolved = self.events.cancel_claimed_delete(
-                            claimed_pending.id,
-                            move_owner,
-                            occurrence.id,
-                            now=datetime.now(timezone.utc),
-                        )
-                        if not claim_resolved:
-                            raise RevisionConflict(
-                                "startup move lost its pending delete claim",
-                                current_revision_id=None,
+                        try:
+                            claim_resolved = self.events.cancel_claimed_delete(
+                                claimed_pending.id,
+                                move_owner,
+                                occurrence.id,
+                                now=datetime.now(timezone.utc),
                             )
+                            if not claim_resolved:
+                                raise RevisionConflict(
+                                    "startup move lost its pending delete claim",
+                                    current_revision_id=None,
+                                )
+                        except Exception as exc:
+                            if cancellation_requested:
+                                self._record_delete_expiry_failure(
+                                    claimed_pending,
+                                    exc,
+                                )
+                                raise asyncio.CancelledError from None
+                            raise
                 self._finish_result(occurrence, result)
                 self._propagate_cancellation(cancellation_requested)
                 return action
