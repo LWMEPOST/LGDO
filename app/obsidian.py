@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 
 RESOURCE_ROOT = Path(__file__).resolve().parents[1] / "resources" / "obsidian-vault"
+PROJECT_ROOT = RESOURCE_ROOT.parents[1]
 MANAGED_JSON = (
     Path(".obsidian/app.json"),
     Path(".obsidian/core-plugins.json"),
@@ -35,6 +37,10 @@ class _JsonArgumentParser(argparse.ArgumentParser):
         raise _CliArgumentError(message)
 
 
+class ObsidianConcurrencyError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class ObsidianInstallResult:
     vault_path: Path
@@ -43,39 +49,60 @@ class ObsidianInstallResult:
     backup_dir: Path | None
 
 
-def _atomic_write_json(path: Path, value: Any) -> None:
+def _json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _stage_bytes(path: Path, payload: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
-    payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     try:
         with temp_path.open("xb") as file:
             file.write(payload)
             file.flush()
             os.fsync(file.fileno())
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return temp_path
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    _atomic_write_bytes(path, _json_bytes(value))
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    temp_path = _stage_bytes(path, payload)
+    try:
         os.replace(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
 
 
-def _atomic_copy(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+def _publish_staged_no_replace(staged: Path, target: Path) -> bool:
     try:
-        with source.open("rb") as source_file, temp_path.open("xb") as target_file:
-            shutil.copyfileobj(source_file, target_file)
-            target_file.flush()
-            os.fsync(target_file.fileno())
-        os.replace(temp_path, target)
+        os.link(staged, target)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _copy_if_missing(source: Path, target: Path) -> bool:
+    staged = _stage_bytes(target, source.read_bytes())
+    try:
+        return _publish_staged_no_replace(staged, target)
     finally:
-        temp_path.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
 
 
 def _new_backup_dir(vault_path: Path) -> Path:
     backup_root = vault_path / ".lgdo" / "obsidian-backups"
-    backup_root.mkdir(parents=True, exist_ok=True)
+    _safe_mkdirs(vault_path, backup_root)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup_dir = backup_root / f"{timestamp}-{uuid4().hex}"
+    _require_safe_directory(vault_path, backup_root)
     backup_dir.mkdir(exist_ok=False)
+    _require_safe_directory(vault_path, backup_dir)
     return backup_dir
 
 
@@ -117,15 +144,141 @@ def _merged_json(relative_path: Path, current: Any, managed: Any) -> Any:
 
 def _backup_file(backup_dir: Path, relative_path: Path, target: Path) -> None:
     backup_path = backup_dir / relative_path
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    _safe_mkdirs(backup_dir, backup_path.parent)
     shutil.copy2(target, backup_path)
+
+
+def _require_nonblank_vault_path(vault_path: str | os.PathLike[str]) -> None:
+    raw_path = os.fspath(vault_path)
+    if isinstance(raw_path, str) and not raw_path.strip():
+        raise ValueError("Vault path must not be empty or whitespace")
+
+
+def _resolve_safe_vault_path(vault_path: str | os.PathLike[str]) -> Path:
+    _require_nonblank_vault_path(vault_path)
+    vault = Path(vault_path).expanduser().resolve()
+    dangerous_roots = {
+        Path.cwd().resolve(),
+        PROJECT_ROOT.resolve(),
+        Path(vault.anchor).resolve(),
+    }
+    if vault in dangerous_roots:
+        raise ValueError(f"Vault path is unsafe for asset installation: {vault}")
+    return vault
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return bool(
+        getattr(path_stat, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _require_safe_directory(root: Path, directory: Path) -> None:
+    directory_stat = directory.lstat()
+    if (
+        directory.is_symlink()
+        or _is_reparse_point(directory)
+        or not stat.S_ISDIR(directory_stat.st_mode)
+    ):
+        raise ValueError(f"Refusing Obsidian asset directory reparse point: {directory}")
+    try:
+        directory.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except ValueError as exc:
+        raise ValueError(f"Obsidian asset directory escapes the Vault: {directory}") from exc
+
+
+def _safe_mkdirs(root: Path, directory: Path) -> None:
+    current = root
+    for component in directory.relative_to(root).parts:
+        if current != root:
+            _require_safe_directory(root, current)
+        current /= component
+        try:
+            current.mkdir()
+        except FileExistsError:
+            pass
+        _require_safe_directory(root, current)
+
+
+def _require_safe_regular_file(path: Path, physical_root: Path) -> None:
+    path_stat = path.lstat()
+    if path.is_symlink() or _is_reparse_point(path) or not stat.S_ISREG(path_stat.st_mode):
+        raise ValueError(f"Refusing unsafe Obsidian target: {path}")
+    try:
+        path.resolve(strict=True).relative_to(physical_root)
+    except ValueError as exc:
+        raise ValueError(f"Obsidian target escapes its physical root: {path}") from exc
+
+
+def _require_safe_target(vault: Path, target: Path) -> None:
+    physical_vault = vault.resolve(strict=True)
+    current = vault
+    for component in target.relative_to(vault).parts[:-1]:
+        current /= component
+        if not current.exists():
+            continue
+        if current.is_symlink() or _is_reparse_point(current) or not current.is_dir():
+            raise ValueError(f"Refusing unsafe Obsidian target parent: {current}")
+        try:
+            current.resolve(strict=True).relative_to(physical_vault)
+        except ValueError as exc:
+            raise ValueError(f"Obsidian target parent escapes the Vault: {current}") from exc
+    if target.exists():
+        _require_safe_regular_file(target, physical_vault)
+
+
+def _refresh_target(
+    *,
+    vault: Path,
+    backup_dir: Path,
+    relative_path: Path,
+    target: Path,
+    current_bytes: bytes,
+    desired_bytes: bytes,
+) -> None:
+    staged = _stage_bytes(target, desired_bytes)
+    backup_path = backup_dir / relative_path
+    claim = backup_dir / ".claimed" / relative_path
+    try:
+        _require_safe_target(vault, target)
+        _backup_file(backup_dir, relative_path, target)
+        _atomic_write_bytes(backup_path, current_bytes)
+        _safe_mkdirs(backup_dir, claim.parent)
+        _require_safe_target(vault, target)
+        os.replace(target, claim)
+        _require_safe_regular_file(claim, backup_dir.resolve(strict=True))
+        claimed_bytes = claim.read_bytes()
+        if claimed_bytes != current_bytes:
+            _copy_if_missing(claim, target)
+            raise ObsidianConcurrencyError(
+                f"Obsidian target changed during refresh: {relative_path.as_posix()}"
+            )
+
+        try:
+            published = _publish_staged_no_replace(staged, target)
+        except OSError:
+            _copy_if_missing(claim, target)
+            raise
+        if not published:
+            raise ObsidianConcurrencyError(
+                f"Obsidian target changed during refresh: {relative_path.as_posix()}"
+            )
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def ensure_obsidian_vault(
     vault_path: str | os.PathLike[str],
     refresh: bool = False,
 ) -> ObsidianInstallResult:
-    vault = Path(vault_path).expanduser().resolve()
+    vault = _resolve_safe_vault_path(vault_path)
     vault.mkdir(parents=True, exist_ok=True)
     installed: list[str] = []
     drifted: list[str] = []
@@ -138,15 +291,19 @@ def ensure_obsidian_vault(
         if not source.is_file():
             raise FileNotFoundError(f"Missing Obsidian resource: {source}")
 
-        if not target.exists():
-            _atomic_copy(source, target)
+        _require_safe_target(vault, target)
+        _safe_mkdirs(vault, target.parent)
+        if not target.exists() and _copy_if_missing(source, target):
             installed.append(relative_name)
             continue
+
+        _require_safe_target(vault, target)
+        current_bytes = target.read_bytes()
 
         if relative_path in MANAGED_JSON:
             managed_value = _load_json(source)
             try:
-                current_value = _load_json(target)
+                current_value = json.loads(current_bytes.decode("utf-8"))
                 desired_value = _merged_json(relative_path, current_value, managed_value)
             except (UnicodeDecodeError, ValueError, TypeError):
                 if not refresh:
@@ -154,9 +311,11 @@ def ensure_obsidian_vault(
                     continue
                 raise
             changed = current_value != desired_value
+            desired_bytes = _json_bytes(desired_value)
         else:
             desired_value = None
-            changed = target.read_bytes() != source.read_bytes()
+            desired_bytes = source.read_bytes()
+            changed = current_bytes != desired_bytes
 
         if not changed:
             continue
@@ -166,11 +325,14 @@ def ensure_obsidian_vault(
 
         if backup_dir is None:
             backup_dir = _new_backup_dir(vault)
-        _backup_file(backup_dir, relative_path, target)
-        if relative_path in MANAGED_JSON:
-            _atomic_write_json(target, desired_value)
-        else:
-            _atomic_copy(source, target)
+        _refresh_target(
+            vault=vault,
+            backup_dir=backup_dir,
+            relative_path=relative_path,
+            target=target,
+            current_bytes=current_bytes,
+            desired_bytes=desired_bytes,
+        )
         installed.append(relative_name)
 
     return ObsidianInstallResult(
@@ -206,6 +368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _build_parser().parse_args(argv)
         if args.command == "install":
+            _require_nonblank_vault_path(args.vault)
             payload = {
                 "operation": "install",
                 **_result_json(ensure_obsidian_vault(args.vault, refresh=args.refresh)),

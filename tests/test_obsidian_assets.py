@@ -48,6 +48,38 @@ def _powershell_hosts() -> list[str]:
     return hosts
 
 
+def _create_windows_junction(junction: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"mklink /J failed\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def _write_fake_python(
+    shim_dir: Path,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    exit_code: int = 0,
+) -> dict[str, str]:
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["@echo off"]
+    if stdout:
+        lines.append(f"echo {stdout}")
+    if stderr:
+        lines.append(f">&2 echo {stderr}")
+    lines.append(f"exit /b {exit_code}")
+    (shim_dir / "python.cmd").write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["PATH"] = str(shim_dir) + os.pathsep + environment.get("PATH", "")
+    return environment
+
+
 POWERSHELL_HOSTS = _powershell_hosts()
 
 
@@ -238,6 +270,54 @@ def test_json_refresh_replace_failure_preserves_original_and_removes_temp(tmp_pa
     assert not list(app_path.parent.glob(".app.json.*.tmp"))
 
 
+def test_missing_asset_publication_collision_preserves_concurrent_file(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    app_path = vault / ".obsidian" / "app.json"
+    concurrent = b'{"concurrentKey": true}\n'
+    original_link = os.link
+
+    def collide_at_publish(staged, destination, *args, **kwargs):
+        if Path(destination) == app_path and not app_path.exists():
+            app_path.write_bytes(concurrent)
+        return original_link(staged, destination, *args, **kwargs)
+
+    monkeypatch.setattr(obsidian.os, "link", collide_at_publish)
+
+    result = ensure_obsidian_vault(vault)
+
+    assert app_path.read_bytes() == concurrent
+    assert ".obsidian/app.json" in result.drifted
+    assert ".obsidian/app.json" not in result.installed
+    assert result.backup_dir is None
+
+
+def test_refresh_concurrent_edit_after_backup_is_preserved_and_aborts(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    ensure_obsidian_vault(vault)
+    app_path = vault / ".obsidian" / "app.json"
+    before = b'{"newFileFolderPath": "before", "before": true}\n'
+    app_path.write_bytes(before)
+    concurrent = b'{"newFileFolderPath": "concurrent", "concurrentKey": "kept"}\n'
+    original_backup = obsidian._backup_file
+
+    def edit_after_backup(backup_dir, relative_path, target):
+        original_backup(backup_dir, relative_path, target)
+        if Path(target) == app_path:
+            app_path.write_bytes(concurrent)
+
+    monkeypatch.setattr(obsidian, "_backup_file", edit_after_backup)
+
+    with pytest.raises(RuntimeError, match="changed during refresh"):
+        ensure_obsidian_vault(vault, refresh=True)
+
+    backup_roots = list((vault / ".lgdo" / "obsidian-backups").iterdir())
+    assert len(backup_roots) == 1
+    assert app_path.read_bytes() == concurrent
+    assert (backup_roots[0] / ".obsidian" / "app.json").read_bytes() == before
+    assert (backup_roots[0] / ".claimed" / ".obsidian" / "app.json").read_bytes() == concurrent
+    assert not list(app_path.parent.glob(".app.json.*.tmp"))
+
+
 @pytest.mark.parametrize("host", POWERSHELL_HOSTS, ids=lambda host: Path(host).stem)
 def test_install_script_works_from_unrelated_cwd_with_absolute_vault(host, tmp_path):
     unrelated = tmp_path / "unrelated cwd"
@@ -323,6 +403,39 @@ def test_install_script_resolves_relative_vault_from_repo_root(host, tmp_path):
         shutil.rmtree(vault, ignore_errors=True)
 
 
+@pytest.mark.parametrize("host", POWERSHELL_HOSTS, ids=lambda host: Path(host).stem)
+@pytest.mark.parametrize("blank_vault", ["", "   "], ids=["empty", "whitespace"])
+def test_install_script_rejects_explicit_blank_vault_before_python(host, blank_vault, tmp_path):
+    environment = _write_fake_python(
+        tmp_path / "shim",
+        stdout='{"operation":"install"}',
+    )
+    script = REPO_ROOT / "scripts" / "install-obsidian-vault.ps1"
+
+    completed = subprocess.run(
+        [
+            host,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-VaultPath",
+            blank_vault,
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert not completed.stdout
+    assert "VaultPath" in completed.stderr
+
+
 def test_build_obsidian_uri_encodes_unicode_spaces_nested_paths_and_reserved_characters():
     vault_name = "团队 知识#?&%"
     page_path = r"产品 文档\嵌套/页面 #?&%.md"
@@ -396,6 +509,60 @@ def test_cli_parse_errors_are_single_json_on_stderr(argv, capsys):
     assert error["error"]
 
 
+def test_python_api_rejects_cwd_and_repository_root_before_writes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="Vault path"):
+        ensure_obsidian_vault(Path(""))
+    assert not (tmp_path / ".obsidian").exists()
+
+    def unexpected_publish(source, target):
+        raise AssertionError("dangerous repository-root publication was attempted")
+
+    monkeypatch.setattr(obsidian, "_copy_if_missing", unexpected_publish)
+    with pytest.raises(ValueError, match="Vault path"):
+        ensure_obsidian_vault(REPO_ROOT)
+    assert not (REPO_ROOT / ".obsidian").exists()
+
+
+@pytest.mark.parametrize("blank_vault", ["", "   "], ids=["empty", "whitespace"])
+def test_cli_blank_vault_is_json_error_without_calling_installer(blank_vault, capsys, monkeypatch):
+    called = False
+
+    def unexpected_install(vault_path, refresh=False):
+        nonlocal called
+        called = True
+        raise AssertionError("installer must not receive a blank Vault path")
+
+    monkeypatch.setattr(obsidian, "ensure_obsidian_vault", unexpected_install)
+
+    assert main(["install", "--vault", blank_vault]) == 2
+    captured = capsys.readouterr()
+    assert not captured.out
+    error = json.loads(captured.err)
+    assert "Vault path" in error["error"]
+    assert called is False
+
+
+@pytest.mark.parametrize("blank_vault", ["", "   "], ids=["empty", "whitespace"])
+def test_module_cli_blank_vault_rejects_without_writes(blank_vault, tmp_path):
+    completed = subprocess.run(
+        [sys.executable, "-m", "app.obsidian", "install", "--vault", blank_vault],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert not completed.stdout
+    error = json.loads(completed.stderr)
+    assert "Vault path" in error["error"]
+    assert not (tmp_path / ".obsidian").exists()
+    assert not (tmp_path / "   " / ".obsidian").exists()
+
+
 def test_module_cli_missing_argument_exits_two_with_json_stderr():
     completed = subprocess.run(
         [sys.executable, "-m", "app.obsidian", "install"],
@@ -443,10 +610,158 @@ def test_legacy_index_migration_moves_deduplicates_and_quarantines(tmp_path):
     quarantine_roots = list(quarantine_parent.iterdir())
     assert len(quarantine_roots) == 1
     assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{32}", quarantine_roots[0].name)
+    assert (quarantine_roots[0] / "nested" / "missing.md").read_text(encoding="utf-8") == "move me\n"
+    assert (quarantine_roots[0] / "duplicate.md").read_text(encoding="utf-8") == "same\n"
     assert (quarantine_roots[0] / "conflict.md").read_text(encoding="utf-8") == "legacy\n"
 
     ensure_vault(vault)
     assert list(quarantine_parent.iterdir()) == quarantine_roots
+
+
+def test_legacy_index_publication_collision_never_overwrites_indexes(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    source = vault / "index" / "race.md"
+    target = vault / "indexes" / "race.md"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"legacy bytes")
+    original_link = os.link
+
+    def collide_at_publish(claim, destination, *args, **kwargs):
+        if Path(destination) == target and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"concurrent indexes bytes")
+        return original_link(claim, destination, *args, **kwargs)
+
+    monkeypatch.setattr(vault_module.os, "link", collide_at_publish)
+
+    ensure_vault(vault)
+
+    assert target.read_bytes() == b"concurrent indexes bytes"
+    quarantine_roots = list((vault / ".lgdo" / "index-migration").iterdir())
+    assert len(quarantine_roots) == 1
+    assert (quarantine_roots[0] / "race.md").read_bytes() == b"legacy bytes"
+
+
+def test_legacy_source_recreated_after_claim_is_never_deleted(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    source = vault / "index" / "duplicate.md"
+    target = vault / "indexes" / "duplicate.md"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    source.write_bytes(b"duplicate bytes")
+    target.write_bytes(b"duplicate bytes")
+    original_replace = os.replace
+
+    def recreate_after_claim(claim_source, claim_target, *args, **kwargs):
+        result = original_replace(claim_source, claim_target, *args, **kwargs)
+        if Path(claim_source) == source:
+            source.write_bytes(b"concurrent legacy bytes")
+        return result
+
+    monkeypatch.setattr(vault_module.os, "replace", recreate_after_claim)
+
+    ensure_vault(vault)
+
+    assert target.read_bytes() == b"duplicate bytes"
+    assert source.read_bytes() == b"concurrent legacy bytes"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_legacy_index_root_junction_is_rejected_without_touching_outside(tmp_path):
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    legacy = vault / "index"
+    outside_file = outside / "outside.md"
+    vault.mkdir()
+    outside.mkdir()
+    outside_file.write_bytes(b"outside bytes")
+    _create_windows_junction(legacy, outside)
+
+    with pytest.raises(ValueError, match="reparse"):
+        ensure_vault(vault)
+
+    assert legacy.is_dir()
+    assert outside_file.read_bytes() == b"outside bytes"
+    assert not (vault / "indexes" / outside_file.name).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_legacy_index_descendant_junction_aborts_before_any_migration(tmp_path):
+    vault = tmp_path / "vault"
+    legacy = vault / "index"
+    outside = tmp_path / "outside"
+    regular = legacy / "regular.md"
+    outside_file = outside / "outside.md"
+    legacy.mkdir(parents=True)
+    outside.mkdir()
+    regular.write_bytes(b"regular bytes")
+    outside_file.write_bytes(b"outside bytes")
+    _create_windows_junction(legacy / "linked", outside)
+
+    with pytest.raises(ValueError, match="reparse"):
+        ensure_vault(vault)
+
+    assert regular.read_bytes() == b"regular bytes"
+    assert outside_file.read_bytes() == b"outside bytes"
+    assert not list((vault / "indexes").rglob("*.md"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_indexes_destination_junction_is_rejected_before_legacy_claim(tmp_path):
+    vault = tmp_path / "vault"
+    legacy_file = vault / "index" / "legacy.md"
+    indexes = vault / "indexes"
+    outside = tmp_path / "outside-indexes"
+    legacy_file.parent.mkdir(parents=True)
+    outside.mkdir()
+    legacy_file.write_bytes(b"legacy bytes")
+    _create_windows_junction(indexes, outside)
+
+    with pytest.raises(ValueError, match="reparse"):
+        ensure_vault(vault)
+
+    assert legacy_file.read_bytes() == b"legacy bytes"
+    assert not (outside / "legacy.md").exists()
+    assert not (vault / ".lgdo" / "index-migration").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_migration_quarantine_junction_is_rejected_before_source_claim(tmp_path):
+    vault = tmp_path / "vault"
+    source = vault / "index" / "legacy.md"
+    outside = tmp_path / "outside-migration"
+    migration_parent = vault / ".lgdo" / "index-migration"
+    source.parent.mkdir(parents=True)
+    migration_parent.parent.mkdir(parents=True)
+    outside.mkdir()
+    source.write_bytes(b"legacy bytes")
+    _create_windows_junction(migration_parent, outside)
+
+    with pytest.raises(ValueError, match="reparse"):
+        ensure_vault(vault)
+
+    assert source.read_bytes() == b"legacy bytes"
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_obsidian_backup_junction_is_rejected_before_target_claim(tmp_path):
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside-backups"
+    backup_parent = vault / ".lgdo" / "obsidian-backups"
+    ensure_obsidian_vault(vault)
+    app_path = vault / ".obsidian" / "app.json"
+    drifted = b'{"newFileFolderPath": "drifted", "userKey": true}\n'
+    app_path.write_bytes(drifted)
+    backup_parent.parent.mkdir(parents=True, exist_ok=True)
+    outside.mkdir()
+    _create_windows_junction(backup_parent, outside)
+
+    with pytest.raises(ValueError, match="reparse"):
+        ensure_obsidian_vault(vault, refresh=True)
+
+    assert app_path.read_bytes() == drifted
+    assert not list(outside.iterdir())
 
 
 def test_ensure_vault_does_not_install_obsidian_assets_implicitly(tmp_path):
@@ -490,3 +805,79 @@ def test_open_script_print_only_exactly_matches_python_uri(host, tmp_path):
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == build_obsidian_uri(vault_name, page_path)
     assert not completed.stderr.strip()
+
+
+@pytest.mark.parametrize("host", POWERSHELL_HOSTS, ids=lambda host: Path(host).stem)
+def test_open_script_preserves_native_python_exit_code(host, tmp_path):
+    environment = _write_fake_python(
+        tmp_path / "shim",
+        stderr="fake python failure",
+        exit_code=7,
+    )
+    script = REPO_ROOT / "scripts" / "open-obsidian.ps1"
+
+    completed = subprocess.run(
+        [
+            host,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-VaultName",
+            "Vault",
+            "-PagePath",
+            "Page.md",
+            "-PrintOnly",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode == 7
+    assert not completed.stdout
+    assert "code 7" in completed.stderr
+
+
+@pytest.mark.parametrize("host", POWERSHELL_HOSTS, ids=lambda host: Path(host).stem)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{}",
+        '{"url":"https://example.com/page"}',
+    ],
+    ids=["missing-url", "invalid-scheme"],
+)
+def test_open_script_rejects_missing_or_non_obsidian_url(host, payload, tmp_path):
+    environment = _write_fake_python(tmp_path / "shim", stdout=payload)
+    script = REPO_ROOT / "scripts" / "open-obsidian.ps1"
+
+    completed = subprocess.run(
+        [
+            host,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-VaultName",
+            "Vault",
+            "-PagePath",
+            "Page.md",
+            "-PrintOnly",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert not completed.stdout
+    assert "obsidian://" in completed.stderr
