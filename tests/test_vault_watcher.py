@@ -314,6 +314,54 @@ async def test_adapter_survives_normalization_failure_and_processes_next_batch(
     assert handled == [[VaultFsEvent("modify", "wiki/page.md")]]
 
 
+@pytest.mark.asyncio
+async def test_adapter_start_recovers_after_immediate_watcher_failure(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+
+    def failing_watch(*_args, **_kwargs):
+        raise RuntimeError("watcher startup failed")
+
+    async def handler(_events):
+        pass
+
+    adapter = VaultWatchAdapter(
+        Settings(_env_file=None, vault_path=vault),
+        handler,
+        watch_factory=failing_watch,
+    )
+
+    with pytest.raises(RuntimeError, match="watcher startup failed"):
+        await adapter.start()
+
+    assert adapter._task is None
+    assert not adapter._ready.is_set()
+
+    watcher_started = asyncio.Event()
+    watcher_stopped = asyncio.Event()
+
+    async def blocking_watch(*_args, **_kwargs):
+        try:
+            watcher_started.set()
+            await asyncio.Future()
+            yield set()
+        finally:
+            watcher_stopped.set()
+
+    adapter.watch_factory = blocking_watch
+    await adapter.start()
+
+    assert watcher_started.is_set()
+    assert adapter._task is not None
+    assert not adapter._task.done()
+
+    await adapter.stop()
+
+    assert watcher_stopped.is_set()
+    assert adapter._task is None
+    assert not adapter._ready.is_set()
+
+
 def test_unreadable_directory_isolated_during_startup_inventory(
     tmp_path, monkeypatch
 ):

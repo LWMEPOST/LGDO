@@ -239,19 +239,30 @@ class VaultWatchAdapter:
                 return
 
     async def start(self) -> None:
-        if self._task is not None:
-            if not self._task.done():
+        task = self._task
+        if task is not None:
+            if not task.done():
                 await self._ready.wait()
                 return
-            await self._task
-            self._task = None
+            try:
+                await task
+            finally:
+                if self._task is task:
+                    self._task = None
+                    self._ready.clear()
 
         self._ready.clear()
-        self._task = asyncio.create_task(self.run(), name="vault-watchfiles")
+        task = asyncio.create_task(self.run(), name="vault-watchfiles")
+        self._task = task
         await self._ready.wait()
         await asyncio.sleep(0)
-        if self._task.done():
-            await self._task
+        if task.done():
+            try:
+                await task
+            finally:
+                if self._task is task:
+                    self._task = None
+                    self._ready.clear()
 
     async def stop(self) -> None:
         task = self._task
