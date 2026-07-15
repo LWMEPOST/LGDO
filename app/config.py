@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +17,16 @@ class Settings(BaseSettings):
     postgres_database: str = "lgdo"
     rag_store_backend: str = "sqlite"
     vault_path: Path = Path("vault")
+    vault_watch_enabled: bool = True
+    vault_watch_debounce_ms: int = 750
+    vault_watch_stability_timeout_seconds: float = 3.0
+    vault_watch_max_file_bytes: int = 5 * 1024 * 1024
+    vault_watch_max_prefix_bytes: int = 64 * 1024
+    vault_rename_grace_ms: int = 5000
+    vault_rename_safety_margin_ms: int = 1000
+    vault_watch_concurrency: int = 4
+    vault_reconcile_lease_seconds: int = 30
+    obsidian_vault_name: str | None = None
     upload_path: Path = Path("uploads")
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -85,6 +96,44 @@ class Settings(BaseSettings):
     @property
     def gbrain_query_token(self) -> str | None:
         return self.gbrain_query_api_key or self.gbrain_api_key
+
+    @model_validator(mode="after")
+    def validate_vault_runtime(self) -> "Settings":
+        if self.vault_watch_debounce_ms < 1:
+            raise ValueError("vault_watch_debounce_ms must be at least 1")
+        if self.vault_watch_stability_timeout_seconds <= 0:
+            raise ValueError("vault_watch_stability_timeout_seconds must be greater than 0")
+        if self.vault_rename_safety_margin_ms < 0:
+            raise ValueError("vault_rename_safety_margin_ms must be at least 0")
+        if self.vault_rename_grace_ms < 1:
+            raise ValueError("vault_rename_grace_ms must be at least 1")
+
+        required_rename_grace_ms = max(
+            5000,
+            self.vault_watch_debounce_ms
+            + int(self.vault_watch_stability_timeout_seconds * 1000)
+            + self.vault_rename_safety_margin_ms,
+        )
+        if self.vault_rename_grace_ms < required_rename_grace_ms:
+            raise ValueError(
+                "vault_rename_grace_ms must cover debounce, stability timeout, "
+                "and rename safety margin"
+            )
+        if self.vault_watch_concurrency < 1:
+            raise ValueError("vault_watch_concurrency must be at least 1")
+        if self.vault_watch_max_file_bytes < 1:
+            raise ValueError("vault_watch_max_file_bytes must be at least 1")
+        if self.vault_watch_max_prefix_bytes < 1:
+            raise ValueError("vault_watch_max_prefix_bytes must be at least 1")
+        if self.vault_watch_max_prefix_bytes > self.vault_watch_max_file_bytes:
+            raise ValueError("vault_watch_max_prefix_bytes must not exceed vault_watch_max_file_bytes")
+        if self.vault_reconcile_lease_seconds < 3:
+            raise ValueError("vault_reconcile_lease_seconds must be at least 3")
+        return self
+
+    @property
+    def effective_obsidian_vault_name(self) -> str:
+        return self.obsidian_vault_name or self.vault_path.resolve().name
 
     @property
     def postgres_dsn(self) -> str:

@@ -8,3 +8,4 @@ def disable_background_integrations(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "projection_worker_enabled", False)
     monkeypatch.setattr(settings, "gbrain_enabled", False)
+    monkeypatch.setattr(settings, "vault_watch_enabled", False)
