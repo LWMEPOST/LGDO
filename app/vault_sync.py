@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -141,6 +142,64 @@ class VaultSyncService:
             page_id=page_id,
         )
 
+    async def _renew_delete_claim_until_stopped(
+        self,
+        delete_id: str,
+        owner: str,
+        stopped: asyncio.Event,
+    ) -> bool:
+        lease_seconds = self.settings.vault_reconcile_lease_seconds
+        interval = max(0.1, lease_seconds / 3)
+        while True:
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=interval)
+                return True
+            except asyncio.TimeoutError:
+                renewed = await asyncio.to_thread(
+                    self.events.renew_delete_claim,
+                    delete_id,
+                    owner,
+                    now=datetime.now(timezone.utc),
+                )
+                if not renewed:
+                    return False
+
+    async def _await_claimed_mutation(
+        self,
+        pending: PendingVaultDelete,
+        owner: str,
+        mutation: Any,
+        *args: Any,
+    ) -> tuple[Any, bool]:
+        stopped = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._renew_delete_claim_until_stopped(
+                pending.id,
+                owner,
+                stopped,
+            )
+        )
+        cancellation_requested = False
+        try:
+            result, cancellation_requested = await self._await_revision_mutation(
+                mutation,
+                *args,
+            )
+        finally:
+            stopped.set()
+            while not heartbeat.done():
+                try:
+                    await asyncio.shield(heartbeat)
+                except asyncio.CancelledError:
+                    cancellation_requested = True
+            claim_retained = await heartbeat
+        if not claim_retained:
+            raise RevisionConflict(
+                "delete expiry lost its persistent claim",
+                current_revision_id=None,
+            )
+        return result, cancellation_requested
+
     async def expire_deletes(self, now: datetime | None = None) -> int:
         expire_at = now or datetime.now(timezone.utc)
         if expire_at.tzinfo is None:
@@ -148,18 +207,20 @@ class VaultSyncService:
 
         completed = 0
         for candidate in self.events.list_due_deletes(expire_at):
+            owner = f"vclaim_{uuid.uuid4().hex}"
+            claimed = self.events.claim_delete(
+                candidate.id,
+                owner,
+                now=datetime.now(timezone.utc),
+                due_at=expire_at,
+            )
+            if not claimed:
+                continue
+            claim_completed = False
             try:
-                if self.events.has_unclassified_add_before(candidate.expires_at):
-                    continue
-                if (
-                    self._absolute_path(candidate.old_page_path).exists()
-                    or self.events.has_active_intent(candidate.page_id)
-                ):
-                    continue
-
                 async with self._page_lock(candidate.page_id):
                     pending = self.events.get_pending_delete(candidate.id)
-                    if pending is None:
+                    if pending is None or pending.claim_owner != owner:
                         continue
                     if (
                         self._absolute_path(pending.old_page_path).exists()
@@ -170,16 +231,23 @@ class VaultSyncService:
                     ):
                         continue
 
-                    result, cancellation_requested = (
-                        await self._await_revision_mutation(
+                    result, cancellation_requested = await (
+                        self._await_claimed_mutation(
+                            pending,
+                            owner,
                             self.revisions.delete_page,
                             pending.occurrence_id,
                             pending.old_page_path,
                         )
                     )
                     if result.status in {"deleted", "ignored"}:
-                        if self.events.complete_delete(pending.id):
+                        if self.events.complete_delete(
+                            pending.id,
+                            owner,
+                            now=datetime.now(timezone.utc),
+                        ):
                             completed += 1
+                            claim_completed = True
                     else:
                         error = (
                             "delete expiry returned non-terminal status: "
@@ -209,6 +277,9 @@ class VaultSyncService:
                     )
                 except Exception:
                     pass
+            finally:
+                if not claim_completed:
+                    self.events.release_delete_claim(candidate.id, owner)
         return completed
 
     @staticmethod
@@ -340,42 +411,96 @@ class VaultSyncService:
                 "startup move replay has no managed identity",
                 current_revision_id=None,
             )
-        async with self._page_lock(page_id):
-            observation = await wait_for_stable_observation(
-                absolute_path,
-                self.limits,
-                timeout_seconds=(
-                    self.settings.vault_watch_stability_timeout_seconds
-                ),
-                poll_interval=stability_poll_interval,
+        pending_deletes = self.events.find_pending_deletes(page_id=page_id)
+        if len(pending_deletes) > 1 or any(
+            pending.old_page_path != occurrence.old_page_path
+            for pending in pending_deletes
+        ):
+            raise RevisionConflict(
+                "startup move replay has ambiguous pending delete evidence",
+                current_revision_id=None,
             )
-            if self._inventory_page_id(observation) != page_id:
-                raise RevisionConflict(
-                    "startup move replay identity changed",
-                    current_revision_id=None,
+        replay_owner = f"vclaim_replay_{uuid.uuid4().hex}"
+        claimed_pending: PendingVaultDelete | None = None
+        claim_resolved = False
+        pending_completed = False
+        try:
+            for pending in pending_deletes:
+                claimed_pending = await self._claim_delete_after_wait(
+                    pending,
+                    replay_owner,
+                    poll_interval=stability_poll_interval,
                 )
-            if occurrence.kind == "rename":
-                result, cancellation_requested = (
-                    await self._await_revision_mutation(
-                        self.revisions.rename_page,
+                if claimed_pending is None:
+                    pending_completed = True
+            async with self._page_lock(page_id):
+                observation = await wait_for_stable_observation(
+                    absolute_path,
+                    self.limits,
+                    timeout_seconds=(
+                        self.settings.vault_watch_stability_timeout_seconds
+                    ),
+                    poll_interval=stability_poll_interval,
+                )
+                if self._inventory_page_id(observation) != page_id:
+                    raise RevisionConflict(
+                        "startup move replay identity changed",
+                        current_revision_id=None,
+                    )
+                if pending_completed:
+                    mutation = self.revisions.ingest_external_change
+                    args = (
+                        f"{occurrence.id}_restore",
+                        occurrence.page_path,
+                        observation,
+                    )
+                elif occurrence.kind == "rename":
+                    mutation = self.revisions.rename_page
+                    args = (
                         occurrence.id,
                         occurrence.old_page_path,
                         occurrence.page_path,
                     )
-                )
-            else:
-                result, cancellation_requested = (
-                    await self._await_revision_mutation(
-                        self.revisions.relocate_external_change,
+                else:
+                    mutation = self.revisions.relocate_external_change
+                    args = (
                         occurrence.id,
                         occurrence.old_page_path,
                         occurrence.page_path,
                         page_id,
                         observation,
                     )
+                if claimed_pending is None:
+                    result, cancellation_requested = (
+                        await self._await_revision_mutation(mutation, *args)
+                    )
+                else:
+                    result, cancellation_requested = await self._await_claimed_mutation(
+                        claimed_pending,
+                        replay_owner,
+                        mutation,
+                        *args,
+                    )
+                    if result.status in {"renamed", "applied", "ignored"}:
+                        claim_resolved = self.events.cancel_claimed_delete(
+                            claimed_pending.id,
+                            replay_owner,
+                            occurrence.id,
+                            now=datetime.now(timezone.utc),
+                        )
+                        if not claim_resolved:
+                            raise RevisionConflict(
+                                "startup move replay lost its pending delete claim",
+                                current_revision_id=None,
+                            )
+                self._finish_result(occurrence, result)
+                self._propagate_cancellation(cancellation_requested)
+        finally:
+            if claimed_pending is not None and not claim_resolved:
+                self.events.release_delete_claim(
+                    claimed_pending.id,
+                    replay_owner,
                 )
-            self._finish_result(occurrence, result)
-            self._propagate_cancellation(cancellation_requested)
 
     async def _replay_pending_occurrences(
         self,
@@ -499,6 +624,21 @@ class VaultSyncService:
         if occurrence.status != "pending":
             return False
 
+        pending = self.events.find_pending_delete_for_path(page_path)
+        if pending is not None:
+            if bound_page is None or str(
+                bound_page.get("page_id")
+            ) != pending.page_id:
+                raise RevisionConflict(
+                    "startup same-path delete evidence changed",
+                    current_revision_id=None,
+                )
+            await self._cancel_delete_after_claim(
+                pending,
+                occurrence.id,
+                poll_interval=stability_poll_interval,
+            )
+
         lock_key = (
             str(bound_page["page_id"])
             if bound_page is not None and bound_page.get("page_id")
@@ -529,20 +669,6 @@ class VaultSyncService:
                     ),
                     poll_interval=stability_poll_interval,
                 )
-                pending = self.events.find_pending_delete_for_path(page_path)
-                if pending is not None:
-                    if (
-                        bound_page is None
-                        or str(bound_page.get("page_id")) != pending.page_id
-                        or not self.events.cancel_delete(
-                            pending.id,
-                            occurrence.id,
-                        )
-                    ):
-                        raise RevisionConflict(
-                            "startup same-path delete evidence changed",
-                            current_revision_id=None,
-                        )
                 result, cancellation_requested = (
                     await self._await_revision_mutation(
                         self.revisions.ingest_external_change,
@@ -569,11 +695,55 @@ class VaultSyncService:
     ) -> str:
         page_id = str(page["page_id"])
         old_path = str(page["path"])
+        absolute_candidate = self._absolute_path(candidate_path)
         occurrence: VaultWatchOccurrence | None = None
+        move_owner = f"vclaim_move_{uuid.uuid4().hex}"
+        claimed_pending: PendingVaultDelete | None = None
+        claim_resolved = False
         try:
+            observation = await wait_for_stable_observation(
+                absolute_candidate,
+                self.limits,
+                timeout_seconds=self.settings.vault_watch_stability_timeout_seconds,
+                poll_interval=stability_poll_interval,
+            )
+            if self._inventory_page_id(observation) != page_id:
+                raise RevisionConflict(
+                    "startup move identity changed",
+                    current_revision_id=None,
+                )
+            pending_deletes = self.events.find_pending_deletes(page_id=page_id)
+            if len(pending_deletes) > 1 or any(
+                pending.old_page_path != old_path
+                for pending in pending_deletes
+            ):
+                raise RevisionConflict(
+                    "startup move has ambiguous pending delete evidence",
+                    current_revision_id=None,
+                )
+            exact = observation.file_hash == page.get("file_hash")
+            action = "rename" if exact else "relocate"
+            occurrence = self.events.begin_occurrence(
+                action,
+                candidate_path,
+                old_page_path=old_path,
+                detected_at=datetime.now(timezone.utc),
+            )
+            self._remember_event_time(occurrence.detected_at)
+            if occurrence.status != "pending":
+                return action
+            pending_completed = False
+            for pending in pending_deletes:
+                claimed_pending = await self._claim_delete_after_wait(
+                    pending,
+                    move_owner,
+                    poll_interval=stability_poll_interval,
+                )
+                if claimed_pending is None:
+                    pending_completed = True
+
             async with self._page_lock(page_id):
                 current = self.events.page_by_path(old_path)
-                absolute_candidate = self._absolute_path(candidate_path)
                 if (
                     current is None
                     or str(current.get("page_id")) != page_id
@@ -598,53 +768,58 @@ class VaultSyncService:
                         "startup move identity changed",
                         current_revision_id=None,
                     )
-
-                pending_deletes = self.events.find_pending_deletes(
-                    page_id=page_id
-                )
-                if len(pending_deletes) > 1 or any(
-                    pending.old_page_path != old_path
-                    for pending in pending_deletes
-                ):
+                if (observation.file_hash == page.get("file_hash")) != exact:
                     raise RevisionConflict(
-                        "startup move has ambiguous pending delete evidence",
+                        "startup move content changed while waiting for delete claim",
                         current_revision_id=None,
                     )
-
-                exact = observation.file_hash == page.get("file_hash")
-                action = "rename" if exact else "relocate"
-                occurrence = self.events.begin_occurrence(
-                    action,
-                    candidate_path,
-                    old_page_path=old_path,
-                    detected_at=datetime.now(timezone.utc),
-                )
-                self._remember_event_time(occurrence.detected_at)
-                if occurrence.status != "pending":
-                    return action
-                if exact:
+                if pending_completed:
                     result, cancellation_requested = (
                         await self._await_revision_mutation(
-                            self.revisions.rename_page,
+                            self.revisions.ingest_external_change,
                             occurrence.id,
-                            old_path,
                             candidate_path,
-                        )
-                    )
-                else:
-                    result, cancellation_requested = (
-                        await self._await_revision_mutation(
-                            self.revisions.relocate_external_change,
-                            occurrence.id,
-                            old_path,
-                            candidate_path,
-                            page_id,
                             observation,
                         )
                     )
-                if result.status in {"renamed", "applied", "ignored"}:
-                    for pending in pending_deletes:
-                        self.events.cancel_delete(pending.id, occurrence.id)
+                    self._finish_result(occurrence, result)
+                    self._propagate_cancellation(cancellation_requested)
+                    return "ingest"
+                if exact:
+                    args = (occurrence.id, old_path, candidate_path)
+                    mutation = self.revisions.rename_page
+                else:
+                    args = (
+                        occurrence.id,
+                        old_path,
+                        candidate_path,
+                        page_id,
+                        observation,
+                    )
+                    mutation = self.revisions.relocate_external_change
+                if claimed_pending is None:
+                    result, cancellation_requested = (
+                        await self._await_revision_mutation(mutation, *args)
+                    )
+                else:
+                    result, cancellation_requested = await self._await_claimed_mutation(
+                        claimed_pending,
+                        move_owner,
+                        mutation,
+                        *args,
+                    )
+                    if result.status in {"renamed", "applied", "ignored"}:
+                        claim_resolved = self.events.cancel_claimed_delete(
+                            claimed_pending.id,
+                            move_owner,
+                            occurrence.id,
+                            now=datetime.now(timezone.utc),
+                        )
+                        if not claim_resolved:
+                            raise RevisionConflict(
+                                "startup move lost its pending delete claim",
+                                current_revision_id=None,
+                            )
                 self._finish_result(occurrence, result)
                 self._propagate_cancellation(cancellation_requested)
                 return action
@@ -653,6 +828,12 @@ class VaultSyncService:
         except Exception as exc:
             self._fail_startup_occurrence(occurrence, exc)
             raise
+        finally:
+            if claimed_pending is not None and not claim_resolved:
+                self.events.release_delete_claim(
+                    claimed_pending.id,
+                    move_owner,
+                )
 
     async def _queue_startup_missing(
         self,
@@ -676,12 +857,6 @@ class VaultSyncService:
                 "delete",
                 page_path,
                 detected_at=datetime.now(timezone.utc),
-                occurrence_id=self._startup_occurrence_id(
-                    "missing",
-                    page_id,
-                    page_path,
-                    str(page.get("file_hash") or ""),
-                ),
             )
             self._remember_event_time(occurrence.detected_at)
             await self._queue_delete(occurrence, occurrence.detected_at)
@@ -808,9 +983,12 @@ class VaultSyncService:
                         candidate_path=candidate_path,
                         stability_poll_interval=stability_poll_interval,
                     )
-                    counters[
-                        "renamed" if action == "rename" else "relocated"
-                    ] += 1
+                    counter = {
+                        "rename": "renamed",
+                        "relocate": "relocated",
+                        "ingest": "ingested",
+                    }[action]
+                    counters[counter] += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1013,6 +1191,45 @@ class VaultSyncService:
         if cancellation_requested:
             raise asyncio.CancelledError
 
+    async def _cancel_delete_after_claim(
+        self,
+        candidate: PendingVaultDelete,
+        occurrence_id: str,
+        *,
+        poll_interval: float,
+    ) -> PendingVaultDelete | None:
+        interval = max(0.01, poll_interval)
+        while True:
+            pending = self.events.get_pending_delete(candidate.id)
+            if pending is None:
+                return None
+            if self.events.cancel_delete(pending.id, occurrence_id):
+                return pending
+            await asyncio.sleep(interval)
+
+    async def _claim_delete_after_wait(
+        self,
+        candidate: PendingVaultDelete,
+        owner: str,
+        *,
+        poll_interval: float,
+    ) -> PendingVaultDelete | None:
+        interval = max(0.01, poll_interval)
+        while True:
+            pending = self.events.get_pending_delete(candidate.id)
+            if pending is None:
+                return None
+            if self.events.claim_delete(
+                pending.id,
+                owner,
+                now=datetime.now(timezone.utc),
+                due_at=pending.expires_at,
+            ):
+                claimed = self.events.get_pending_delete(pending.id)
+                if claimed is not None and claimed.claim_owner == owner:
+                    return claimed
+            await asyncio.sleep(interval)
+
     def _same_path_evidence(
         self,
         candidate: PendingVaultDelete,
@@ -1069,6 +1286,45 @@ class VaultSyncService:
         self._finish_result(occurrence, result)
         self._propagate_cancellation(cancellation_requested)
 
+    async def _apply_pending_move_arrival(
+        self,
+        occurrence: VaultWatchOccurrence,
+        pending: PendingVaultDelete,
+        observation: FileObservationInput,
+        absolute_path: Path,
+    ) -> None:
+        page = self.events.page_by_path(pending.old_page_path)
+        if (
+            page is None
+            or str(page.get("page_id")) != pending.page_id
+            or self._absolute_path(pending.old_page_path).exists()
+            or not absolute_path.exists()
+            or self.events.has_active_intent(pending.page_id)
+            or self._managed_page_id(observation) != pending.page_id
+        ):
+            raise RevisionConflict(
+                "rename evidence changed",
+                current_revision_id=None,
+            )
+        if observation.file_hash == pending.file_hash:
+            result, cancellation_requested = await self._await_revision_mutation(
+                self.revisions.rename_page,
+                occurrence.id,
+                pending.old_page_path,
+                occurrence.page_path,
+            )
+        else:
+            result, cancellation_requested = await self._await_revision_mutation(
+                self.revisions.relocate_external_change,
+                occurrence.id,
+                pending.old_page_path,
+                occurrence.page_path,
+                pending.page_id,
+                observation,
+            )
+        self._finish_result(occurrence, result)
+        self._propagate_cancellation(cancellation_requested)
+
     async def _process_add_or_modify(
         self,
         occurrence: VaultWatchOccurrence,
@@ -1085,7 +1341,25 @@ class VaultSyncService:
 
         same_path = self.events.find_pending_delete_for_path(occurrence.page_path)
         if same_path is not None:
+            evidence = self._same_path_evidence(
+                same_path,
+                occurrence,
+                absolute_path,
+            )
+            pending = await self._cancel_delete_after_claim(
+                evidence,
+                occurrence.id,
+                poll_interval=stability_poll_interval,
+            )
             async with self._page_lock(same_path.page_id):
+                if (
+                    not absolute_path.exists()
+                    or self.events.has_active_intent(same_path.page_id)
+                ):
+                    raise RevisionConflict(
+                        "same-path save evidence changed",
+                        current_revision_id=None,
+                    )
                 observation = await wait_for_stable_observation(
                     absolute_path,
                     self.limits,
@@ -1094,17 +1368,10 @@ class VaultSyncService:
                     ),
                     poll_interval=stability_poll_interval,
                 )
-                pending = self._same_path_evidence(
-                    same_path,
-                    occurrence,
-                    absolute_path,
+                arrived_before_deadline = (
+                    occurrence.detected_at
+                    <= (pending or evidence).expires_at
                 )
-                arrived_before_deadline = occurrence.detected_at <= pending.expires_at
-                if not self.events.cancel_delete(pending.id, occurrence.id):
-                    raise RevisionConflict(
-                        "same-path save evidence changed",
-                        current_revision_id=None,
-                    )
                 result, cancellation_requested = await self._await_revision_mutation(
                     self.revisions.ingest_external_change,
                     occurrence.id,
@@ -1127,7 +1394,10 @@ class VaultSyncService:
         if page_id is not None:
             self.events.find_pending_deletes(page_id=page_id)
         lock_key = page_id or occurrence.page_path
+        resolution_ready = False
+        resolved_pending: PendingVaultDelete | None = None
         while True:
+            wait_candidate: PendingVaultDelete | None = None
             async with self._page_lock(lock_key):
                 observation = await wait_for_stable_observation(
                     absolute_path,
@@ -1140,8 +1410,25 @@ class VaultSyncService:
                 page_id = self._managed_page_id(observation)
                 fresh_lock_key = page_id or occurrence.page_path
                 if fresh_lock_key != lock_key:
+                    if resolution_ready:
+                        raise RevisionConflict(
+                            "managed identity changed while waiting for delete claim",
+                            current_revision_id=None,
+                        )
                     lock_key = fresh_lock_key
                     continue
+
+                if resolution_ready:
+                    if resolved_pending is None:
+                        await self._ingest(occurrence, observation)
+                    else:
+                        await self._apply_pending_move_arrival(
+                            occurrence,
+                            resolved_pending,
+                            observation,
+                            absolute_path,
+                        )
+                    return
 
                 candidates = (
                     self.events.find_pending_deletes(page_id=page_id)
@@ -1174,36 +1461,28 @@ class VaultSyncService:
                     return
 
                 candidate = candidates[0]
-                pending = self._rename_evidence(
+                evidence = self._rename_evidence(
                     candidate,
                     occurrence,
                     absolute_path,
                 )
-                if observation.file_hash == pending.file_hash:
-                    result, cancellation_requested = (
-                        await self._await_revision_mutation(
-                            self.revisions.rename_page,
-                            occurrence.id,
-                            pending.old_page_path,
-                            occurrence.page_path,
-                        )
+                if self.events.cancel_delete(evidence.id, occurrence.id):
+                    await self._apply_pending_move_arrival(
+                        occurrence,
+                        evidence,
+                        observation,
+                        absolute_path,
                     )
+                    return
                 else:
-                    result, cancellation_requested = (
-                        await self._await_revision_mutation(
-                            self.revisions.relocate_external_change,
-                            occurrence.id,
-                            pending.old_page_path,
-                            occurrence.page_path,
-                            pending.page_id,
-                            observation,
-                        )
-                    )
-                if result.status in {"renamed", "applied", "ignored"}:
-                    self.events.cancel_delete(pending.id, occurrence.id)
-                self._finish_result(occurrence, result)
-                self._propagate_cancellation(cancellation_requested)
-                return
+                    wait_candidate = evidence
+            if wait_candidate is not None:
+                resolved_pending = await self._cancel_delete_after_claim(
+                    wait_candidate,
+                    occurrence.id,
+                    poll_interval=stability_poll_interval,
+                )
+                resolution_ready = True
 
     async def _handle_occurrence(
         self,

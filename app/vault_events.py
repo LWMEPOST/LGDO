@@ -96,10 +96,18 @@ class PendingVaultDelete:
     semantic_hash: str | None
     detected_at: datetime
     expires_at: datetime
+    claim_owner: str | None = None
+    claim_updated_at: datetime | None = None
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> PendingVaultDelete:
         values = dict(row)
+        claim_owner = (
+            str(values["matched_occurrence_id"])
+            if values.get("status") == "pending"
+            and values.get("matched_occurrence_id") is not None
+            else None
+        )
         return cls(
             id=str(values["id"]),
             occurrence_id=str(values["occurrence_id"]),
@@ -109,6 +117,12 @@ class PendingVaultDelete:
             semantic_hash=values.get("semantic_hash"),
             detected_at=_parse_datetime(values["detected_at"]),
             expires_at=_parse_datetime(values["expires_at"]),
+            claim_owner=claim_owner,
+            claim_updated_at=(
+                _parse_datetime(values["updated_at"])
+                if claim_owner is not None
+                else None
+            ),
         )
 
 
@@ -419,27 +433,158 @@ class VaultEventStore:
             ).fetchall()
         return [PendingVaultDelete.from_row(row) for row in rows]
 
+    def claim_delete(
+        self,
+        delete_id: str,
+        owner: str,
+        *,
+        now: datetime,
+        due_at: datetime | None = None,
+    ) -> bool:
+        claimed_at = _datetime_iso(now)
+        stale_before = _datetime_iso(
+            now - timedelta(seconds=self.settings.vault_reconcile_lease_seconds)
+        )
+        due_before = _datetime_iso(due_at or now)
+        with connect_app_write(self.settings) as conn:
+            updated = conn.execute(
+                """
+                UPDATE pending_vault_deletes
+                SET matched_occurrence_id=?,updated_at=?
+                WHERE id=? AND status='pending' AND expires_at<=? AND (
+                  matched_occurrence_id IS NULL
+                  OR updated_at<=?
+                )
+                """,
+                (owner, claimed_at, delete_id, due_before, stale_before),
+            )
+            return updated.rowcount == 1
+
+    def renew_delete_claim(
+        self,
+        delete_id: str,
+        owner: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        stale_before = _datetime_iso(
+            now - timedelta(seconds=self.settings.vault_reconcile_lease_seconds)
+        )
+        with connect_app_write(self.settings) as conn:
+            updated = conn.execute(
+                """
+                UPDATE pending_vault_deletes
+                SET updated_at=?
+                WHERE id=? AND status='pending' AND matched_occurrence_id=?
+                  AND updated_at>?
+                """,
+                (_datetime_iso(now), delete_id, owner, stale_before),
+            )
+            return updated.rowcount == 1
+
+    def release_delete_claim(
+        self,
+        delete_id: str,
+        owner: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        released_at = now or datetime.now(timezone.utc)
+        with connect_app_write(self.settings) as conn:
+            updated = conn.execute(
+                """
+                UPDATE pending_vault_deletes
+                SET matched_occurrence_id=NULL,updated_at=?
+                WHERE id=? AND status='pending' AND matched_occurrence_id=?
+                """,
+                (_datetime_iso(released_at), delete_id, owner),
+            )
+            return updated.rowcount == 1
+
     def cancel_delete(self, delete_id: str, occurrence_id: str) -> bool:
+        cancelled_at = datetime.now(timezone.utc)
+        stale_before = cancelled_at - timedelta(
+            seconds=self.settings.vault_reconcile_lease_seconds
+        )
         with connect_app_write(self.settings) as conn:
             updated = conn.execute(
                 """
                 UPDATE pending_vault_deletes
                 SET status='cancelled',matched_occurrence_id=?,updated_at=?
-                WHERE id=? AND status='pending'
+                WHERE id=? AND status='pending' AND (
+                  matched_occurrence_id IS NULL OR updated_at<=?
+                )
                 """,
-                (occurrence_id, now_iso(), delete_id),
+                (
+                    occurrence_id,
+                    _datetime_iso(cancelled_at),
+                    delete_id,
+                    _datetime_iso(stale_before),
+                ),
             )
             return updated.rowcount == 1
 
-    def complete_delete(self, delete_id: str) -> bool:
+    def cancel_claimed_delete(
+        self,
+        delete_id: str,
+        owner: str,
+        occurrence_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        cancelled_at = now or datetime.now(timezone.utc)
+        stale_before = cancelled_at - timedelta(
+            seconds=self.settings.vault_reconcile_lease_seconds
+        )
         with connect_app_write(self.settings) as conn:
             updated = conn.execute(
                 """
                 UPDATE pending_vault_deletes
-                SET status='completed',updated_at=?
-                WHERE id=? AND status='pending'
+                SET status='cancelled',matched_occurrence_id=?,updated_at=?
+                WHERE id=? AND status='pending' AND matched_occurrence_id=?
+                  AND updated_at>?
                 """,
-                (now_iso(), delete_id),
+                (
+                    occurrence_id,
+                    _datetime_iso(cancelled_at),
+                    delete_id,
+                    owner,
+                    _datetime_iso(stale_before),
+                ),
+            )
+            return updated.rowcount == 1
+
+    def complete_delete(
+        self,
+        delete_id: str,
+        owner: str | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        completed_at = now or datetime.now(timezone.utc)
+        stale_before = completed_at - timedelta(
+            seconds=self.settings.vault_reconcile_lease_seconds
+        )
+        with connect_app_write(self.settings) as conn:
+            updated = conn.execute(
+                """
+                UPDATE pending_vault_deletes
+                SET status='completed',matched_occurrence_id=NULL,updated_at=?
+                WHERE id=? AND status='pending' AND (
+                  (? IS NULL AND matched_occurrence_id IS NULL)
+                  OR (
+                    ? IS NOT NULL AND matched_occurrence_id=? AND updated_at>?
+                  )
+                )
+                """,
+                (
+                    _datetime_iso(completed_at),
+                    delete_id,
+                    owner,
+                    owner,
+                    owner,
+                    _datetime_iso(stale_before),
+                ),
             )
             return updated.rowcount == 1
 

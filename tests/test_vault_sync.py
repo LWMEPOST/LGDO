@@ -1201,3 +1201,207 @@ async def test_delete_expiry_cancellation_drains_before_propagating(settings):
         ).fetchone()[0]
     assert pending == 0
     assert revisions.calls == [("delete", revisions.calls[0][1], old_path)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "same_instance",
+    [False, True],
+    ids=["cross-instance", "same-instance"],
+)
+async def test_cross_instance_add_waits_for_claimed_delete_then_restores(
+    settings,
+    same_instance,
+):
+    page_id = "page_cross_instance_claim"
+    page_path = "wiki/product/cross-instance-claim.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=page_path, content=content)
+    detected_at = datetime(2026, 7, 15, 13, 0, tzinfo=timezone.utc)
+    delete_entered = threading.Event()
+    release_delete = threading.Event()
+    ingest_entered = threading.Event()
+    cancel_attempted = threading.Event()
+    cancel_results: list[bool] = []
+    order: list[str] = []
+
+    class OrderedRevisionService(FakeRevisionService):
+        def delete_page(self, event_id, path):
+            self.calls.append(("delete", event_id, path))
+            order.append("delete_enter")
+            delete_entered.set()
+            if not release_delete.wait(timeout=5):
+                raise RuntimeError("blocked cross-instance delete was not released")
+            order.append("delete_commit")
+            return FakeResult("deleted", page_id=page_id)
+
+        def ingest_external_change(self, event_id, path, observation):
+            self.calls.append(("ingest", event_id, path, observation.file_hash))
+            order.append("ingest_commit")
+            ingest_entered.set()
+            return FakeResult("applied", page_id=page_id)
+
+    class ObservedEventStore(VaultEventStore):
+        def cancel_delete(self, delete_id, occurrence_id):
+            result = super().cancel_delete(delete_id, occurrence_id)
+            cancel_results.append(result)
+            cancel_attempted.set()
+            return result
+
+    revisions = OrderedRevisionService()
+    observed_store = ObservedEventStore(settings)
+    expirer = VaultSyncService(
+        settings,
+        revisions=revisions,
+        events=observed_store if same_instance else None,
+    )
+    observer = (
+        expirer
+        if same_instance
+        else VaultSyncService(
+            settings,
+            revisions=revisions,
+            events=observed_store,
+        )
+    )
+    await handle(
+        expirer,
+        [VaultFsEvent("delete", page_path)],
+        detected_at=detected_at,
+    )
+    expiry = asyncio.create_task(
+        expirer.expire_deletes(now=detected_at + timedelta(seconds=6))
+    )
+    while not delete_entered.is_set():
+        await asyncio.sleep(0)
+
+    write_page(settings, page_path, content)
+    add = asyncio.create_task(
+        handle(
+            observer,
+            [VaultFsEvent("add", page_path)],
+            detected_at=detected_at + timedelta(seconds=6),
+        )
+    )
+    while not cancel_attempted.is_set():
+        await asyncio.sleep(0)
+    add_was_blocked = (
+        cancel_results == [False]
+        and not ingest_entered.is_set()
+        and not add.done()
+    )
+
+    release_delete.set()
+    expired, add_result = await asyncio.gather(expiry, add)
+
+    assert add_was_blocked is True
+    assert expired == 1
+    assert add_result is None
+    assert order == ["delete_enter", "delete_commit", "ingest_commit"]
+    assert observer.snapshot()["pending_deletes"] == 0
+    assert observer.events.pending_occurrences() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edited", [False, True], ids=["rename", "relocate"])
+async def test_startup_move_replay_cleans_predecessor_pending_delete(
+    settings,
+    edited,
+):
+    page_id = f"page_replayed_startup_move_{edited}"
+    old_path = f"wiki/product/replayed-startup-old-{edited}.md"
+    new_path = f"wiki/product/replayed-startup-new-{edited}.md"
+    original = managed_bytes(page_id)
+    moved = managed_bytes(page_id, body="Edited replay") if edited else original
+    seed_page(settings, page_id=page_id, page_path=old_path, content=original)
+    detected_at = datetime(2026, 7, 15, 14, 0, tzinfo=timezone.utc)
+    store = VaultEventStore(settings)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions, events=store)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    write_page(settings, new_path, moved)
+    kind = "relocate" if edited else "rename"
+    move = store.begin_occurrence(
+        kind,
+        new_path,
+        old_page_path=old_path,
+        detected_at=detected_at + timedelta(seconds=1),
+    )
+
+    result = await service.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    with connect_app(settings) as conn:
+        move_status = conn.execute(
+            "SELECT status FROM vault_watch_occurrences WHERE id=?",
+            (move.id,),
+        ).fetchone()["status"]
+    assert result["replayed"] == 1
+    assert move_status == ("applied" if edited else "renamed")
+    assert service.snapshot()["pending_deletes"] == 0
+    assert [call[0] for call in revisions.calls] == [
+        kind,
+        "ensure_projection_jobs",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_repeated_missing_cycle_uses_new_delete_occurrence(settings):
+    page_id = "page_repeated_missing_cycle"
+    page_path = "wiki/product/repeated-missing-cycle.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=page_path, content=content)
+
+    first = VaultSyncService(settings, revisions=FakeRevisionService())
+    await first.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+    with connect_app(settings) as conn:
+        first_pending = dict(
+            conn.execute(
+                "SELECT * FROM pending_vault_deletes WHERE status='pending'"
+            ).fetchone()
+        )
+
+    write_page(settings, page_path, content)
+    restored = VaultSyncService(settings, revisions=FakeRevisionService())
+    await restored.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+    assert restored.snapshot()["pending_deletes"] == 0
+    remove_page(settings, page_path)
+
+    revisions = FakeRevisionService()
+    missing_again = VaultSyncService(settings, revisions=revisions)
+    result = await missing_again.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+    with connect_app(settings) as conn:
+        pending_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM pending_vault_deletes WHERE status='pending'"
+            ).fetchall()
+        ]
+
+    assert result["missing"] == 1
+    assert len(pending_rows) == 1
+    second_pending = pending_rows[0]
+    assert second_pending["occurrence_id"] != first_pending["occurrence_id"]
+    expires_at = datetime.fromisoformat(second_pending["expires_at"])
+    assert await missing_again.expire_deletes(
+        now=expires_at + timedelta(seconds=1)
+    ) == 1
+    assert await missing_again.expire_deletes(
+        now=expires_at + timedelta(seconds=2)
+    ) == 0
+    assert [call[0] for call in revisions.calls].count("delete") == 1
