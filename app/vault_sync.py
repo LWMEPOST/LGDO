@@ -200,6 +200,24 @@ class VaultSyncService:
             )
         return result, cancellation_requested
 
+    def _record_delete_expiry_failure(
+        self,
+        pending: PendingVaultDelete,
+        exc: Exception,
+    ) -> None:
+        error = (str(exc) or type(exc).__name__)[:500]
+        self.last_error = error
+        try:
+            self.events.upsert_sync_issue(
+                page_path=pending.old_page_path,
+                file_hash=pending.file_hash or "",
+                page_id=pending.page_id,
+                issue_type="delete_expiry_failed",
+                error_summary=error,
+            )
+        except Exception:
+            pass
+
     async def expire_deletes(self, now: datetime | None = None) -> int:
         expire_at = now or datetime.now(timezone.utc)
         if expire_at.tzinfo is None:
@@ -208,16 +226,25 @@ class VaultSyncService:
         completed = 0
         for candidate in self.events.list_due_deletes(expire_at):
             owner = f"vclaim_{uuid.uuid4().hex}"
-            claimed = self.events.claim_delete(
-                candidate.id,
-                owner,
-                now=datetime.now(timezone.utc),
-                due_at=expire_at,
-            )
-            if not claimed:
-                continue
+            claimed = False
             claim_completed = False
             try:
+                if (
+                    self._absolute_path(candidate.old_page_path).exists()
+                    or self.events.has_active_intent(candidate.page_id)
+                    or self.events.has_unclassified_add_before(
+                        candidate.expires_at
+                    )
+                ):
+                    continue
+                claimed = self.events.claim_delete(
+                    candidate.id,
+                    owner,
+                    now=datetime.now(timezone.utc),
+                    due_at=expire_at,
+                )
+                if not claimed:
+                    continue
                 async with self._page_lock(candidate.page_id):
                     pending = self.events.get_pending_delete(candidate.id)
                     if pending is None or pending.claim_owner != owner:
@@ -249,37 +276,24 @@ class VaultSyncService:
                             completed += 1
                             claim_completed = True
                     else:
-                        error = (
-                            "delete expiry returned non-terminal status: "
-                            f"{result.status}"
-                        )
-                        self.last_error = error[:500]
-                        self.events.upsert_sync_issue(
-                            page_path=pending.old_page_path,
-                            file_hash=pending.file_hash or "",
-                            page_id=pending.page_id,
-                            issue_type="delete_expiry_failed",
-                            error_summary=self.last_error,
+                        self._record_delete_expiry_failure(
+                            pending,
+                            RuntimeError(
+                                "delete expiry returned non-terminal status: "
+                                f"{result.status}"
+                            ),
                         )
                     self._propagate_cancellation(cancellation_requested)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                error = str(exc)[:500]
-                self.last_error = error
-                try:
-                    self.events.upsert_sync_issue(
-                        page_path=candidate.old_page_path,
-                        file_hash=candidate.file_hash or "",
-                        page_id=candidate.page_id,
-                        issue_type="delete_expiry_failed",
-                        error_summary=error,
-                    )
-                except Exception:
-                    pass
+                self._record_delete_expiry_failure(candidate, exc)
             finally:
-                if not claim_completed:
-                    self.events.release_delete_claim(candidate.id, owner)
+                if claimed and not claim_completed:
+                    try:
+                        self.events.release_delete_claim(candidate.id, owner)
+                    except Exception as exc:
+                        self._record_delete_expiry_failure(candidate, exc)
         return completed
 
     @staticmethod

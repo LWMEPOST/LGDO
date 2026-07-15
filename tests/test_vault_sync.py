@@ -1405,3 +1405,129 @@ async def test_startup_repeated_missing_cycle_uses_new_delete_occurrence(setting
         now=expires_at + timedelta(seconds=2)
     ) == 0
     assert [call[0] for call in revisions.calls].count("delete") == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_prechecks_existing_path_before_claim(settings):
+    page_id = "page_preclaim_path"
+    page_path = "wiki/product/preclaim-path.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=page_path, content=content)
+    claim_calls = 0
+
+    class ClaimObservedStore(VaultEventStore):
+        def claim_delete(self, *args, **kwargs):
+            nonlocal claim_calls
+            claim_calls += 1
+            return super().claim_delete(*args, **kwargs)
+
+    store = ClaimObservedStore(settings)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions, events=store)
+    detected_at = datetime(2026, 7, 15, 15, 0, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", page_path)],
+        detected_at=detected_at,
+    )
+    write_page(settings, page_path, content)
+
+    assert await service.expire_deletes(
+        now=detected_at + timedelta(seconds=6)
+    ) == 0
+    assert claim_calls == 0
+    assert revisions.calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_claim_failure_does_not_abort_later_candidates(
+    settings,
+):
+    detected_at = datetime(2026, 7, 15, 15, 30, tzinfo=timezone.utc)
+    paths = [
+        "wiki/product/claim-failure-first.md",
+        "wiki/product/claim-failure-second.md",
+    ]
+    for index, page_path in enumerate(paths):
+        content = managed_bytes(f"page_claim_failure_{index}")
+        seed_page(
+            settings,
+            page_id=f"page_claim_failure_{index}",
+            page_path=page_path,
+            content=content,
+        )
+
+    class FailFirstClaimStore(VaultEventStore):
+        def __init__(self, configured_settings):
+            super().__init__(configured_settings)
+            self.claim_calls = 0
+
+        def claim_delete(self, *args, **kwargs):
+            self.claim_calls += 1
+            if self.claim_calls == 1:
+                raise RuntimeError("claim database unavailable")
+            return super().claim_delete(*args, **kwargs)
+
+    store = FailFirstClaimStore(settings)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions, events=store)
+    await handle(
+        service,
+        [VaultFsEvent("delete", page_path) for page_path in paths],
+        detected_at=detected_at,
+    )
+
+    expired = await service.expire_deletes(
+        now=detected_at + timedelta(seconds=6)
+    )
+
+    assert expired == 1
+    assert store.claim_calls == 2
+    assert [call[0] for call in revisions.calls] == ["delete"]
+    assert service.snapshot()["pending_deletes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_release_failure_preserves_cancellation(settings):
+    page_id = "page_release_failure_cancel"
+    page_path = "wiki/product/release-failure-cancel.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=page_path, content=content)
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+
+    class ReleaseFailingStore(VaultEventStore):
+        def release_delete_claim(self, *args, **kwargs):
+            raise RuntimeError("claim release database unavailable")
+
+    class FailingDeleteRevisions(FakeRevisionService):
+        def delete_page(self, event_id, path):
+            self.calls.append(("delete", event_id, path))
+            mutation_entered.set()
+            if not release_mutation.wait(timeout=5):
+                raise RuntimeError("blocked cancellation delete was not released")
+            raise RuntimeError("delete failed after cancellation")
+
+    revisions = FailingDeleteRevisions()
+    service = VaultSyncService(
+        settings,
+        revisions=revisions,
+        events=ReleaseFailingStore(settings),
+    )
+    detected_at = datetime(2026, 7, 15, 16, 0, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", page_path)],
+        detected_at=detected_at,
+    )
+    expiry = asyncio.create_task(
+        service.expire_deletes(now=detected_at + timedelta(seconds=6))
+    )
+    while not mutation_entered.is_set():
+        await asyncio.sleep(0)
+
+    expiry.cancel()
+    release_mutation.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await expiry
