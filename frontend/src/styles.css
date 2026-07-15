@@ -2743,23 +2743,62 @@ td {
   }
 
   .wiki-topbar {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
     padding: 12px;
   }
 
   .topbar-actions {
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: flex-start;
     gap: 8px;
   }
 
   .sync-state {
     max-width: 100%;
+    flex: 1 1 104px;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .space-header {
     min-height: auto;
   }
 
+  .space-sidebar {
+    min-width: 0;
+  }
+
   .nav-list {
+    width: 100%;
+    display: flex;
     gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 2px 0 8px;
+    overscroll-behavior-inline: contain;
+  }
+
+  .nav-item {
+    width: auto;
+    min-height: 40px;
+    flex: 0 0 auto;
+    grid-template-columns: 26px auto;
+    gap: 7px;
+    padding: 6px 8px;
+  }
+
+  .nav-icon {
+    width: 26px;
+    height: 26px;
+  }
+
+  .nav-copy small,
+  .nav-count,
+  .space-tree {
+    display: none;
   }
 
   .task-area {
