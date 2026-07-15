@@ -277,6 +277,29 @@ class VaultEventStore:
             ).fetchone()
         return row is not None
 
+    def page_by_path(self, page_path: str) -> dict[str, Any] | None:
+        with connect_app(self.settings) as conn:
+            row = conn.execute(
+                "SELECT * FROM wiki_pages WHERE path=?",
+                (page_path,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def has_active_intent(self, page_id: str) -> bool:
+        with connect_app(self.settings) as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM vault_write_intents
+                WHERE page_id=?
+                  AND status IN (
+                    'pending','captured','installed','recovery_required'
+                  )
+                LIMIT 1
+                """,
+                (page_id,),
+            ).fetchone()
+        return row is not None
+
     def get_or_create_pending_delete(
         self,
         *,
@@ -607,6 +630,28 @@ class VaultEventStore:
                 else None
             ),
         }
+
+    def upsert_sync_issue(
+        self,
+        *,
+        page_path: str,
+        file_hash: str,
+        page_id: str | None,
+        issue_type: str,
+        error_summary: str,
+    ) -> SyncIssueRef:
+        from app.wiki_revisions import _upsert_sync_issue_locked
+
+        with connect_app_write(self.settings) as conn:
+            issue_id, generation = _upsert_sync_issue_locked(
+                conn,
+                page_path=page_path,
+                file_hash=file_hash,
+                page_id=page_id,
+                issue_type=issue_type,
+                error_summary=error_summary,
+            )
+        return SyncIssueRef(issue_id, generation)
 
     def list_open_issue_refs(self, page_path: str) -> tuple[SyncIssueRef, ...]:
         with connect_app(self.settings) as conn:
