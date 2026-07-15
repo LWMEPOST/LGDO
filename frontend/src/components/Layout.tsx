@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { ChevronDown, SlidersHorizontal } from "lucide-react";
 
 import { APP_RAIL_ITEMS, NAV_ITEMS, type SectionId } from "../constants";
 import type { AuthUser, KnowledgeGap, RagStatus, SourcePreview, SourceRecord, SpaceDirectoryGroup, SpaceFilter, WikiPage } from "../types";
@@ -160,6 +161,13 @@ export function Layout({
             ))}
           </nav>
 
+          <MobileSpaceFilter
+            directory={directory}
+            activeSpaceFilter={activeSpaceFilter}
+            selectSpaceFilter={selectSpaceFilter}
+            clearSpaceFilter={clearSpaceFilter}
+          />
+
           <SpaceTree
             directory={directory}
             activeSpaceFilter={activeSpaceFilter}
@@ -224,35 +232,29 @@ export function Layout({
   );
 }
 
+interface SpaceDirectoryContentProps {
+  directory: SpaceDirectoryGroup[];
+  activeSpaceFilter: SpaceFilter;
+  selectSpaceFilter: (filter: SpaceFilter) => void;
+}
+
+interface SpaceDirectoryProps extends SpaceDirectoryContentProps {
+  clearSpaceFilter: () => void;
+}
+
 function SpaceTree({
   directory,
   activeSpaceFilter,
   selectSpaceFilter,
   clearSpaceFilter,
-}: {
-  directory: SpaceDirectoryGroup[];
-  activeSpaceFilter: SpaceFilter;
-  selectSpaceFilter: (filter: SpaceFilter) => void;
-  clearSpaceFilter: () => void;
-}) {
+}: SpaceDirectoryProps) {
   return (
     <div className="space-tree" aria-label="空间目录">
-      {directory.map((group) => (
-        <div className="tree-section" key={group.id}>
-          <div className="tree-title">{group.label}</div>
-          {group.items.map((item) => (
-            <div key={item.id}>
-              <TreeItem
-                label={item.label}
-                desc={item.desc}
-                count={item.count}
-                active={activeSpaceFilter.id === item.id}
-                onClick={() => selectSpaceFilter(item)}
-              />
-            </div>
-          ))}
-        </div>
-      ))}
+      <SpaceDirectoryContent
+        directory={directory}
+        activeSpaceFilter={activeSpaceFilter}
+        selectSpaceFilter={selectSpaceFilter}
+      />
       {activeSpaceFilter.id !== "all" && (
         <button className="clear-tree-filter" type="button" onClick={clearSpaceFilter}>
           清除目录筛选
@@ -260,6 +262,63 @@ function SpaceTree({
       )}
     </div>
   );
+}
+
+function MobileSpaceFilter({
+  directory,
+  activeSpaceFilter,
+  selectSpaceFilter,
+  clearSpaceFilter,
+}: SpaceDirectoryProps) {
+  return (
+    <div className="mobile-space-filter">
+      <details className="mobile-space-disclosure">
+        <summary>
+          <SlidersHorizontal className="mobile-space-summary-icon" size={18} aria-hidden="true" />
+          <span className="mobile-space-summary-copy">
+            <strong>空间目录</strong>
+            <small>{activeSpaceFilter.label}</small>
+          </span>
+          <ChevronDown className="mobile-space-chevron" size={18} aria-hidden="true" />
+        </summary>
+        <div className="mobile-space-directory" aria-label="移动空间目录">
+          <SpaceDirectoryContent
+            directory={directory}
+            activeSpaceFilter={activeSpaceFilter}
+            selectSpaceFilter={selectSpaceFilter}
+          />
+        </div>
+      </details>
+      {activeSpaceFilter.id !== "all" && (
+        <button className="mobile-clear-space-filter" type="button" onClick={clearSpaceFilter}>
+          清除筛选
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SpaceDirectoryContent({
+  directory,
+  activeSpaceFilter,
+  selectSpaceFilter,
+}: SpaceDirectoryContentProps) {
+  return directory.map((group) => (
+    <div className="tree-section" key={group.id}>
+      <div className="tree-title">{group.label}</div>
+      {group.items.map((item) => (
+        <div key={item.id}>
+          <TreeItem
+            label={item.label}
+            desc={item.desc}
+            count={item.count}
+            active={activeSpaceFilter.id === item.id}
+            onClick={() => selectSpaceFilter(item)}
+          />
+        </div>
+      ))}
+    </div>
+  ));
 }
 
 function TreeItem({

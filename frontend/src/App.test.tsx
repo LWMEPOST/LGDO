@@ -570,3 +570,50 @@ describe("App vault integration", () => {
     expect(button).toBeEnabled();
   });
 });
+
+describe("App mobile space directory", () => {
+  it("expands the full space directory from a collapsed disclosure", async () => {
+    installFetch();
+    setAuthToken("test-token");
+
+    render(<App />);
+
+    expect(await screen.findByText("LGDO Console")).toBeInTheDocument();
+    const summary = screen.getByText("空间目录", { selector: "strong" }).closest("summary");
+    const disclosure = summary?.closest("details");
+
+    expect(summary).not.toBeNull();
+    expect(disclosure).not.toBeNull();
+    expect(disclosure).not.toHaveAttribute("open");
+    fireEvent.click(summary as HTMLElement);
+
+    expect(disclosure).toHaveAttribute("open");
+    expect(within(disclosure as HTMLElement).getByRole("button", { name: /全部空间.*资料、知识页与缺口/ }))
+      .toBeInTheDocument();
+    expect(within(disclosure as HTMLElement).getByRole("button", { name: /常见问题.*知识页类型/ }))
+      .toBeInTheDocument();
+  });
+
+  it("clears an active filter while the mobile disclosure is collapsed", async () => {
+    installFetch();
+    setAuthToken("test-token");
+
+    render(<App />);
+
+    expect(await screen.findByText("LGDO Console")).toBeInTheDocument();
+    const summary = screen.getByText("空间目录", { selector: "strong" }).closest("summary") as HTMLElement;
+    const disclosure = summary.closest("details") as HTMLDetailsElement;
+    fireEvent.click(summary);
+    fireEvent.click(within(disclosure).getByRole("button", { name: /常见问题.*知识页类型/ }));
+
+    expect(within(summary).getByText("常见问题")).toBeInTheDocument();
+    fireEvent.click(summary);
+    expect(disclosure).not.toHaveAttribute("open");
+    const clearButton = screen.getByRole("button", { name: "清除筛选" });
+    expect(disclosure).not.toContainElement(clearButton);
+    fireEvent.click(clearButton);
+
+    expect(within(summary).getByText("全部空间")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "清除筛选" })).not.toBeInTheDocument();
+  });
+});
