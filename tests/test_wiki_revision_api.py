@@ -6,10 +6,12 @@ from urllib.parse import quote
 import pytest
 from fastapi.testclient import TestClient
 
+import app.api as api_module
 from app.config import Settings, get_settings
 from app.db import connect_app, init_app_db
 from app.main import app
 from app.models import BackupReleaseRequest
+from app.obsidian import build_obsidian_uri
 from app.vault_writer import IntentExecutor
 from app.wiki_revisions import (
     CompileCandidateCommand,
@@ -436,11 +438,80 @@ def test_specific_wiki_routes_are_registered_before_greedy_page_routes():
         ("/api/internal/wiki/pages/{page_path:path}/revisions", "GET"),
         ("/api/internal/wiki/pages/{page_path:path}/conflicts", "GET"),
         ("/api/internal/wiki/pages/{page_path:path}/status", "PATCH"),
+        ("/api/internal/wiki/pages/{page_path:path}/obsidian-link", "GET"),
     ]
 
     for path, method in specific_routes:
         assert route_index(path, method) < greedy_get
         assert route_index(path, method) < greedy_put
+
+
+def test_obsidian_link_missing_and_unauthorized_are_indistinguishable(
+    api_content_conflict,
+    api_wiki_page,
+):
+    client, conflict = api_content_conflict
+    _same_client, page = api_wiki_page
+    outsider = {
+        "X-LGDO-User": "outsider",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "support",
+    }
+    finance = {
+        "X-LGDO-User": "finance_user",
+        "X-LGDO-Role": "viewer",
+        "X-LGDO-ACL-Tags": "finance",
+    }
+    hidden_path = "wiki/product/faq/hidden secret.md"
+    encoded_hidden = quote(hidden_path, safe="/")
+
+    missing = client.get(
+        f"/api/internal/wiki/pages/{encoded_hidden}/obsidian-link",
+        headers=finance,
+    )
+    unauthorized = client.get(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}/obsidian-link",
+        headers=outsider,
+    )
+
+    expected_hidden = {"detail": {"code": "wiki_page_not_found"}}
+    assert missing.status_code == unauthorized.status_code == 404
+    assert missing.json() == unauthorized.json() == expected_hidden
+    assert encoded_hidden not in missing.text
+    assert conflict.encoded_path not in unauthorized.text
+
+    visible = client.get(
+        f"/api/internal/wiki/pages/{conflict.encoded_path}/obsidian-link",
+        headers=finance,
+    )
+    assert visible.status_code == 200
+    assert visible.json() == {
+        "url": build_obsidian_uri(
+            page.settings.effective_obsidian_vault_name,
+            "wiki/product/faq/api.md",
+        )
+    }
+
+
+def test_obsidian_link_maps_catalog_permission_error_to_hidden_404(
+    api_wiki_page,
+    monkeypatch,
+):
+    client, page = api_wiki_page
+
+    def forbidden(*_args, **_kwargs):
+        raise PermissionError(str(page.absolute_path))
+
+    monkeypatch.setattr(api_module.catalog, "read_wiki_page", forbidden)
+    response = client.get(
+        f"/api/internal/wiki/pages/{page.encoded_path}/obsidian-link"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {"code": "wiki_page_not_found"}
+    }
+    assert str(page.absolute_path) not in response.text
 
 
 def test_wiki_reads_require_page_and_all_source_acl(api_content_conflict):

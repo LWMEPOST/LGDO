@@ -29,6 +29,8 @@ def projection_api(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "gbrain_projection_api_key", None)
     monkeypatch.setattr(settings, "gbrain_managed_source_id", None)
     monkeypatch.setattr(settings, "gbrain_import_on_compile", False)
+    monkeypatch.setattr("app.api.get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "settings", settings)
     init_app_db(settings)
 
     app.dependency_overrides[current_user] = lambda: UserContext(
@@ -36,11 +38,10 @@ def projection_api(tmp_path, monkeypatch):
         role="admin",
         acl_tags=("*",),
     )
-    client = TestClient(app)
     try:
-        yield settings, client
+        with TestClient(app) as client:
+            yield settings, client
     finally:
-        client.close()
         app.dependency_overrides.pop(current_user, None)
 
 
@@ -251,6 +252,7 @@ def test_health_separates_query_circuit_from_projection_backlog(
         "pending": 0,
         "running": 1,
         "failed": 1,
+        "enabled": True,
         "configured": True,
         "degraded": True,
     }

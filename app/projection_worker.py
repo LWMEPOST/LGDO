@@ -159,14 +159,17 @@ def projection_health(settings: Settings) -> dict[str, dict[str, int | bool]]:
         if target in counts and status in counts[target]:
             counts[target][status] = int(row["count"])
 
+    enabled = bool(settings.gbrain_enabled)
     configured = bool(
-        settings.gbrain_endpoint
+        enabled
+        and settings.gbrain_endpoint
         and settings.gbrain_projection_api_key
         and settings.gbrain_managed_source_id
     )
+    counts["gbrain"]["enabled"] = enabled
     counts["gbrain"]["configured"] = configured
     counts["gbrain"]["degraded"] = bool(
-        counts["gbrain"]["failed"] or not configured
+        enabled and (counts["gbrain"]["failed"] or not configured)
     )
     return counts
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -14,10 +15,12 @@ from app.vault_events import (
     PendingVaultDelete,
     VaultEventStore,
     VaultOccurrenceConflict,
+    VaultReconcileJob,
     VaultWatchOccurrence,
 )
 from app.vault_watcher import (
     VaultFsEvent,
+    VaultWatchAdapter,
     canonical_wiki_path,
     iter_canonical_wiki_files,
     wait_for_stable_observation,
@@ -46,6 +49,10 @@ StartupInventoryEntry = tuple[
 StartupInventory = tuple[list[StartupInventoryEntry], set[str], int]
 
 
+class ReconcileLeaseLost(RuntimeError):
+    pass
+
+
 class VaultSyncService:
     def __init__(
         self,
@@ -66,9 +73,359 @@ class VaultSyncService:
         self._semaphore = asyncio.Semaphore(settings.vault_watch_concurrency)
         self._page_locks: dict[str, PageLockEntry] = {}
         self._page_locks_guard = asyncio.Lock()
+        self._reconcile_lock = asyncio.Lock()
+        self._reconcile_owner = f"vault-reconcile-{uuid.uuid4().hex}"
+        self._reconcile_tasks: dict[str, asyncio.Task[None]] = {}
+        self._stop_lock = asyncio.Lock()
+        self._watcher = VaultWatchAdapter(
+            settings,
+            self.handle_batch,
+            error_handler=self._record_watcher_error,
+        )
+        self.watcher_running = False
         self.running = False
         self.last_event_at: datetime | None = None
         self.last_error: str | None = None
+
+    def _record_watcher_error(self, exc: Exception) -> None:
+        self.last_error = (str(exc) or type(exc).__name__)[:500]
+
+    async def _store_call(
+        self,
+        operation: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[Any, bool]:
+        worker = asyncio.create_task(
+            asyncio.to_thread(operation, *args, **kwargs)
+        )
+        cancellation_requested = False
+        while True:
+            try:
+                return await asyncio.shield(worker), cancellation_requested
+            except asyncio.CancelledError:
+                cancellation_requested = True
+            except Exception:
+                if cancellation_requested:
+                    raise asyncio.CancelledError from None
+                raise
+
+    @staticmethod
+    async def _cancel_and_await(task: asyncio.Task[Any] | None) -> bool:
+        if task is None:
+            return False
+        task.cancel()
+        cancellation_requested = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done() and task.cancelled():
+                    break
+                cancellation_requested = True
+            except Exception:
+                break
+        if task.done() and not task.cancelled():
+            try:
+                task.exception()
+            except Exception:
+                pass
+        return cancellation_requested
+
+    async def _reconcile_heartbeat(self, job_id: str) -> None:
+        lease_seconds = self.settings.vault_reconcile_lease_seconds
+        interval = lease_seconds / 3
+        while True:
+            await asyncio.sleep(interval)
+            renewed, cancellation_requested = await self._store_call(
+                self.events.renew_reconcile,
+                job_id,
+                self._reconcile_owner,
+                now=datetime.now(timezone.utc),
+                lease_seconds=lease_seconds,
+            )
+            self._propagate_cancellation(cancellation_requested)
+            if not renewed:
+                raise ReconcileLeaseLost(
+                    f"vault reconcile lease lost: {job_id}"
+                )
+
+    async def _claim_reconcile_job(self, job_id: str) -> bool:
+        lease_seconds = self.settings.vault_reconcile_lease_seconds
+        claimed, cancellation_requested = await self._store_call(
+            self.events.claim_reconcile,
+            job_id,
+            self._reconcile_owner,
+            now=datetime.now(timezone.utc),
+            lease_seconds=lease_seconds,
+        )
+        if cancellation_requested:
+            if claimed:
+                try:
+                    await self._store_call(
+                        self.events.requeue_reconcile,
+                        job_id,
+                        self._reconcile_owner,
+                    )
+                except BaseException:
+                    pass
+            raise asyncio.CancelledError
+        return bool(claimed)
+
+    async def _await_reconcile_claim(self, job_id: str) -> bool:
+        poll_interval = max(
+            0.01,
+            min(0.25, self.settings.vault_reconcile_lease_seconds / 3),
+        )
+        while True:
+            if await self._claim_reconcile_job(job_id):
+                return True
+            job, cancellation_requested = await self._store_call(
+                self.events.get_reconcile,
+                job_id,
+            )
+            self._propagate_cancellation(cancellation_requested)
+            if job is None:
+                raise RuntimeError(f"vault reconcile job disappeared: {job_id}")
+            if job.status in {"succeeded", "failed"}:
+                return False
+            await asyncio.sleep(poll_interval)
+
+    async def _run_reconcile_job(self, job_id: str) -> None:
+        work: asyncio.Task[dict[str, int]] | None = None
+        heartbeat: asyncio.Task[None] | None = None
+        owns_lease = False
+        async with self._reconcile_lock:
+            try:
+                owns_lease = await self._await_reconcile_claim(job_id)
+                if not owns_lease:
+                    return
+
+                work = asyncio.create_task(
+                    self.reconcile_startup(reconcile_intents=False),
+                    name=f"vault-reconcile-inventory-{job_id}",
+                )
+                heartbeat = asyncio.create_task(
+                    self._reconcile_heartbeat(job_id),
+                    name=f"vault-reconcile-heartbeat-{job_id}",
+                )
+                done, _pending = await asyncio.wait(
+                    {work, heartbeat},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if heartbeat in done:
+                    self._propagate_cancellation(
+                        await self._cancel_and_await(work)
+                    )
+                    if heartbeat.cancelled():
+                        raise ReconcileLeaseLost(
+                            f"vault reconcile heartbeat stopped: {job_id}"
+                        )
+                    try:
+                        heartbeat.result()
+                    except ReconcileLeaseLost:
+                        raise
+                    except Exception as exc:
+                        raise ReconcileLeaseLost(
+                            f"vault reconcile heartbeat failed: {job_id}"
+                        ) from exc
+                    raise ReconcileLeaseLost(
+                        f"vault reconcile heartbeat stopped: {job_id}"
+                    )
+
+                result = work.result()
+                self._propagate_cancellation(
+                    await self._cancel_and_await(heartbeat)
+                )
+                finished, cancellation_requested = await self._store_call(
+                    self.events.finish_reconcile,
+                    job_id,
+                    self._reconcile_owner,
+                    result,
+                )
+                self._propagate_cancellation(cancellation_requested)
+                if not finished:
+                    raise ReconcileLeaseLost(
+                        f"vault reconcile finish lost its lease: {job_id}"
+                    )
+            except asyncio.CancelledError:
+                await self._cancel_and_await(work)
+                await self._cancel_and_await(heartbeat)
+                if owns_lease:
+                    try:
+                        await self._store_call(
+                            self.events.requeue_reconcile,
+                            job_id,
+                            self._reconcile_owner,
+                        )
+                    except BaseException:
+                        pass
+                raise
+            except ReconcileLeaseLost:
+                cancellation_requested = await self._cancel_and_await(work)
+                if cancellation_requested:
+                    if owns_lease:
+                        try:
+                            await self._store_call(
+                                self.events.requeue_reconcile,
+                                job_id,
+                                self._reconcile_owner,
+                            )
+                        except BaseException:
+                            pass
+                    raise asyncio.CancelledError from None
+                raise
+            except Exception as exc:
+                cancellation_requested = await self._cancel_and_await(work)
+                error = (str(exc) or type(exc).__name__)[:500]
+                self.last_error = error
+                failure_recorded = False
+                failure_fence_returned = False
+                if owns_lease:
+                    try:
+                        failure_recorded, cancelled_during_fence = (
+                            await self._store_call(
+                                self.events.fail_reconcile,
+                                job_id,
+                                self._reconcile_owner,
+                                error,
+                            )
+                        )
+                        failure_fence_returned = True
+                        cancellation_requested = bool(
+                            cancellation_requested or cancelled_during_fence
+                        )
+                    except asyncio.CancelledError:
+                        cancellation_requested = True
+                    except BaseException:
+                        pass
+                if cancellation_requested:
+                    if owns_lease and not failure_recorded:
+                        try:
+                            await self._store_call(
+                                self.events.requeue_reconcile,
+                                job_id,
+                                self._reconcile_owner,
+                            )
+                        except BaseException:
+                            pass
+                    raise asyncio.CancelledError from None
+                if (
+                    owns_lease
+                    and failure_fence_returned
+                    and not failure_recorded
+                ):
+                    raise ReconcileLeaseLost(
+                        f"vault reconcile failure lost its lease: {job_id}"
+                    ) from exc
+                raise
+            finally:
+                active_error = sys.exc_info()[1]
+                work_cancelled = await self._cancel_and_await(work)
+                heartbeat_cancelled = await self._cancel_and_await(heartbeat)
+                if active_error is None:
+                    await asyncio.sleep(0)
+                    if work_cancelled or heartbeat_cancelled:
+                        raise asyncio.CancelledError
+
+    @staticmethod
+    def _consume_reconcile_task(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:
+            pass
+
+    def _ensure_reconcile_task(self, job_id: str) -> asyncio.Task[None]:
+        task = self._reconcile_tasks.get(job_id)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._run_reconcile_job(job_id),
+                name=f"vault-reconcile-{job_id}",
+            )
+            task.add_done_callback(self._consume_reconcile_task)
+            self._reconcile_tasks[job_id] = task
+        return task
+
+    def request_reconcile(self, requested_by: str) -> VaultReconcileJob:
+        job = self.events.request_reconcile(requested_by)
+        self._ensure_reconcile_task(job.id)
+        return job
+
+    async def reconcile_before_watcher_start(self) -> dict[str, int]:
+        active, cancellation_requested = await self._store_call(
+            self.events.active_reconcile
+        )
+        self._propagate_cancellation(cancellation_requested)
+        if active is None:
+            active, cancellation_requested = await self._store_call(
+                self.events.request_reconcile,
+                "startup",
+            )
+            self._propagate_cancellation(cancellation_requested)
+
+        task = self._ensure_reconcile_task(active.id)
+        try:
+            await task
+        except Exception as exc:
+            terminal, cancellation_requested = await self._store_call(
+                self.events.get_reconcile,
+                active.id,
+            )
+            self._propagate_cancellation(cancellation_requested)
+            if terminal is None or terminal.status != "succeeded":
+                raise RuntimeError(
+                    f"vault startup reconcile did not succeed: {active.id}"
+                ) from exc
+
+        terminal, cancellation_requested = await self._store_call(
+            self.events.get_reconcile,
+            active.id,
+        )
+        self._propagate_cancellation(cancellation_requested)
+        if (
+            terminal is None
+            or terminal.status != "succeeded"
+            or terminal.result is None
+        ):
+            error = terminal.error_summary if terminal is not None else None
+            suffix = f": {error}" if error else ""
+            raise RuntimeError(
+                f"vault startup reconcile did not succeed: {active.id}{suffix}"
+            )
+        return terminal.result
+
+    async def start(self) -> None:
+        if not self.settings.vault_watch_enabled or self.watcher_running:
+            return
+        await self._watcher.start()
+        self.watcher_running = True
+
+    async def stop(self) -> None:
+        async with self._stop_lock:
+            stop_error: BaseException | None = None
+            try:
+                await self._watcher.stop()
+            except BaseException as exc:
+                stop_error = exc
+            self.watcher_running = False
+
+            tasks = list(self._reconcile_tasks.values())
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                waiter = asyncio.gather(*tasks, return_exceptions=True)
+                while not waiter.done():
+                    try:
+                        await asyncio.shield(waiter)
+                    except asyncio.CancelledError as exc:
+                        if stop_error is None:
+                            stop_error = exc
+            self._reconcile_tasks.clear()
+            if stop_error is not None:
+                raise stop_error
 
     async def _drop_page_lock_user(
         self,
@@ -1670,5 +2027,5 @@ class VaultSyncService:
                     snapshot["last_event_at"] = memory_event_at.isoformat()
         if snapshot.get("last_error") is None and self.last_error is not None:
             snapshot["last_error"] = self.last_error
-        snapshot["running"] = self.running
+        snapshot["running"] = self.watcher_running
         return snapshot

@@ -117,6 +117,35 @@ class ProjectionJobResponse(BaseModel):
     last_error: str | None
 
 
+class VaultReconcileJobResponse(BaseModel):
+    job_id: str
+    status: str
+    result: dict[str, int] | None = None
+    error_summary: str | None = None
+
+
+class ObsidianLinkResponse(BaseModel):
+    url: str
+
+
+class VaultStatusResponse(BaseModel):
+    configured: bool
+    running: bool
+    clean: bool
+    degraded: bool
+    last_event_at: str | None = None
+    last_error: str | None = None
+    pending_occurrences: int = 0
+    failed_occurrences: int = 0
+    pending_deletes: int = 0
+    open_issues: int = 0
+    invalid_pages: int = 0
+    projection_backlog: int = 0
+    projection: dict = Field(default_factory=dict)
+    obsidian: dict = Field(default_factory=dict)
+    reconcile: VaultReconcileJobResponse | None = None
+
+
 class MemoryHit(BaseModel):
     query_id: str
     question: str

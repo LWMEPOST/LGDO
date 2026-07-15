@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
 import shutil
+from pathlib import Path
 from typing import NoReturn
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi import Depends, Request
 from fastapi.responses import StreamingResponse
 
+from app import catalog
 from app.aliases import delete_entity_alias, list_entity_aliases, seed_default_entity_aliases, upsert_entity_alias
 from app.accounts import authenticate_account, create_account, list_accounts, revoke_session, update_account
 from app.auth import UserContext, resolve_user_context
@@ -23,7 +24,6 @@ from app.catalog import (
     list_wiki_pages,
     rag_status,
     read_source_preview,
-    read_wiki_page,
     release_wiki_backup,
     resolve_wiki_conflict,
     save_wiki_page,
@@ -55,12 +55,15 @@ from app.models import (
     FeedbackResponse,
     GapUpdateRequest,
     LoginRequest,
+    ObsidianLinkResponse,
     ReviewUpdateRequest,
     ScanRequest,
     ScanResponse,
     SourcePreviewResponse,
     UpgradedEvalRunRequest,
     UploadResponse,
+    VaultReconcileJobResponse,
+    VaultStatusResponse,
     WikiConflictResponse,
     WikiMutationResponse,
     WikiPageContentResponse,
@@ -73,10 +76,13 @@ from app.projection_worker import (
     ProjectionJobNotFound,
     ProjectionJobStateConflict,
     list_projection_jobs,
+    projection_health,
     retry_projection_job,
 )
+from app.obsidian import build_obsidian_uri
 from app.search import ask, stream_ask_events
 from app.vault import slugify
+from app.vault_events import VaultEventStore
 from app.wiki import compile_wiki
 from app.wiki_revisions import (
     InvalidWikiDocument,
@@ -101,6 +107,176 @@ def require_account_admin(user: UserContext) -> None:
 def require_editor(user: UserContext) -> None:
     if not user.is_admin and user.role != "editor":
         raise HTTPException(status_code=403, detail="需要 admin/editor 权限执行内部管理操作")
+
+
+def _vault_reconcile_payload(job) -> dict:
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "result": job.result,
+        "error_summary": job.error_summary,
+    }
+
+
+def _safe_asset_names(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    safe: list[str] = []
+    for item in value:
+        candidate = Path(str(item))
+        if candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        normalized = candidate.as_posix()
+        if normalized and normalized != ".":
+            safe.append(normalized)
+    return sorted(dict.fromkeys(safe))
+
+
+def _safe_vault_error(value: object, vault_path: Path) -> str | None:
+    if value is None:
+        return None
+    summary = str(value)[:500]
+    candidates = {str(vault_path), str(vault_path.resolve())}
+    for candidate in candidates:
+        summary = summary.replace(candidate, "<vault>")
+        summary = summary.replace(candidate.replace("\\", "/"), "<vault>")
+    return summary
+
+
+@router.post(
+    "/vault/reconcile",
+    response_model=VaultReconcileJobResponse,
+    status_code=202,
+)
+async def request_vault_reconcile_endpoint(
+    request: Request,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_account_admin(user)
+    runtime = getattr(request.app.state, "vault_sync", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="vault sync runtime unavailable")
+    return _vault_reconcile_payload(runtime.request_reconcile(user.user_id))
+
+
+@router.get(
+    "/vault/reconcile/{job_id}",
+    response_model=VaultReconcileJobResponse,
+)
+def get_vault_reconcile_endpoint(
+    job_id: str,
+    request: Request,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    require_account_admin(user)
+    runtime = getattr(request.app.state, "vault_sync", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="vault sync runtime unavailable")
+    job = runtime.events.get_reconcile(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="vault reconcile job not found")
+    return _vault_reconcile_payload(job)
+
+
+@router.get("/vault/status", response_model=VaultStatusResponse)
+def vault_status_endpoint(
+    request: Request,
+    _user: UserContext = Depends(current_user),
+) -> dict:
+    settings = get_settings()
+    runtime = getattr(request.app.state, "vault_sync", None)
+    event_store = runtime.events if runtime is not None else VaultEventStore(settings)
+    snapshot = {}
+    if runtime is not None:
+        try:
+            snapshot = runtime.snapshot()
+        except Exception:
+            snapshot = {}
+    else:
+        try:
+            snapshot = event_store.status_snapshot()
+        except Exception:
+            snapshot = {}
+
+    counters = {
+        key: int(snapshot.get(key) or 0)
+        for key in (
+            "pending_occurrences",
+            "failed_occurrences",
+            "pending_deletes",
+            "open_issues",
+            "invalid_pages",
+        )
+    }
+    projections = projection_health(settings)
+    enabled_targets = ["rag"]
+    if settings.gbrain_enabled:
+        enabled_targets.append("gbrain")
+    projection_backlog = sum(
+        int(projections[target][status])
+        for target in enabled_targets
+        for status in ("pending", "running")
+    )
+    projection_failed = sum(
+        int(projections[target]["failed"])
+        for target in enabled_targets
+    )
+
+    raw_obsidian = getattr(request.app.state, "obsidian_status", {})
+    if not isinstance(raw_obsidian, dict):
+        raw_obsidian = {}
+    obsidian = {
+        "installed": _safe_asset_names(raw_obsidian.get("installed")),
+        "drifted": _safe_asset_names(raw_obsidian.get("drifted")),
+        "vault_name": settings.effective_obsidian_vault_name,
+    }
+
+    reconcile = None
+    active_reconcile = False
+    reconcile_failed = False
+    try:
+        active = event_store.active_reconcile()
+        job = active or event_store.latest_reconcile()
+        if job is not None:
+            reconcile = _vault_reconcile_payload(job)
+            active_reconcile = job.status in {"queued", "running"}
+            reconcile_failed = job.status == "failed"
+    except Exception:
+        reconcile = None
+
+    degraded = bool(
+        counters["failed_occurrences"]
+        or counters["open_issues"]
+        or counters["invalid_pages"]
+        or projection_failed
+        or obsidian["drifted"]
+        or reconcile_failed
+    )
+    busy = bool(
+        counters["pending_occurrences"]
+        or counters["pending_deletes"]
+        or projection_backlog
+        or active_reconcile
+    )
+    return {
+        "configured": bool(settings.vault_watch_enabled),
+        "running": bool(
+            runtime is not None
+            and getattr(runtime, "watcher_running", False)
+        ),
+        "clean": not degraded and not busy,
+        "degraded": degraded,
+        "last_event_at": snapshot.get("last_event_at"),
+        "last_error": _safe_vault_error(
+            snapshot.get("last_error"),
+            settings.vault_path,
+        ),
+        **counters,
+        "projection_backlog": projection_backlog,
+        "projection": projections,
+        "obsidian": obsidian,
+        "reconcile": reconcile,
+    }
 
 
 def raise_wiki_http(exc: Exception) -> NoReturn:
@@ -448,6 +624,36 @@ def update_wiki_status_endpoint(
         raise_wiki_http(exc)
 
 
+@router.get(
+    "/wiki/pages/{page_path:path}/obsidian-link",
+    response_model=ObsidianLinkResponse,
+)
+def wiki_page_obsidian_link_endpoint(
+    page_path: str,
+    user: UserContext = Depends(current_user),
+) -> dict:
+    settings = get_settings()
+    try:
+        page = catalog.read_wiki_page(
+            settings,
+            page_path,
+            user_context=user,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "wiki_page_not_found"},
+        ) from exc
+    except Exception as exc:
+        raise_wiki_http(exc)
+    return {
+        "url": build_obsidian_uri(
+            settings.effective_obsidian_vault_name,
+            page["path"],
+        )
+    }
+
+
 @router.get("/wiki/pages/{page_path:path}", response_model=WikiPageContentResponse)
 def read_wiki_page_endpoint(
     page_path: str,
@@ -455,7 +661,7 @@ def read_wiki_page_endpoint(
 ) -> WikiPageContentResponse:
     try:
         return WikiPageContentResponse(
-            **read_wiki_page(
+            **catalog.read_wiki_page(
                 get_settings(),
                 page_path,
                 user_context=user,

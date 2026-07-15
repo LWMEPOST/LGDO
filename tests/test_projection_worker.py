@@ -11,9 +11,12 @@ import pytest
 
 import app.main as main_module
 import app.projection_worker as projection_worker
+import app.vault_sync as vault_sync_module
 from app.config import Settings
 from app.db import connect_app, connect_app_write, init_app_db, json_dump
 from app.projection_jobs import ProjectionJob, ProjectionOutbox
+from app.vault_events import VaultEventStore
+from app.vault_sync import VaultSyncService
 from app.wiki_rag_projection import ProjectionLeaseLost as RagProjectionLeaseLost
 
 
@@ -876,6 +879,7 @@ def test_worker_passes_injected_now_unchanged_to_mark_failed(settings, monkeypat
 
 
 def test_missing_gbrain_endpoint_marks_failed_and_reports_degraded(settings, monkeypatch):
+    settings.gbrain_enabled = True
     settings.gbrain_endpoint = None
     outbox = ProjectionOutbox(settings)
     with connect_app_write(settings) as conn:
@@ -912,26 +916,591 @@ def test_missing_gbrain_endpoint_marks_failed_and_reports_degraded(settings, mon
     assert status.gbrain["failed"] == 1
 
 
-def test_fastapi_lifespan_owns_worker(settings, monkeypatch):
+def test_reconcile_lease_loss_cancels_inventory_before_finish(
+    settings,
+    monkeypatch,
+):
+    settings.vault_reconcile_lease_seconds = 0.03
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+    renew_called = threading.Event()
+    finishes: list[str] = []
+
+    def lose_lease(*_args, **_kwargs):
+        renew_called.set()
+        return False
+
+    original_finish = events.finish_reconcile
+
+    def record_finish(job_id, owner, result):
+        finishes.append(job_id)
+        return original_finish(job_id, owner, result)
+
+    monkeypatch.setattr(events, "renew_reconcile", lose_lease)
+    monkeypatch.setattr(events, "finish_reconcile", record_finish)
+
+    async def exercise() -> None:
+        inventory_started = asyncio.Event()
+        inventory_cancelled = asyncio.Event()
+
+        async def blocked_inventory(**_kwargs):
+            inventory_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                inventory_cancelled.set()
+                raise
+
+        monkeypatch.setattr(service, "reconcile_startup", blocked_inventory)
+        task = asyncio.create_task(service._run_reconcile_job(job.id))
+        await inventory_started.wait()
+        with pytest.raises(vault_sync_module.ReconcileLeaseLost):
+            await task
+        assert inventory_cancelled.is_set()
+
+    asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert renew_called.is_set()
+    assert finishes == []
+    assert persisted is not None
+    assert persisted.status == "running"
+    assert persisted.lease_owner == service._reconcile_owner
+
+
+def test_reconcile_heartbeat_error_is_lease_loss_without_failing_job(
+    settings,
+    monkeypatch,
+):
+    settings.vault_reconcile_lease_seconds = 0.03
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+    inventory_cancelled = threading.Event()
+    failures: list[str] = []
+    finishes: list[str] = []
+
+    def broken_renew(*_args, **_kwargs):
+        raise RuntimeError("heartbeat database unavailable")
+
+    def forbidden_fail(job_id, *_args, **_kwargs):
+        failures.append(job_id)
+        return True
+
+    def forbidden_finish(job_id, *_args, **_kwargs):
+        finishes.append(job_id)
+        return True
+
+    monkeypatch.setattr(events, "renew_reconcile", broken_renew)
+    monkeypatch.setattr(events, "fail_reconcile", forbidden_fail)
+    monkeypatch.setattr(events, "finish_reconcile", forbidden_finish)
+
+    async def blocked_inventory(**_kwargs):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            inventory_cancelled.set()
+            raise
+
+    monkeypatch.setattr(service, "reconcile_startup", blocked_inventory)
+
+    async def exercise() -> None:
+        with pytest.raises(vault_sync_module.ReconcileLeaseLost):
+            await service._run_reconcile_job(job.id)
+
+    asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert inventory_cancelled.is_set()
+    assert failures == []
+    assert finishes == []
+    assert persisted is not None
+    assert persisted.status == "running"
+    assert persisted.lease_owner == service._reconcile_owner
+
+
+def test_reconcile_heartbeat_prevents_takeover_during_long_inventory(
+    settings,
+    monkeypatch,
+):
+    settings.vault_reconcile_lease_seconds = 1
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+    renewed_four_times = threading.Event()
+    renew_times: list[datetime] = []
+    original_renew = events.renew_reconcile
+
+    def tracked_renew(job_id, owner, *, now, lease_seconds):
+        renewed = original_renew(
+            job_id,
+            owner,
+            now=now,
+            lease_seconds=lease_seconds,
+        )
+        if renewed:
+            renew_times.append(now)
+            if len(renew_times) >= 4:
+                renewed_four_times.set()
+        return renewed
+
+    monkeypatch.setattr(events, "renew_reconcile", tracked_renew)
+
+    async def exercise() -> None:
+        release_inventory = asyncio.Event()
+
+        async def blocked_inventory(**_kwargs):
+            await release_inventory.wait()
+            return {"ingested": 1, "failed": 0, "projection_jobs": 0}
+
+        monkeypatch.setattr(service, "reconcile_startup", blocked_inventory)
+        task = asyncio.create_task(service._run_reconcile_job(job.id))
+        assert await asyncio.to_thread(renewed_four_times.wait, 5)
+        takeover = await asyncio.to_thread(
+            events.claim_reconcile,
+            job.id,
+            "owner-b",
+            now=renew_times[-1],
+            lease_seconds=1,
+        )
+        assert takeover is False
+        release_inventory.set()
+        await task
+
+    asyncio.run(exercise())
+    completed = events.get_reconcile(job.id)
+    assert len(renew_times) >= 4
+    assert completed is not None
+    assert completed.status == "succeeded"
+    assert completed.result == {
+        "ingested": 1,
+        "failed": 0,
+        "projection_jobs": 0,
+    }
+
+
+@pytest.mark.parametrize("prequeued", [False, True])
+def test_startup_and_persisted_reconcile_share_one_global_authority(
+    settings,
+    monkeypatch,
+    prequeued,
+):
+    if prequeued:
+        VaultEventStore(settings).request_reconcile("admin")
+    first = VaultSyncService(settings)
+    second = VaultSyncService(settings)
+    inventory_calls: list[str] = []
+    claim_attempts = 0
+    two_claims = threading.Event()
+    original_claim = VaultEventStore.claim_reconcile
+
+    def tracked_claim(store, *args, **kwargs):
+        nonlocal claim_attempts
+        claimed = original_claim(store, *args, **kwargs)
+        claim_attempts += 1
+        if claim_attempts >= 2:
+            two_claims.set()
+        return claimed
+
+    monkeypatch.setattr(VaultEventStore, "claim_reconcile", tracked_claim)
+
+    async def fake_inventory(label: str, **_kwargs):
+        inventory_calls.append(label)
+        assert await asyncio.to_thread(two_claims.wait, 2)
+        return {"ingested": 1, "failed": 0, "projection_jobs": 0}
+
+    monkeypatch.setattr(
+        first,
+        "reconcile_startup",
+        lambda **kwargs: fake_inventory("first", **kwargs),
+    )
+    monkeypatch.setattr(
+        second,
+        "reconcile_startup",
+        lambda **kwargs: fake_inventory("second", **kwargs),
+    )
+    watcher_starts: list[str] = []
+
+    class Watcher:
+        def __init__(self, label: str, store: VaultEventStore):
+            self.label = label
+            self.store = store
+
+        async def start(self):
+            latest = self.store.latest_reconcile()
+            assert latest is not None
+            watcher_starts.append(f"{self.label}:{latest.status}")
+
+        async def stop(self):
+            return None
+
+    first._watcher = Watcher("first", first.events)
+    second._watcher = Watcher("second", second.events)
+
+    async def boot(service: VaultSyncService):
+        result = await service.reconcile_before_watcher_start()
+        await service.start()
+        return result
+
+    async def exercise() -> tuple[dict[str, int], dict[str, int]]:
+        results = await asyncio.gather(boot(first), boot(second))
+        await asyncio.gather(first.stop(), second.stop())
+        return results[0], results[1]
+
+    first_result, second_result = asyncio.run(exercise())
+    assert inventory_calls in (["first"], ["second"])
+    assert first_result == second_result == {
+        "ingested": 1,
+        "failed": 0,
+        "projection_jobs": 0,
+    }
+    assert sorted(watcher_starts) == ["first:succeeded", "second:succeeded"]
+    assert first._reconcile_tasks == {}
+    assert second._reconcile_tasks == {}
+
+
+def test_stop_cancels_owned_reconcile_and_requeues_its_lease(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    inventory_started = threading.Event()
+    inventory_cancelled = threading.Event()
+
+    async def blocked_inventory(**_kwargs):
+        inventory_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            inventory_cancelled.set()
+            raise
+
+    monkeypatch.setattr(service, "reconcile_startup", blocked_inventory)
+
+    async def exercise():
+        job = service.request_reconcile("admin")
+        assert await asyncio.to_thread(inventory_started.wait, 2)
+        await service.stop()
+        await service.stop()
+        return job
+
+    job = asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert inventory_cancelled.is_set()
+    assert persisted is not None
+    assert persisted.status == "queued"
+    assert persisted.lease_owner is None
+    assert service._reconcile_tasks == {}
+
+
+def test_vault_runtime_reports_idle_watcher_as_running(settings):
+    service = VaultSyncService(settings)
+    calls: list[str] = []
+
+    class Watcher:
+        async def start(self):
+            calls.append("start")
+
+        async def stop(self):
+            calls.append("stop")
+
+    service._watcher = Watcher()
+
+    async def exercise() -> None:
+        await service.start()
+        assert service.snapshot()["running"] is True
+        await service.stop()
+        assert service.snapshot()["running"] is False
+
+    asyncio.run(exercise())
+    assert calls == ["start", "stop"]
+
+
+def test_cancel_during_reconcile_claim_requeues_the_acquired_lease(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    original_claim = events.claim_reconcile
+
+    def delayed_claim(*args, **kwargs):
+        claim_entered.set()
+        assert release_claim.wait(timeout=2)
+        return original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(events, "claim_reconcile", delayed_claim)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(service._run_reconcile_job(job.id))
+        assert await asyncio.to_thread(claim_entered.wait, 2)
+        task.cancel()
+        release_claim.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert persisted is not None
+    assert persisted.status == "queued"
+    assert persisted.lease_owner is None
+
+
+def test_cancel_during_reconcile_failure_fencing_preserves_cancellation(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+    fail_entered = threading.Event()
+    release_fail = threading.Event()
+    original_fail = events.fail_reconcile
+
+    async def failed_inventory(**_kwargs):
+        raise RuntimeError("inventory failed")
+
+    def delayed_fail(*args, **kwargs):
+        fail_entered.set()
+        assert release_fail.wait(timeout=2)
+        return original_fail(*args, **kwargs)
+
+    monkeypatch.setattr(service, "reconcile_startup", failed_inventory)
+    monkeypatch.setattr(events, "fail_reconcile", delayed_fail)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(service._run_reconcile_job(job.id))
+        assert await asyncio.to_thread(fail_entered.wait, 2)
+        task.cancel()
+        release_fail.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.error_summary == "inventory failed"
+
+
+def test_cancel_during_heartbeat_cleanup_requeues_successful_inventory(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+
+    async def completed_inventory(**_kwargs):
+        return {"ingested": 1, "failed": 0, "projection_jobs": 0}
+
+    async def exercise() -> None:
+        heartbeat_cleanup_started = asyncio.Event()
+        release_heartbeat = asyncio.Event()
+
+        async def heartbeat(_job_id):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                heartbeat_cleanup_started.set()
+                await release_heartbeat.wait()
+
+        monkeypatch.setattr(service, "reconcile_startup", completed_inventory)
+        monkeypatch.setattr(service, "_reconcile_heartbeat", heartbeat)
+        task = asyncio.create_task(service._run_reconcile_job(job.id))
+        await heartbeat_cleanup_started.wait()
+        task.cancel()
+        release_heartbeat.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert persisted is not None
+    assert persisted.status == "queued"
+    assert persisted.lease_owner is None
+
+
+def test_reconcile_failure_fence_false_reports_lease_loss(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+    original_fail = events.fail_reconcile
+
+    async def failed_inventory(**_kwargs):
+        raise RuntimeError("inventory failed after takeover")
+
+    def takeover_before_fail(job_id, owner, error):
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                """
+                UPDATE vault_reconcile_jobs
+                SET lease_owner='owner-b'
+                WHERE id=? AND status='running'
+                """,
+                (job_id,),
+            )
+        return original_fail(job_id, owner, error)
+
+    monkeypatch.setattr(service, "reconcile_startup", failed_inventory)
+    monkeypatch.setattr(events, "fail_reconcile", takeover_before_fail)
+
+    async def exercise() -> None:
+        with pytest.raises(vault_sync_module.ReconcileLeaseLost):
+            await service._run_reconcile_job(job.id)
+
+    asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert persisted is not None
+    assert persisted.status == "running"
+    assert persisted.lease_owner == "owner-b"
+
+
+def test_reconcile_finally_propagates_cancel_queued_after_finish(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+    job = events.request_reconcile("admin")
+    original_store_call = service._store_call
+
+    async def completed_inventory(**_kwargs):
+        return {"ingested": 1, "failed": 0, "projection_jobs": 0}
+
+    async def cancel_after_finish(operation, *args, **kwargs):
+        result = await original_store_call(operation, *args, **kwargs)
+        if operation == events.finish_reconcile:
+            task = asyncio.current_task()
+            assert task is not None
+            asyncio.get_running_loop().call_soon(task.cancel)
+        return result
+
+    monkeypatch.setattr(service, "reconcile_startup", completed_inventory)
+    monkeypatch.setattr(service, "_store_call", cancel_after_finish)
+
+    async def exercise() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await service._run_reconcile_job(job.id)
+
+    asyncio.run(exercise())
+    persisted = events.get_reconcile(job.id)
+    assert persisted is not None
+    assert persisted.status == "succeeded"
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "intent_reconcile",
+        "vault_reconcile",
+        "projection_start",
+        "vault_start",
+    ],
+)
+def test_lifespan_cleans_both_runtime_owners_at_every_failure_point(
+    settings,
+    monkeypatch,
+    failure_point,
+):
+    settings.projection_worker_enabled = True
+    settings.vault_watch_enabled = True
     events: list[str] = []
+    instances: dict[str, Any] = {}
+    previous_state = dict(main_module.app.state._state)
+    main_module.app.state._state.clear()
+
+    class Executor:
+        def __init__(self, configured):
+            assert configured is settings
+
+        def reconcile_all(self):
+            events.append("intent.reconcile")
+            if failure_point == "intent_reconcile":
+                raise RuntimeError("intent reconcile failed")
+            return []
+
+    class VaultRuntime:
+        def __init__(self, configured, *, intent_executor):
+            assert configured is settings
+            assert isinstance(intent_executor, Executor)
+            self.stop_calls = 0
+            self._reconcile_tasks = {"partial": object()}
+            instances["vault"] = self
+
+        async def reconcile_before_watcher_start(self):
+            events.append("vault.reconcile")
+            if failure_point == "vault_reconcile":
+                raise RuntimeError("vault reconcile failed")
+            return {"failed": 0}
+
+        async def start(self):
+            events.append("vault.start")
+            if failure_point == "vault_start":
+                raise RuntimeError("vault start failed")
+
+        async def stop(self):
+            events.append("vault.stop")
+            self.stop_calls += 1
+            self._reconcile_tasks.clear()
 
     class Worker:
         def __init__(self, configured):
             assert configured is settings
+            self.stop_calls = 0
+            self._tasks = [object()]
+            instances["projection"] = self
 
         async def start(self):
-            events.append("start")
+            events.append("projection.start")
+            if failure_point == "projection_start":
+                raise RuntimeError("projection start failed")
 
         async def stop(self):
-            events.append("stop")
+            events.append("projection.stop")
+            self.stop_calls += 1
+            self._tasks.clear()
 
     monkeypatch.setattr(main_module, "settings", settings)
+    monkeypatch.setattr(main_module, "IntentExecutor", Executor, raising=False)
+    monkeypatch.setattr(main_module, "VaultSyncService", VaultRuntime, raising=False)
     monkeypatch.setattr(main_module, "ProjectionWorker", Worker)
+    monkeypatch.setattr(main_module, "ensure_vault", lambda _path: None)
+    monkeypatch.setattr(main_module, "init_app_db", lambda _settings: None)
+    monkeypatch.setattr(
+        main_module,
+        "ensure_obsidian_vault",
+        lambda _path: SimpleNamespace(
+            installed=[".obsidian/app.json"],
+            drifted=[],
+            backup_dir=settings.vault_path / ".lgdo" / "secret-backup",
+        ),
+        raising=False,
+    )
 
     async def exercise() -> None:
-        async with main_module.lifespan(main_module.app):
-            assert isinstance(main_module.app.state.projection_worker, Worker)
-            assert events == ["start"]
+        with pytest.raises(RuntimeError, match="failed"):
+            async with main_module.lifespan(main_module.app):
+                raise AssertionError("failure point did not abort startup")
 
-    asyncio.run(exercise())
-    assert events == ["start", "stop"]
+    try:
+        asyncio.run(exercise())
+        vault = instances["vault"]
+        projection = instances["projection"]
+        assert vault.stop_calls == 1
+        assert projection.stop_calls == 1
+        assert vault._reconcile_tasks == {}
+        assert projection._tasks == []
+        assert events[-2:] == ["vault.stop", "projection.stop"]
+        assert "vault_sync" not in main_module.app.state._state
+        assert "projection_worker" not in main_module.app.state._state
+        assert "obsidian_status" not in main_module.app.state._state
+    finally:
+        main_module.app.state._state.clear()
+        main_module.app.state._state.update(previous_state)
