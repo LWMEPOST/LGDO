@@ -4,7 +4,31 @@ from pydantic import ValidationError
 from app.config import Settings
 
 
-def test_vault_watcher_defaults_cover_stability_and_delete_grace():
+@pytest.fixture
+def isolated_vault_config_environment(monkeypatch):
+    env_keys = (
+        "VAULT_WATCH_ENABLED",
+        "VAULT_WATCH_DEBOUNCE_MS",
+        "VAULT_WATCH_STABILITY_TIMEOUT_SECONDS",
+        "VAULT_WATCH_MAX_FILE_BYTES",
+        "VAULT_WATCH_MAX_PREFIX_BYTES",
+        "VAULT_RENAME_GRACE_MS",
+        "VAULT_RENAME_SAFETY_MARGIN_MS",
+        "VAULT_WATCH_CONCURRENCY",
+        "VAULT_RECONCILE_LEASE_SECONDS",
+        "OBSIDIAN_VAULT_NAME",
+        "PROJECTION_WORKER_ENABLED",
+        "PROJECTION_POLL_SECONDS",
+        "PROJECTION_LEASE_SECONDS",
+        "PROJECTION_CLAIM_LIMIT",
+    )
+    for key in env_keys:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_vault_watcher_defaults_cover_stability_and_delete_grace(
+    isolated_vault_config_environment,
+):
     settings = Settings(_env_file=None)
     required = max(
         5000,
@@ -41,6 +65,9 @@ def test_vault_watcher_defaults_cover_stability_and_delete_grace():
         },
     ],
 )
-def test_vault_watcher_rejects_unsafe_configuration(updates):
+def test_vault_watcher_rejects_unsafe_configuration(
+    updates,
+    isolated_vault_config_environment,
+):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **updates)
