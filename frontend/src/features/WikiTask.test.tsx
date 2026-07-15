@@ -143,7 +143,9 @@ describe("WikiTask Obsidian controls", () => {
   it("distinguishes an unconfigured vault", () => {
     renderWikiTask({ vaultStatus: { ...healthyVaultStatus, configured: false } });
 
-    expect(screen.getByText("同步未启用").closest(".sync-status")).toHaveClass("ok");
+    const status = screen.getByText("同步未启用").closest(".sync-status");
+    expect(status).toHaveClass("disabled");
+    expect(status).not.toHaveClass("ok");
   });
 
   it("requests one reconcile for an admin", () => {

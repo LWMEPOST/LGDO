@@ -36,7 +36,13 @@ export function WikiTask({
 }) {
   const buckets = countPagesByType(pages);
   const canReconcile = currentUser.role === "admin" || currentUser.role === "owner" || currentUser.acl_tags.includes("*");
-  const syncTone = vaultStatus === null ? "unknown" : vaultStatus.degraded ? "warn" : "ok";
+  const syncTone = vaultStatus === null
+    ? "unknown"
+    : !vaultStatus.configured
+      ? "disabled"
+      : vaultStatus.degraded
+        ? "warn"
+        : "ok";
   const syncLabel = vaultStatus === null
     ? "同步状态未知"
     : !vaultStatus.configured

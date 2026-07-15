@@ -1655,6 +1655,15 @@ th {
   color: var(--muted);
 }
 
+.sync-status.disabled {
+  border-left-color: var(--muted);
+  color: var(--muted);
+}
+
+.sync-status.disabled .sync-status-copy > strong {
+  color: var(--muted);
+}
+
 .sync-status.warn {
   border-left-color: var(--warn);
 }
