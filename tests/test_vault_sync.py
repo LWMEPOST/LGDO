@@ -1695,3 +1695,67 @@ async def test_startup_claim_finalization_failure_preserves_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await startup
     assert service.last_error == "claim finalization database unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay", [False, True], ids=["inventory", "replay"])
+async def test_startup_claim_release_failure_preserves_cancellation(
+    settings,
+    replay,
+):
+    page_id = f"page_startup_release_cancel_{replay}"
+    old_path = f"wiki/product/startup-release-old-{replay}.md"
+    new_path = f"wiki/product/startup-release-new-{replay}.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+
+    class ReleaseFailingStore(VaultEventStore):
+        def release_delete_claim(self, *args, **kwargs):
+            raise RuntimeError("claim release database unavailable")
+
+    class FailingRenameRevisions(FakeRevisionService):
+        def rename_page(self, event_id, source_path, target_path):
+            self.calls.append(("rename", event_id, source_path, target_path))
+            mutation_entered.set()
+            if not release_mutation.wait(timeout=5):
+                raise RuntimeError("blocked startup rename was not released")
+            raise RuntimeError("startup rename failed after cancellation")
+
+    store = ReleaseFailingStore(settings)
+    service = VaultSyncService(
+        settings,
+        revisions=FailingRenameRevisions(),
+        events=store,
+    )
+    detected_at = datetime(2026, 7, 15, 18, 0, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    write_page(settings, new_path, content)
+    if replay:
+        store.begin_occurrence(
+            "rename",
+            new_path,
+            old_page_path=old_path,
+            detected_at=detected_at + timedelta(seconds=1),
+        )
+
+    startup = asyncio.create_task(
+        service.reconcile_startup(
+            stability_poll_interval=0.001,
+            reconcile_intents=False,
+        )
+    )
+    while not mutation_entered.is_set():
+        await asyncio.sleep(0)
+
+    startup.cancel()
+    release_mutation.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    assert service.last_error == "claim release database unavailable"

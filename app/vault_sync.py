@@ -480,6 +480,7 @@ class VaultSyncService:
         claimed_pending: PendingVaultDelete | None = None
         claim_resolved = False
         pending_completed = False
+        cancellation_in_flight = False
         try:
             for pending in pending_deletes:
                 claimed_pending = await self._claim_delete_after_wait(
@@ -560,12 +561,20 @@ class VaultSyncService:
                             raise
                 self._finish_result(occurrence, result)
                 self._propagate_cancellation(cancellation_requested)
+        except asyncio.CancelledError:
+            cancellation_in_flight = True
+            raise
         finally:
             if claimed_pending is not None and not claim_resolved:
-                self.events.release_delete_claim(
-                    claimed_pending.id,
-                    replay_owner,
-                )
+                try:
+                    self.events.release_delete_claim(
+                        claimed_pending.id,
+                        replay_owner,
+                    )
+                except Exception as exc:
+                    self._record_delete_expiry_failure(claimed_pending, exc)
+                    if not cancellation_in_flight:
+                        raise
 
     async def _replay_pending_occurrences(
         self,
@@ -765,6 +774,7 @@ class VaultSyncService:
         move_owner = f"vclaim_move_{uuid.uuid4().hex}"
         claimed_pending: PendingVaultDelete | None = None
         claim_resolved = False
+        cancellation_in_flight = False
         try:
             observation = await wait_for_stable_observation(
                 absolute_candidate,
@@ -898,16 +908,22 @@ class VaultSyncService:
                 self._propagate_cancellation(cancellation_requested)
                 return action
         except asyncio.CancelledError:
+            cancellation_in_flight = True
             raise
         except Exception as exc:
             self._fail_startup_occurrence(occurrence, exc)
             raise
         finally:
             if claimed_pending is not None and not claim_resolved:
-                self.events.release_delete_claim(
-                    claimed_pending.id,
-                    move_owner,
-                )
+                try:
+                    self.events.release_delete_claim(
+                        claimed_pending.id,
+                        move_owner,
+                    )
+                except Exception as exc:
+                    self._record_delete_expiry_failure(claimed_pending, exc)
+                    if not cancellation_in_flight:
+                        raise
 
     async def _queue_startup_missing(
         self,
