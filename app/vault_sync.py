@@ -53,6 +53,10 @@ class ReconcileLeaseLost(RuntimeError):
     pass
 
 
+class VaultSyncStopping(RuntimeError):
+    pass
+
+
 class VaultSyncService:
     def __init__(
         self,
@@ -77,6 +81,8 @@ class VaultSyncService:
         self._reconcile_owner = f"vault-reconcile-{uuid.uuid4().hex}"
         self._reconcile_tasks: dict[str, asyncio.Task[None]] = {}
         self._stop_lock = asyncio.Lock()
+        self._stopping = False
+        self._accepting_reconciles = True
         self._watcher = VaultWatchAdapter(
             settings,
             self.handle_batch,
@@ -354,31 +360,40 @@ class VaultSyncService:
 
     def _ensure_reconcile_task(self, job_id: str) -> asyncio.Task[None]:
         task = self._reconcile_tasks.get(job_id)
-        if task is None or task.done():
-            task = asyncio.create_task(
-                self._run_reconcile_job(job_id),
-                name=f"vault-reconcile-{job_id}",
+        if task is not None and not task.done():
+            return task
+        if self._stopping or not self._accepting_reconciles:
+            raise VaultSyncStopping("vault sync runtime stopping")
+        task = asyncio.create_task(
+            self._run_reconcile_job(job_id),
+            name=f"vault-reconcile-{job_id}",
+        )
+        task.add_done_callback(
+            lambda completed, requested_job_id=job_id: self._consume_reconcile_task(
+                requested_job_id,
+                completed,
             )
-            task.add_done_callback(
-                lambda completed, requested_job_id=job_id: self._consume_reconcile_task(
-                    requested_job_id,
-                    completed,
-                )
-            )
-            self._reconcile_tasks[job_id] = task
+        )
+        self._reconcile_tasks[job_id] = task
         return task
 
     def request_reconcile(self, requested_by: str) -> VaultReconcileJob:
+        if self._stopping or not self._accepting_reconciles:
+            raise VaultSyncStopping("vault sync runtime stopping")
         job = self.events.request_reconcile(requested_by)
         self._ensure_reconcile_task(job.id)
         return job
 
     async def reconcile_before_watcher_start(self) -> dict[str, int]:
+        if self._stopping or not self._accepting_reconciles:
+            raise VaultSyncStopping("vault sync runtime stopping")
         active, cancellation_requested = await self._store_call(
             self.events.active_reconcile
         )
         self._propagate_cancellation(cancellation_requested)
         if active is None:
+            if self._stopping or not self._accepting_reconciles:
+                raise VaultSyncStopping("vault sync runtime stopping")
             active, cancellation_requested = await self._store_call(
                 self.events.request_reconcile,
                 "startup",
@@ -423,6 +438,8 @@ class VaultSyncService:
         self.watcher_running = True
 
     async def stop(self) -> None:
+        self._stopping = True
+        self._accepting_reconciles = False
         async with self._stop_lock:
             stop_error: BaseException | None = None
             try:
@@ -431,19 +448,24 @@ class VaultSyncService:
                 stop_error = exc
             self.watcher_running = False
 
-            tasks = list(self._reconcile_tasks.values())
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            if tasks:
-                waiter = asyncio.gather(*tasks, return_exceptions=True)
+            while self._reconcile_tasks:
+                tasks = list(self._reconcile_tasks.items())
+                for _, task in tasks:
+                    if not task.done():
+                        task.cancel()
+                waiter = asyncio.gather(
+                    *(task for _, task in tasks),
+                    return_exceptions=True,
+                )
                 while not waiter.done():
                     try:
                         await asyncio.shield(waiter)
                     except asyncio.CancelledError as exc:
                         if stop_error is None:
                             stop_error = exc
-            self._reconcile_tasks.clear()
+                for job_id, task in tasks:
+                    if self._reconcile_tasks.get(job_id) is task:
+                        self._reconcile_tasks.pop(job_id, None)
             if stop_error is not None:
                 raise stop_error
 

@@ -1276,33 +1276,126 @@ def test_completed_reconcile_tasks_are_evicted_and_stop_request_is_safe(
 
         watcher_stop_started = asyncio.Event()
         release_watcher_stop = asyncio.Event()
-        inventory_started = asyncio.Event()
 
         class BlockingWatcher:
             async def stop(self):
                 watcher_stop_started.set()
                 await release_watcher_stop.wait()
 
-        async def blocked_inventory(**_kwargs):
-            inventory_started.set()
-            await asyncio.Future()
-
         service._watcher = BlockingWatcher()
-        monkeypatch.setattr(service, "reconcile_startup", blocked_inventory)
         stop_task = asyncio.create_task(service.stop())
         await watcher_stop_started.wait()
-        concurrent_job = service.request_reconcile("during-stop")
-        await inventory_started.wait()
-        release_watcher_stop.set()
+        request_error = None
+        try:
+            service.request_reconcile("during-stop")
+        except RuntimeError as exc:
+            request_error = exc
+        finally:
+            release_watcher_stop.set()
         await stop_task
         await asyncio.sleep(0)
 
-        persisted = events.get_reconcile(concurrent_job.id)
-        assert persisted is not None
-        assert persisted.status == "queued"
+        assert request_error is not None
+        assert "stopping" in str(request_error)
         assert service._reconcile_tasks == {}
 
     asyncio.run(exercise())
+
+
+def test_stop_fence_prevents_replacement_after_task_snapshot(
+    settings,
+    monkeypatch,
+):
+    events = VaultEventStore(settings)
+    service = VaultSyncService(settings, events=events)
+
+    async def exercise():
+        first_inventory_started = asyncio.Event()
+        first_cancel_started = asyncio.Event()
+        release_first_cancel = asyncio.Event()
+        blocker_cancel_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+        replacement_started = asyncio.Event()
+        inventory_runs = 0
+
+        async def inventory(**_kwargs):
+            nonlocal inventory_runs
+            inventory_runs += 1
+            if inventory_runs == 1:
+                first_inventory_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    first_cancel_started.set()
+                    await release_first_cancel.wait()
+                    raise
+            replacement_started.set()
+            await asyncio.Future()
+
+        async def blocker():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                blocker_cancel_started.set()
+                await release_blocker.wait()
+                raise
+
+        monkeypatch.setattr(service, "reconcile_startup", inventory)
+        job = service.request_reconcile("admin")
+        old_task = service._reconcile_tasks[job.id]
+        blocker_task = asyncio.create_task(blocker(), name="stop-snapshot-blocker")
+        service._reconcile_tasks["stop-snapshot-blocker"] = blocker_task
+        await first_inventory_started.wait()
+
+        stop_task = asyncio.create_task(service.stop())
+        await asyncio.gather(
+            first_cancel_started.wait(),
+            blocker_cancel_started.wait(),
+        )
+        release_first_cancel.set()
+        while not old_task.done():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        replacement = None
+        request_error = None
+        try:
+            service.request_reconcile("during-stop-snapshot")
+        except RuntimeError as exc:
+            request_error = exc
+        else:
+            replacement = service._reconcile_tasks.get(job.id)
+            assert replacement is not None
+            await replacement_started.wait()
+
+        release_blocker.set()
+        await stop_task
+        await asyncio.sleep(0)
+        persisted = events.get_reconcile(job.id)
+        assert persisted is not None
+        observed = {
+            "request_rejected": request_error is not None,
+            "replacement_live": bool(
+                replacement is not None and not replacement.done()
+            ),
+            "map_empty": service._reconcile_tasks == {},
+            "status": persisted.status,
+            "owner": persisted.lease_owner,
+        }
+
+        if replacement is not None and not replacement.done():
+            replacement.cancel()
+            await asyncio.gather(replacement, return_exceptions=True)
+        return observed
+
+    observed = asyncio.run(exercise())
+    assert observed == {
+        "request_rejected": True,
+        "replacement_live": False,
+        "map_empty": True,
+        "status": "queued",
+        "owner": None,
+    }
 
 
 def test_old_reconcile_done_callback_cannot_remove_replacement(settings):

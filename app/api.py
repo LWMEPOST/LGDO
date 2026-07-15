@@ -84,6 +84,7 @@ from app.obsidian import build_obsidian_uri
 from app.search import ask, stream_ask_events
 from app.vault import slugify
 from app.vault_events import VaultEventStore
+from app.vault_sync import VaultSyncStopping
 from app.wiki import compile_wiki
 from app.wiki_revisions import (
     InvalidWikiDocument,
@@ -164,7 +165,14 @@ async def request_vault_reconcile_endpoint(
     runtime = getattr(request.app.state, "vault_sync", None)
     if runtime is None:
         raise HTTPException(status_code=503, detail="vault sync runtime unavailable")
-    return _vault_reconcile_payload(runtime.request_reconcile(user.user_id))
+    try:
+        job = runtime.request_reconcile(user.user_id)
+    except VaultSyncStopping as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="vault sync runtime stopping",
+        ) from exc
+    return _vault_reconcile_payload(job)
 
 
 @router.get(

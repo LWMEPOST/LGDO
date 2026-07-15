@@ -163,6 +163,23 @@ def test_reconcile_get_reports_runtime_unavailable_instead_of_job_missing(
     assert response.json()["detail"] == "vault sync runtime unavailable"
 
 
+def test_reconcile_post_returns_503_while_runtime_is_stopping(
+    configured_client,
+):
+    _settings, client = configured_client
+    runtime = app.state.vault_sync
+    runtime._stopping = True
+    runtime._accepting_reconciles = False
+    try:
+        response = client.post("/api/internal/vault/reconcile")
+    finally:
+        runtime._stopping = False
+        runtime._accepting_reconciles = True
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "vault sync runtime stopping"
+
+
 def test_disabled_gbrain_failed_backlog_is_raw_diagnostic_only(
     configured_client,
 ):
