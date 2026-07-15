@@ -2771,6 +2771,10 @@ td {
     min-width: 0;
   }
 
+  .overview-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .nav-list {
     width: 100%;
     display: flex;

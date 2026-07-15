@@ -43,4 +43,10 @@ describe("mobile wiki layout styles", () => {
   it("removes the space tree from the mobile flow", () => {
     expect(extractBlock(mobileStyles, ".space-tree")).toMatch(/display:\s*none;/);
   });
+
+  it("stacks overview panels in one mobile column", () => {
+    expect(extractBlock(mobileStyles, ".overview-workspace")).toMatch(
+      /grid-template-columns:\s*minmax\(0,\s*1fr\);/,
+    );
+  });
 });
