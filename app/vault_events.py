@@ -192,7 +192,9 @@ class VaultEventStore:
             if row is None:
                 raise RuntimeError("watcher occurrence insert did not produce a row")
             if str(row["payload_digest"]) != digest:
-                raise VaultOccurrenceConflict("payload changed")
+                raise VaultOccurrenceConflict(
+                    "watch occurrence payload changed"
+                )
             return VaultWatchOccurrence.from_row(row)
 
     def finish_occurrence(

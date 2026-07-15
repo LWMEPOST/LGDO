@@ -121,7 +121,10 @@ def test_occurrence_replay_uses_only_canonical_identity_payload(sqlite_settings)
         ("rename", "wiki/product/new-name.md", "wiki/product/other-old.md"),
     )
     for kind, page_path, old_page_path in changed_payloads:
-        with pytest.raises(VaultOccurrenceConflict, match="^payload changed$"):
+        with pytest.raises(
+            VaultOccurrenceConflict,
+            match="^watch occurrence payload changed$",
+        ):
             store.begin_occurrence(
                 kind,
                 page_path,
