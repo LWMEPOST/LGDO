@@ -69,6 +69,8 @@ def test_internal_mvp_flow(tmp_path, monkeypatch):
     compile_result = client.post("/api/internal/wiki/compile", json={"domain": "product"})
     assert compile_result.status_code == 200
     assert compile_result.json()["created_pages"] >= 2
+    assert (vault_dir / "indexes" / "product_index.md").exists()
+    assert not (vault_dir / "index").exists()
 
     sources = client.get("/api/internal/sources?domain=product")
     assert sources.status_code == 200

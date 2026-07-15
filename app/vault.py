@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 
 VAULT_DIRS = [
@@ -26,7 +29,8 @@ VAULT_DIRS = [
     "wiki/customer_service/scripts",
     "wiki/customer_service/policies",
     "wiki/customer_service/cases",
-    "index",
+    "indexes",
+    "templates",
     "reviews",
     "logs",
 ]
@@ -35,6 +39,61 @@ VAULT_DIRS = [
 def ensure_vault(vault_path: Path) -> None:
     for rel in VAULT_DIRS:
         (vault_path / rel).mkdir(parents=True, exist_ok=True)
+    migrate_legacy_indexes(vault_path)
+
+
+def _new_index_quarantine(vault_path: Path) -> Path:
+    quarantine_parent = vault_path / ".lgdo" / "index-migration"
+    quarantine_parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    quarantine = quarantine_parent / f"{timestamp}-{uuid4().hex}"
+    quarantine.mkdir(exist_ok=False)
+    return quarantine
+
+
+def migrate_legacy_indexes(vault_path: Path) -> Path | None:
+    legacy_root = vault_path / "index"
+    if not legacy_root.is_dir():
+        return None
+
+    indexes_root = vault_path / "indexes"
+    indexes_root.mkdir(parents=True, exist_ok=True)
+    quarantine: Path | None = None
+    legacy_files = sorted(
+        (path for path in legacy_root.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(legacy_root).as_posix(),
+    )
+    for source in legacy_files:
+        relative_path = source.relative_to(legacy_root)
+        target = indexes_root / relative_path
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, target)
+            continue
+        if source.read_bytes() == target.read_bytes():
+            source.unlink()
+            continue
+        if quarantine is None:
+            quarantine = _new_index_quarantine(vault_path)
+        quarantine_target = quarantine / relative_path
+        quarantine_target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, quarantine_target)
+
+    directories = sorted(
+        (path for path in legacy_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    try:
+        legacy_root.rmdir()
+    except OSError:
+        pass
+    return quarantine
 
 
 def slugify(value: str, fallback: str = "page") -> str:

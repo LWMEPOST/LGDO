@@ -213,6 +213,6 @@ def write_indexes(settings: Settings, conn, domain: str, timestamp: str) -> None
     lines = [f"# {domain} Index", "", f"Updated: {timestamp}", ""]
     for row in rows:
         lines.append(f"- [{row['title']}](../{row['path']}) `{row['page_type']}` `{row['review_status']}`")
-    index_path = settings.vault_path / "index" / f"{domain}_index.md"
+    index_path = settings.vault_path / "indexes" / f"{domain}_index.md"
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -605,7 +605,7 @@ def load_source_map(settings: Any) -> dict[str, dict[str, Any]]:
 
 
 def collect_vault_metrics(vault_path: Path) -> dict[str, Any]:
-    sections = ["raw", "normalized", "jsonl", "wiki", "index", "reviews", "logs"]
+    sections = ["raw", "normalized", "jsonl", "wiki", "indexes", "reviews", "logs"]
     by_section: dict[str, dict[str, Any]] = {}
     for section in sections:
         root = vault_path / section
