@@ -36,6 +36,14 @@ export function WikiTask({
 }) {
   const buckets = countPagesByType(pages);
   const canReconcile = currentUser.role === "admin" || currentUser.role === "owner" || currentUser.acl_tags.includes("*");
+  const reconcile = vaultStatus?.reconcile;
+  const reconcileActive = reconcile?.status === "queued" || reconcile?.status === "running";
+  const reconcileLabel = reconcile && ({
+    queued: "对账排队中",
+    running: "对账进行中",
+    succeeded: "对账已完成",
+    failed: "对账失败",
+  } as Record<string, string>)[reconcile.status];
   const syncTone = vaultStatus === null
     ? "unknown"
     : !vaultStatus.configured
@@ -60,13 +68,15 @@ export function WikiTask({
           <small>{activeSpaceFilter.desc}</small>
           {activeSpaceFilter.id !== "all" && <button className="link-button" onClick={clearSpaceFilter} type="button">清除</button>}
         </div>
-        <div className={`sync-status ${syncTone}`}>
+        <div aria-live="polite" className={`sync-status ${syncTone}`} role="status">
           <div className="sync-status-copy">
             <strong>{syncLabel}</strong>
             {vaultStatus && (
               <div className="sync-status-metrics">
                 <span>{vaultStatus.pending_occurrences} 个待处理事件</span>
                 <span>{vaultStatus.open_issues} 个同步问题</span>
+                {reconcileLabel && <span>{reconcileLabel}</span>}
+                {reconcile?.status === "failed" && reconcile.error_summary && <span>{reconcile.error_summary}</span>}
               </div>
             )}
           </div>
@@ -74,6 +84,7 @@ export function WikiTask({
             <button
               aria-label="立即对账"
               className="icon-button"
+              disabled={reconcileActive}
               onClick={() => requestReconcile().catch((error) => showToast(error instanceof Error ? error.message : "Vault 对账失败"))}
               title="立即对账"
               type="button"
@@ -93,7 +104,7 @@ export function WikiTask({
         <List rows={pages} empty="暂无知识页" render={(page) => (
           <Item title={page.title} meta={[translatePageType(page.page_type), translateReviewStatus(page.review_status), page.domain, page.path]}>
             <button
-              aria-label="在 Obsidian 中打开"
+              aria-label={`在 Obsidian 中打开：${page.title}（${page.path}）`}
               className="icon-button"
               onClick={() => openInObsidian(page.path).catch((error) => showToast(error instanceof Error ? error.message : "无法打开 Obsidian"))}
               title="在 Obsidian 中打开"
@@ -112,7 +123,7 @@ export function WikiTask({
             <input value={editor.path} readOnly />
           </Field>
           <button
-            aria-label="在 Obsidian 中打开"
+            aria-label={editor.path ? `在 Obsidian 中打开：${editor.path}` : "在 Obsidian 中打开"}
             className="icon-button"
             disabled={!editor.path}
             onClick={() => editor.path && openInObsidian(editor.path).catch((error) => showToast(error instanceof Error ? error.message : "无法打开 Obsidian"))}

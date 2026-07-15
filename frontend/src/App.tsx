@@ -41,6 +41,18 @@ import {
   findSpaceFilter,
 } from "./utils/space";
 
+const VAULT_RECONCILE_POLL_MS = 1_000;
+
+function reconcileStatusRank(status: string) {
+  if (status === "queued") return 0;
+  if (status === "running") return 1;
+  return 2;
+}
+
+function isActiveReconcile(job: VaultReconcileJob) {
+  return job.status === "queued" || job.status === "running";
+}
+
 export function App({ navigateTo = (url: string) => window.location.assign(url) }: { navigateTo?: (url: string) => void } = {}) {
   const [activeSection, setActiveSection] = useState<SectionId>("overview");
   const [searchText, setSearchText] = useState("");
@@ -88,9 +100,30 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
     owner: "",
   });
   const wikiMutationInFlight = useRef(false);
+  const mountedRef = useRef(true);
+  const sessionGenerationRef = useRef(0);
+  const reconcileTimerRef = useRef<number | null>(null);
+  const reconcileJobRef = useRef<VaultReconcileJob | null>(null);
+  const reconcileRequestGenerationRef = useRef<number | null>(null);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [sourcePreview, setSourcePreview] = useState<SourcePreview | null>(null);
   const [sourcePreviewLoading, setSourcePreviewLoading] = useState(false);
+
+  function resetVaultReconcileTracking() {
+    if (reconcileTimerRef.current !== null) window.clearTimeout(reconcileTimerRef.current);
+    reconcileTimerRef.current = null;
+    reconcileJobRef.current = null;
+    reconcileRequestGenerationRef.current = null;
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      sessionGenerationRef.current += 1;
+      resetVaultReconcileTracking();
+    };
+  }, []);
 
   useEffect(() => {
     bootstrapAuth().catch((error) => {
@@ -113,17 +146,76 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
     window.setTimeout(() => setToast(""), 3200);
   }
 
+  function isCurrentGeneration(generation: number) {
+    return mountedRef.current && sessionGenerationRef.current === generation;
+  }
+
+  function mergeTrackedReconcile(job: VaultReconcileJob) {
+    const tracked = reconcileJobRef.current;
+    if (tracked?.job_id === job.job_id && reconcileStatusRank(tracked.status) > reconcileStatusRank(job.status)) {
+      return tracked;
+    }
+    reconcileJobRef.current = job;
+    return job;
+  }
+
+  function mergeVaultStatus(snapshot: VaultStatus) {
+    const tracked = reconcileJobRef.current;
+    if (!tracked) return snapshot;
+    if (!snapshot.reconcile || snapshot.reconcile.job_id !== tracked.job_id) {
+      return { ...snapshot, reconcile: tracked };
+    }
+    const reconcile = mergeTrackedReconcile(snapshot.reconcile);
+    return reconcile === snapshot.reconcile ? snapshot : { ...snapshot, reconcile };
+  }
+
+  async function refreshVaultStatus(generation: number) {
+    try {
+      const status = await api<VaultStatus>("/api/internal/vault/status");
+      if (isCurrentGeneration(generation)) setVaultStatus(mergeVaultStatus(status));
+    } catch {
+      // Vault status is optional; the terminal job already remains visible.
+    }
+  }
+
+  function scheduleVaultReconcilePoll(jobId: string, generation: number) {
+    if (reconcileTimerRef.current !== null) window.clearTimeout(reconcileTimerRef.current);
+    reconcileTimerRef.current = window.setTimeout(() => {
+      reconcileTimerRef.current = null;
+      void api<VaultReconcileJob>(`/api/internal/vault/reconcile/${encodeURIComponent(jobId)}`)
+        .then((response) => {
+          if (!isCurrentGeneration(generation) || reconcileJobRef.current?.job_id !== jobId) return;
+          const job = mergeTrackedReconcile(response);
+          setVaultStatus((current) => current ? { ...current, reconcile: job } : current);
+          if (isActiveReconcile(job)) {
+            scheduleVaultReconcilePoll(jobId, generation);
+          } else {
+            void refreshVaultStatus(generation);
+          }
+        })
+        .catch((error) => {
+          if (!isCurrentGeneration(generation) || reconcileJobRef.current?.job_id !== jobId) return;
+          showToast(error instanceof Error ? error.message : "Vault 对账状态查询失败");
+        });
+    }, VAULT_RECONCILE_POLL_MS);
+  }
+
   async function bootstrapAuth() {
+    const generation = sessionGenerationRef.current;
     if (!getAuthToken()) {
-      setAuthLoading(false);
+      if (isCurrentGeneration(generation)) setAuthLoading(false);
       return;
     }
     try {
       const user = await api<AuthUser>("/api/internal/auth/me");
+      if (!isCurrentGeneration(generation)) return;
       setCurrentUser(user);
       setAuthLoading(false);
-      await refresh(user);
+      await refresh(user, generation);
     } catch (error) {
+      if (!isCurrentGeneration(generation)) return;
+      sessionGenerationRef.current += 1;
+      resetVaultReconcileTracking();
       setAuthToken("");
       setCurrentUser(null);
       setAuthLoading(false);
@@ -131,22 +223,30 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
   }
 
   async function login(username: string, password: string) {
+    const generation = sessionGenerationRef.current + 1;
+    sessionGenerationRef.current = generation;
+    resetVaultReconcileTracking();
     setAuthError("");
     try {
       const session = await api<AuthSession>("/api/internal/auth/login", {
         method: "POST",
         body: JSON.stringify({ username, password }),
       });
+      if (!isCurrentGeneration(generation)) return;
       setAuthToken(session.token);
       setCurrentUser(session.user);
-      await refresh(session.user);
+      await refresh(session.user, generation);
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "登录失败");
+      if (isCurrentGeneration(generation)) {
+        setAuthError(error instanceof Error ? error.message : "登录失败");
+      }
     }
   }
 
   async function logout() {
-    await api("/api/internal/auth/logout", { method: "POST" }).catch(() => undefined);
+    const logoutRequest = api("/api/internal/auth/logout", { method: "POST" }).catch(() => undefined);
+    sessionGenerationRef.current += 1;
+    resetVaultReconcileTracking();
     setAuthToken("");
     setCurrentUser(null);
     setAccounts([]);
@@ -157,27 +257,34 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
     setGaps([]);
     setRagStatus(null);
     setVaultStatus(null);
+    await logoutRequest;
   }
 
-  async function refresh(user = currentUser) {
-    const [nextSources, nextReports, nextPages, nextReviews, nextGaps, nextRagStatus, nextVaultStatus] = await Promise.all([
+  async function refresh(user = currentUser, generation = sessionGenerationRef.current) {
+    const nextVaultStatus = api<VaultStatus>("/api/internal/vault/status").catch(() => null);
+    const [nextSources, nextReports, nextPages, nextReviews, nextGaps, nextRagStatus] = await Promise.all([
       api<SourceRecord[]>("/api/internal/sources"),
       api<IngestReport[]>("/api/internal/ingest/reports"),
       api<WikiPage[]>("/api/internal/wiki/pages"),
       api<ReviewItem[]>("/api/internal/reviews?status=pending"),
       api<KnowledgeGap[]>("/api/internal/gaps"),
       api<RagStatus>("/api/internal/rag/status"),
-      api<VaultStatus>("/api/internal/vault/status").catch(() => null),
     ]);
+    if (!isCurrentGeneration(generation)) return;
     setSources(nextSources);
     setReports(nextReports);
     setPages(nextPages);
     setReviews(nextReviews);
     setGaps(nextGaps);
     setRagStatus(nextRagStatus);
-    setVaultStatus(nextVaultStatus);
+    void nextVaultStatus.then((status) => {
+      if (isCurrentGeneration(generation)) setVaultStatus(status ? mergeVaultStatus(status) : status);
+    });
     if (user?.role === "admin" || user?.acl_tags?.includes("*")) {
-      setAccounts(await api<AccountRecord[]>("/api/internal/accounts"));
+      const nextAccounts = await api<AccountRecord[]>("/api/internal/accounts");
+      if (isCurrentGeneration(generation)) setAccounts(nextAccounts);
+    } else if (isCurrentGeneration(generation)) {
+      setAccounts([]);
     }
   }
 
@@ -306,9 +413,25 @@ export function App({ navigateTo = (url: string) => window.location.assign(url) 
   }
 
   async function requestVaultReconcile() {
-    const job = await api<VaultReconcileJob>("/api/internal/vault/reconcile", { method: "POST" });
-    setVaultStatus((current) => current ? { ...current, reconcile: job } : null);
-    showToast(`Vault 对账已进入${job.status}`);
+    const generation = sessionGenerationRef.current;
+    if (reconcileRequestGenerationRef.current === generation) return;
+    reconcileRequestGenerationRef.current = generation;
+    try {
+      const job = await api<VaultReconcileJob>("/api/internal/vault/reconcile", { method: "POST" });
+      if (!isCurrentGeneration(generation)) return;
+      const trackedJob = mergeTrackedReconcile(job);
+      setVaultStatus((current) => current ? { ...current, reconcile: trackedJob } : null);
+      showToast(`Vault 对账已进入${job.status}`);
+      if (isActiveReconcile(trackedJob)) {
+        scheduleVaultReconcilePoll(trackedJob.job_id, generation);
+      } else {
+        void refreshVaultStatus(generation);
+      }
+    } finally {
+      if (reconcileRequestGenerationRef.current === generation) {
+        reconcileRequestGenerationRef.current = null;
+      }
+    }
   }
 
   async function loadPage(path: string) {

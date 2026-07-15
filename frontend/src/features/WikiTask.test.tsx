@@ -106,7 +106,9 @@ describe("WikiTask Obsidian controls", () => {
     const row = screen.getByText("退款流程").closest(".item");
 
     expect(row).not.toBeNull();
-    const button = within(row as HTMLElement).getByRole("button", { name: "在 Obsidian 中打开" });
+    const button = within(row as HTMLElement).getByRole("button", {
+      name: /在 Obsidian 中打开.*退款流程.*wiki\/product\/faq\/refund\.md/,
+    });
     expect(button).toHaveAttribute("title", "在 Obsidian 中打开");
     fireEvent.click(button);
 
@@ -129,6 +131,13 @@ describe("WikiTask Obsidian controls", () => {
     expect(screen.getByText("1 个待处理事件")).toBeInTheDocument();
     expect(screen.getByText("1 个同步问题")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "立即对账" })).not.toBeInTheDocument();
+  });
+
+  it("announces sync changes politely", () => {
+    renderWikiTask();
+
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("aria-live", "polite");
   });
 
   it("renders missing vault status as neutral unknown", () => {
@@ -163,6 +172,48 @@ describe("WikiTask Obsidian controls", () => {
   });
 
   it.each([
+    ["queued", "对账排队中"],
+    ["running", "对账进行中"],
+  ])("shows active reconcile status %s and prevents duplicate requests", (status, label) => {
+    const requestReconcile = vi.fn(async () => undefined);
+    renderWikiTask({
+      currentUser: { ...viewer, role: "admin" },
+      requestReconcile,
+      vaultStatus: {
+        ...healthyVaultStatus,
+        reconcile: { job_id: "reconcile-active", status },
+      },
+    });
+
+    expect(screen.getByText(label)).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "立即对账" });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(requestReconcile).not.toHaveBeenCalled();
+  });
+
+  it("shows a failed reconcile summary as safe text and allows retry", () => {
+    const errorSummary = '<img src=x onerror="alert(1)"> inventory failed';
+    const { container } = renderWikiTask({
+      currentUser: { ...viewer, role: "admin" },
+      vaultStatus: {
+        ...healthyVaultStatus,
+        reconcile: {
+          job_id: "reconcile-failed",
+          status: "failed",
+          error_summary: errorSummary,
+        },
+      },
+    });
+
+    expect(screen.getByText("对账失败")).toBeInTheDocument();
+    expect(screen.getByText(errorSummary)).toBeInTheDocument();
+    expect(container.querySelector("img")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "立即对账" })).toBeEnabled();
+  });
+
+  it.each([
     ["owner role", { ...viewer, role: "owner" }],
     ["wildcard ACL", { ...viewer, acl_tags: ["*"] }],
   ])("allows reconcile for %s", (_label, currentUser) => {
@@ -177,7 +228,9 @@ describe("WikiTask Obsidian controls", () => {
     const editorPanel = screen.getByRole("heading", { name: "Markdown 编辑区" }).closest(".panel");
 
     expect(editorPanel).not.toBeNull();
-    const button = within(editorPanel as HTMLElement).getByRole("button", { name: "在 Obsidian 中打开" });
+    const button = within(editorPanel as HTMLElement).getByRole("button", {
+      name: /在 Obsidian 中打开.*wiki\/product\/faq\/selected\.md/,
+    });
     expect(button).toHaveAttribute("title", "在 Obsidian 中打开");
     fireEvent.click(button);
 
@@ -189,7 +242,7 @@ describe("WikiTask Obsidian controls", () => {
     renderWikiTask({ editor: { ...editor, path: "" }, openInObsidian });
     const editorPanel = screen.getByRole("heading", { name: "Markdown 编辑区" }).closest(".panel");
 
-    const button = within(editorPanel as HTMLElement).getByRole("button", { name: "在 Obsidian 中打开" });
+    const button = within(editorPanel as HTMLElement).getByRole("button", { name: /在 Obsidian 中打开/ });
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(openInObsidian).not.toHaveBeenCalled();
