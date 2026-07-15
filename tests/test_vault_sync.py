@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -106,9 +107,10 @@ class FakeResult:
 
 
 class FakeRevisionService:
-    def __init__(self, *, failing_paths=()):
+    def __init__(self, *, failing_paths=(), projection_jobs=()):
         self.calls: list[tuple] = []
         self.failing_paths = set(failing_paths)
+        self.projection_jobs = list(projection_jobs)
 
     def ingest_external_change(self, event_id, page_path, observation):
         self.calls.append(("ingest", event_id, page_path, observation.file_hash))
@@ -146,7 +148,7 @@ class FakeRevisionService:
 
     def ensure_projection_jobs(self, page_id=None):
         self.calls.append(("ensure_projection_jobs", page_id))
-        return []
+        return self.projection_jobs
 
 
 def write_page(settings, page_path: str, content: bytes) -> None:
@@ -738,3 +740,359 @@ async def test_ambiguous_candidates_are_rechecked_under_page_lock(
         ).fetchone()[0]
     assert tuple(occurrence) == ("renamed", None)
     assert issue_count == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_waits_for_predeadline_unclassified_add(settings):
+    page_id = "page_delete_barrier"
+    old_path = "wiki/product/delete-barrier-old.md"
+    new_path = "wiki/product/delete-barrier-new.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    revisions = FakeRevisionService()
+    store = VaultEventStore(settings)
+    service = VaultSyncService(settings, revisions=revisions, events=store)
+    detected_at = datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc)
+
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    store.begin_occurrence(
+        "add",
+        new_path,
+        detected_at=detected_at + timedelta(seconds=4),
+    )
+
+    expired = await service.expire_deletes(
+        now=detected_at + timedelta(seconds=6)
+    )
+
+    assert expired == 0
+    assert revisions.calls == []
+
+
+@pytest.mark.asyncio
+async def test_true_delete_rechecks_path_and_intent_then_applies(settings):
+    page_id = "page_true_delete"
+    old_path = "wiki/product/true-delete.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+    detected_at = datetime(2026, 7, 15, 10, 30, tzinfo=timezone.utc)
+
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+
+    expired = await service.expire_deletes(
+        now=detected_at + timedelta(seconds=6)
+    )
+
+    assert expired == 1
+    assert [call[0] for call in revisions.calls] == ["delete"]
+    assert revisions.calls[0][2] == old_path
+
+
+@pytest.mark.asyncio
+async def test_startup_unique_missing_path_is_explicit_offline_rename_evidence(
+    settings,
+):
+    page_id = "page_startup_exact_move"
+    old_path = "wiki/product/startup-exact-old.md"
+    new_path = "wiki/product/startup-exact-new.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    write_page(settings, new_path, content)
+    revisions = FakeRevisionService(projection_jobs=["projection-1"])
+    service = VaultSyncService(settings, revisions=revisions)
+
+    result = await service.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    assert result == {
+        "renamed": 1,
+        "relocated": 0,
+        "ingested": 0,
+        "missing": 0,
+        "replayed": 0,
+        "duplicate_page_ids": 0,
+        "failed": 0,
+        "projection_jobs": 1,
+    }
+    assert [call[0] for call in revisions.calls] == [
+        "rename",
+        "ensure_projection_jobs",
+    ]
+    assert revisions.calls[0][2:] == (old_path, new_path)
+
+
+@pytest.mark.asyncio
+async def test_startup_edited_unique_missing_path_relocates_external_change(
+    settings,
+):
+    page_id = "page_startup_edited_move"
+    old_path = "wiki/product/startup-edited-old.md"
+    new_path = "wiki/product/startup-edited-new.md"
+    original = managed_bytes(page_id)
+    edited = managed_bytes(page_id, body="Edited while the service was offline")
+    seed_page(settings, page_id=page_id, page_path=old_path, content=original)
+    write_page(settings, new_path, edited)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+
+    result = await service.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    assert result["relocated"] == 1
+    assert result["renamed"] == 0
+    assert [call[0] for call in revisions.calls] == [
+        "relocate",
+        "ensure_projection_jobs",
+    ]
+    assert revisions.calls[0][2:5] == (old_path, new_path, page_id)
+
+
+@pytest.mark.asyncio
+async def test_startup_present_original_and_copied_id_is_duplicate(settings):
+    page_id = "page_startup_copy"
+    old_path = "wiki/product/startup-copy-original.md"
+    copied_path = "wiki/product/startup-copy-duplicate.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    write_page(settings, old_path, content)
+    write_page(settings, copied_path, content)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+
+    result = await service.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    assert result["duplicate_page_ids"] == 1
+    assert result["renamed"] == 0
+    assert result["relocated"] == 0
+    assert [call[0] for call in revisions.calls] == ["ensure_projection_jobs"]
+
+
+@pytest.mark.asyncio
+async def test_startup_missing_page_delete_survives_restart_and_expires_once(
+    settings,
+):
+    page_id = "page_startup_missing"
+    old_path = "wiki/product/startup-missing.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    first_revisions = FakeRevisionService()
+
+    first_result = await VaultSyncService(
+        settings,
+        revisions=first_revisions,
+    ).reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    assert first_result["missing"] == 1
+    assert [call[0] for call in first_revisions.calls] == [
+        "ensure_projection_jobs"
+    ]
+    with connect_app(settings) as conn:
+        pending = dict(
+            conn.execute(
+                "SELECT * FROM pending_vault_deletes WHERE status='pending'"
+            ).fetchone()
+        )
+        occurrence_count = conn.execute(
+            "SELECT COUNT(*) FROM vault_watch_occurrences WHERE kind='delete'"
+        ).fetchone()[0]
+    assert occurrence_count == 1
+
+    restarted_revisions = FakeRevisionService()
+    restarted = VaultSyncService(settings, revisions=restarted_revisions)
+    expires_at = datetime.fromisoformat(pending["expires_at"])
+    assert await restarted.expire_deletes(
+        now=expires_at + timedelta(seconds=1)
+    ) == 1
+    assert await restarted.expire_deletes(
+        now=expires_at + timedelta(seconds=2)
+    ) == 0
+    assert [call[0] for call in restarted_revisions.calls] == ["delete"]
+
+
+@pytest.mark.asyncio
+async def test_startup_inventory_is_canonical_and_continues_after_failure(
+    settings,
+    monkeypatch,
+):
+    good_path = "wiki/product/startup-good.md"
+    bad_path = "wiki/product/startup-bad.md"
+    hidden_path = "wiki/product/.startup-hidden.md"
+    good = external_page_bytes(title="Startup good")
+    bad = external_page_bytes(title="Startup bad")
+    hidden = external_page_bytes(title="Startup hidden")
+    write_page(settings, good_path, good)
+    write_page(settings, bad_path, bad)
+    write_page(settings, hidden_path, hidden)
+
+    async def observe(path, *_args, **_kwargs):
+        if path.name == "startup-bad.md":
+            raise RuntimeError("unreadable startup page")
+        return observation_for(path.read_bytes())
+
+    monkeypatch.setattr("app.vault_sync.wait_for_stable_observation", observe)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+
+    result = await service.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    assert result["ingested"] == 1
+    assert result["failed"] == 1
+    assert [call[2] for call in revisions.calls if call[0] == "ingest"] == [
+        good_path
+    ]
+    with connect_app(settings) as conn:
+        failures = conn.execute(
+            "SELECT COUNT(*) FROM vault_watch_occurrences WHERE status='failed'"
+        ).fetchone()[0]
+    assert failures == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_replays_pending_occurrences_once_and_ignores_missing(
+    settings,
+):
+    existing_path = "wiki/product/startup-replay-add.md"
+    missing_path = "wiki/product/startup-replay-missing.md"
+    write_page(settings, existing_path, external_page_bytes(title="Replay"))
+    store = VaultEventStore(settings)
+    detected_at = datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc)
+    store.begin_occurrence("add", existing_path, detected_at=detected_at)
+    store.begin_occurrence(
+        "modify",
+        missing_path,
+        detected_at=detected_at + timedelta(seconds=1),
+    )
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions, events=store)
+
+    result = await service.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    assert result["replayed"] == 2
+    assert [call[0] for call in revisions.calls] == [
+        "ingest",
+        "ensure_projection_jobs",
+    ]
+    with connect_app(settings) as conn:
+        statuses = {
+            row["page_path"]: row["status"]
+            for row in conn.execute(
+                "SELECT page_path,status FROM vault_watch_occurrences"
+            ).fetchall()
+        }
+    assert statuses == {existing_path: "applied", missing_path: "ignored"}
+    assert store.pending_occurrences() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_state", ["path", "intent"])
+async def test_delete_expiry_rechecks_path_and_intent_under_lock(
+    settings,
+    monkeypatch,
+    changed_state,
+):
+    page_id = f"page_delete_recheck_{changed_state}"
+    old_path = f"wiki/product/delete-recheck-{changed_state}.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    store = VaultEventStore(settings)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions, events=store)
+    detected_at = datetime(2026, 7, 15, 11, 30, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    original_page_lock = service._page_lock
+    intent_active = False
+
+    @asynccontextmanager
+    async def change_after_lock(key):
+        nonlocal intent_active
+        async with original_page_lock(key):
+            if changed_state == "path":
+                write_page(settings, old_path, content)
+            else:
+                intent_active = True
+            yield
+
+    monkeypatch.setattr(service, "_page_lock", change_after_lock)
+    monkeypatch.setattr(store, "has_active_intent", lambda _page_id: intent_active)
+
+    assert await service.expire_deletes(
+        now=detected_at + timedelta(seconds=6)
+    ) == 0
+    assert revisions.calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_cancellation_drains_before_propagating(settings):
+    page_id = "page_delete_cancelled"
+    old_path = "wiki/product/delete-cancelled.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+
+    class BlockingDeleteRevisions(FakeRevisionService):
+        def delete_page(self, event_id, page_path):
+            self.calls.append(("delete", event_id, page_path))
+            mutation_entered.set()
+            if not release_mutation.wait(timeout=5):
+                raise RuntimeError("blocked delete was not released")
+            return FakeResult("deleted")
+
+    revisions = BlockingDeleteRevisions()
+    service = VaultSyncService(settings, revisions=revisions)
+    detected_at = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    expiry = asyncio.create_task(
+        service.expire_deletes(now=detected_at + timedelta(seconds=6))
+    )
+    while not mutation_entered.is_set():
+        await asyncio.sleep(0)
+
+    expiry.cancel()
+    await asyncio.sleep(0)
+    expiry.cancel()
+    assert expiry.done() is False
+    release_mutation.set()
+    with pytest.raises(asyncio.CancelledError):
+        await expiry
+
+    with connect_app(settings) as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM pending_vault_deletes WHERE status='pending'"
+        ).fetchone()[0]
+    assert pending == 0
+    assert revisions.calls == [("delete", revisions.calls[0][1], old_path)]

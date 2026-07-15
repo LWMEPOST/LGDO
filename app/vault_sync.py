@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,7 +15,12 @@ from app.vault_events import (
     VaultOccurrenceConflict,
     VaultWatchOccurrence,
 )
-from app.vault_watcher import VaultFsEvent, wait_for_stable_observation
+from app.vault_watcher import (
+    VaultFsEvent,
+    canonical_wiki_path,
+    iter_canonical_wiki_files,
+    wait_for_stable_observation,
+)
 from app.vault_writer import IntentExecutor
 from app.wiki_markdown import (
     FileObservationInput,
@@ -29,6 +35,14 @@ from app.wiki_revisions import MutationResult, RevisionConflict, WikiRevisionSer
 class PageLockEntry:
     lock: asyncio.Lock
     users: int = 0
+
+
+StartupInventoryEntry = tuple[
+    str,
+    FileObservationInput | None,
+    str | None,
+]
+StartupInventory = tuple[list[StartupInventoryEntry], set[str], int]
 
 
 class VaultSyncService:
@@ -126,6 +140,821 @@ class VaultSyncService:
             "deferred",
             page_id=page_id,
         )
+
+    async def expire_deletes(self, now: datetime | None = None) -> int:
+        expire_at = now or datetime.now(timezone.utc)
+        if expire_at.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+
+        completed = 0
+        for candidate in self.events.list_due_deletes(expire_at):
+            try:
+                if self.events.has_unclassified_add_before(candidate.expires_at):
+                    continue
+                if (
+                    self._absolute_path(candidate.old_page_path).exists()
+                    or self.events.has_active_intent(candidate.page_id)
+                ):
+                    continue
+
+                async with self._page_lock(candidate.page_id):
+                    pending = self.events.get_pending_delete(candidate.id)
+                    if pending is None:
+                        continue
+                    if (
+                        self._absolute_path(pending.old_page_path).exists()
+                        or self.events.has_active_intent(pending.page_id)
+                        or self.events.has_unclassified_add_before(
+                            pending.expires_at
+                        )
+                    ):
+                        continue
+
+                    result, cancellation_requested = (
+                        await self._await_revision_mutation(
+                            self.revisions.delete_page,
+                            pending.occurrence_id,
+                            pending.old_page_path,
+                        )
+                    )
+                    if result.status in {"deleted", "ignored"}:
+                        if self.events.complete_delete(pending.id):
+                            completed += 1
+                    else:
+                        error = (
+                            "delete expiry returned non-terminal status: "
+                            f"{result.status}"
+                        )
+                        self.last_error = error[:500]
+                        self.events.upsert_sync_issue(
+                            page_path=pending.old_page_path,
+                            file_hash=pending.file_hash or "",
+                            page_id=pending.page_id,
+                            issue_type="delete_expiry_failed",
+                            error_summary=self.last_error,
+                        )
+                    self._propagate_cancellation(cancellation_requested)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = str(exc)[:500]
+                self.last_error = error
+                try:
+                    self.events.upsert_sync_issue(
+                        page_path=candidate.old_page_path,
+                        file_hash=candidate.file_hash or "",
+                        page_id=candidate.page_id,
+                        issue_type="delete_expiry_failed",
+                        error_summary=error,
+                    )
+                except Exception:
+                    pass
+        return completed
+
+    @staticmethod
+    def _startup_occurrence_id(prefix: str, *parts: str) -> str:
+        payload = "\0".join((prefix, *parts)).encode("utf-8")
+        return f"vocc_startup_{hashlib.sha256(payload).hexdigest()}"
+
+    def _inventory_page_id(
+        self,
+        observation: FileObservationInput,
+    ) -> str | None:
+        if observation.content_truncated or observation.content_bytes is None:
+            raise ValueError("startup inventory requires complete file bytes")
+        document = parse_wiki_bytes(observation.content_bytes, self.limits)
+        first_id = document.frontmatter.get("lgdo_page_id")
+        second_id = document.frontmatter.get("id")
+        if (
+            first_id is not None
+            and second_id is not None
+            and first_id != second_id
+        ):
+            raise ValueError("wiki page declares conflicting managed IDs")
+        value = first_id or second_id
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise ValueError("managed page ID must be a non-empty string")
+        return value
+
+    def _inventory_failure_path(self, path: Path) -> str:
+        canonical = canonical_wiki_path(self.settings.vault_path, path)
+        if canonical is not None:
+            return canonical
+        try:
+            return path.relative_to(self.settings.vault_path).as_posix()
+        except ValueError:
+            return str(path)
+
+    def _record_inventory_failure(
+        self,
+        page_path: str,
+        exc: Exception,
+    ) -> None:
+        error = (str(exc) or type(exc).__name__)[:500]
+        detected_at = datetime.now(timezone.utc)
+        occurrence = self.events.begin_occurrence(
+            "modify",
+            page_path,
+            detected_at=detected_at,
+            occurrence_id=self._startup_occurrence_id(
+                "inventory-failure",
+                page_path,
+                type(exc).__name__,
+                error,
+            ),
+        )
+        self._remember_event_time(occurrence.detected_at)
+        self.events.finish_occurrence(
+            occurrence.id,
+            "failed",
+            error_summary=error,
+        )
+        self.last_error = error
+
+    def _record_startup_issue(
+        self,
+        *,
+        page_path: str,
+        file_hash: str,
+        page_id: str | None,
+        issue_type: str,
+        error_summary: str,
+    ) -> None:
+        error = error_summary[:500]
+        issue = self.events.upsert_sync_issue(
+            page_path=page_path,
+            file_hash=file_hash,
+            page_id=page_id,
+            issue_type=issue_type,
+            error_summary=error,
+        )
+        detected_at = datetime.now(timezone.utc)
+        occurrence = self.events.begin_occurrence(
+            "modify",
+            page_path,
+            detected_at=detected_at,
+            occurrence_id=self._startup_occurrence_id(
+                "startup-issue",
+                issue.id,
+                issue_type,
+                page_path,
+                file_hash,
+                page_id or "",
+            ),
+        )
+        self._remember_event_time(occurrence.detected_at)
+        self.events.finish_occurrence(
+            occurrence.id,
+            "invalid",
+            page_id=page_id,
+            sync_issue_id=issue.id,
+            error_summary=error,
+        )
+
+    async def _replay_startup_move(
+        self,
+        occurrence: VaultWatchOccurrence,
+        *,
+        stability_poll_interval: float,
+    ) -> None:
+        if occurrence.old_page_path is None:
+            raise RevisionConflict(
+                "startup move occurrence has no old path",
+                current_revision_id=None,
+            )
+        absolute_path = self._absolute_path(occurrence.page_path)
+        if not absolute_path.exists():
+            self.events.finish_occurrence(occurrence.id, "ignored")
+            return
+        observation = await wait_for_stable_observation(
+            absolute_path,
+            self.limits,
+            timeout_seconds=self.settings.vault_watch_stability_timeout_seconds,
+            poll_interval=stability_poll_interval,
+        )
+        page_id = self._inventory_page_id(observation)
+        if page_id is None:
+            raise RevisionConflict(
+                "startup move replay has no managed identity",
+                current_revision_id=None,
+            )
+        async with self._page_lock(page_id):
+            observation = await wait_for_stable_observation(
+                absolute_path,
+                self.limits,
+                timeout_seconds=(
+                    self.settings.vault_watch_stability_timeout_seconds
+                ),
+                poll_interval=stability_poll_interval,
+            )
+            if self._inventory_page_id(observation) != page_id:
+                raise RevisionConflict(
+                    "startup move replay identity changed",
+                    current_revision_id=None,
+                )
+            if occurrence.kind == "rename":
+                result, cancellation_requested = (
+                    await self._await_revision_mutation(
+                        self.revisions.rename_page,
+                        occurrence.id,
+                        occurrence.old_page_path,
+                        occurrence.page_path,
+                    )
+                )
+            else:
+                result, cancellation_requested = (
+                    await self._await_revision_mutation(
+                        self.revisions.relocate_external_change,
+                        occurrence.id,
+                        occurrence.old_page_path,
+                        occurrence.page_path,
+                        page_id,
+                        observation,
+                    )
+                )
+            self._finish_result(occurrence, result)
+            self._propagate_cancellation(cancellation_requested)
+
+    async def _replay_pending_occurrences(
+        self,
+        stability_poll_interval: float,
+    ) -> tuple[set[str], int, int]:
+        pending = sorted(
+            self.events.pending_occurrences(),
+            key=lambda occurrence: (
+                occurrence.kind != "delete",
+                occurrence.detected_at,
+                occurrence.id,
+            ),
+        )
+        replayed_paths: set[str] = set()
+        replayed = 0
+        failed = 0
+        for occurrence in pending:
+            replayed += 1
+            self._remember_event_time(occurrence.detected_at)
+            if occurrence.kind != "delete":
+                replayed_paths.add(occurrence.page_path)
+            if (
+                occurrence.kind in {"add", "modify", "rename", "relocate"}
+                and not self._absolute_path(occurrence.page_path).exists()
+            ):
+                self.events.finish_occurrence(occurrence.id, "ignored")
+                continue
+            failed += int(
+                await self._handle_occurrence(
+                    occurrence,
+                    stability_poll_interval=stability_poll_interval,
+                )
+            )
+        return replayed_paths, replayed, failed
+
+    async def _inventory(
+        self,
+        stability_poll_interval: float,
+    ) -> StartupInventory:
+        entries: list[StartupInventoryEntry] = []
+        seen_paths: set[str] = set()
+        failed = 0
+        recorded_failures: set[tuple[str, str, str]] = set()
+
+        def record_failure(path: Path, exc: Exception) -> None:
+            nonlocal failed
+            page_path = self._inventory_failure_path(path)
+            seen_paths.add(page_path)
+            identity = (page_path, type(exc).__name__, str(exc))
+            if identity in recorded_failures:
+                return
+            recorded_failures.add(identity)
+            failed += 1
+            try:
+                self._record_inventory_failure(page_path, exc)
+            except Exception as record_exc:
+                self.last_error = str(record_exc)[:500]
+
+        for absolute_path in iter_canonical_wiki_files(
+            self.settings.vault_path,
+            error_handler=record_failure,
+        ):
+            page_path = canonical_wiki_path(
+                self.settings.vault_path,
+                absolute_path,
+            )
+            if page_path is None:
+                continue
+            seen_paths.add(page_path)
+            try:
+                observation = await wait_for_stable_observation(
+                    absolute_path,
+                    self.limits,
+                    timeout_seconds=(
+                        self.settings.vault_watch_stability_timeout_seconds
+                    ),
+                    poll_interval=stability_poll_interval,
+                )
+                page_id = self._inventory_page_id(observation)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                record_failure(absolute_path, exc)
+                continue
+            entries.append((page_path, observation, page_id))
+        return entries, seen_paths, failed
+
+    def _fail_startup_occurrence(
+        self,
+        occurrence: VaultWatchOccurrence | None,
+        exc: Exception,
+    ) -> None:
+        error = (str(exc) or type(exc).__name__)[:500]
+        self.last_error = error
+        if occurrence is None or occurrence.status != "pending":
+            return
+        try:
+            self.events.finish_occurrence(
+                occurrence.id,
+                "failed",
+                error_summary=error,
+            )
+        except VaultOccurrenceConflict:
+            pass
+
+    async def _apply_startup_ingest(
+        self,
+        *,
+        page_path: str,
+        page_id: str | None,
+        bound_page: dict[str, Any] | None,
+        stability_poll_interval: float,
+    ) -> bool:
+        detected_at = datetime.now(timezone.utc)
+        occurrence = self.events.begin_occurrence(
+            "modify" if bound_page is not None else "add",
+            page_path,
+            detected_at=detected_at,
+        )
+        self._remember_event_time(occurrence.detected_at)
+        if occurrence.status != "pending":
+            return False
+
+        lock_key = (
+            str(bound_page["page_id"])
+            if bound_page is not None and bound_page.get("page_id")
+            else page_id or page_path
+        )
+        try:
+            async with self._page_lock(lock_key):
+                absolute_path = self._absolute_path(page_path)
+                if not absolute_path.exists():
+                    self.events.finish_occurrence(occurrence.id, "ignored")
+                    return False
+                if (
+                    bound_page is not None
+                    and bound_page.get("page_id")
+                    and self.events.has_active_intent(
+                        str(bound_page["page_id"])
+                    )
+                ):
+                    raise RevisionConflict(
+                        "startup ingest is blocked by an active intent",
+                        current_revision_id=None,
+                    )
+                observation = await wait_for_stable_observation(
+                    absolute_path,
+                    self.limits,
+                    timeout_seconds=(
+                        self.settings.vault_watch_stability_timeout_seconds
+                    ),
+                    poll_interval=stability_poll_interval,
+                )
+                pending = self.events.find_pending_delete_for_path(page_path)
+                if pending is not None:
+                    if (
+                        bound_page is None
+                        or str(bound_page.get("page_id")) != pending.page_id
+                        or not self.events.cancel_delete(
+                            pending.id,
+                            occurrence.id,
+                        )
+                    ):
+                        raise RevisionConflict(
+                            "startup same-path delete evidence changed",
+                            current_revision_id=None,
+                        )
+                result, cancellation_requested = (
+                    await self._await_revision_mutation(
+                        self.revisions.ingest_external_change,
+                        occurrence.id,
+                        page_path,
+                        observation,
+                    )
+                )
+                self._finish_result(occurrence, result)
+                self._propagate_cancellation(cancellation_requested)
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail_startup_occurrence(occurrence, exc)
+            raise
+
+    async def _apply_startup_move(
+        self,
+        *,
+        page: dict[str, Any],
+        candidate_path: str,
+        stability_poll_interval: float,
+    ) -> str:
+        page_id = str(page["page_id"])
+        old_path = str(page["path"])
+        occurrence: VaultWatchOccurrence | None = None
+        try:
+            async with self._page_lock(page_id):
+                current = self.events.page_by_path(old_path)
+                absolute_candidate = self._absolute_path(candidate_path)
+                if (
+                    current is None
+                    or str(current.get("page_id")) != page_id
+                    or self._absolute_path(old_path).exists()
+                    or not absolute_candidate.exists()
+                    or self.events.has_active_intent(page_id)
+                ):
+                    raise RevisionConflict(
+                        "startup move evidence changed",
+                        current_revision_id=None,
+                    )
+                observation = await wait_for_stable_observation(
+                    absolute_candidate,
+                    self.limits,
+                    timeout_seconds=(
+                        self.settings.vault_watch_stability_timeout_seconds
+                    ),
+                    poll_interval=stability_poll_interval,
+                )
+                if self._inventory_page_id(observation) != page_id:
+                    raise RevisionConflict(
+                        "startup move identity changed",
+                        current_revision_id=None,
+                    )
+
+                pending_deletes = self.events.find_pending_deletes(
+                    page_id=page_id
+                )
+                if len(pending_deletes) > 1 or any(
+                    pending.old_page_path != old_path
+                    for pending in pending_deletes
+                ):
+                    raise RevisionConflict(
+                        "startup move has ambiguous pending delete evidence",
+                        current_revision_id=None,
+                    )
+
+                exact = observation.file_hash == page.get("file_hash")
+                action = "rename" if exact else "relocate"
+                occurrence = self.events.begin_occurrence(
+                    action,
+                    candidate_path,
+                    old_page_path=old_path,
+                    detected_at=datetime.now(timezone.utc),
+                )
+                self._remember_event_time(occurrence.detected_at)
+                if occurrence.status != "pending":
+                    return action
+                if exact:
+                    result, cancellation_requested = (
+                        await self._await_revision_mutation(
+                            self.revisions.rename_page,
+                            occurrence.id,
+                            old_path,
+                            candidate_path,
+                        )
+                    )
+                else:
+                    result, cancellation_requested = (
+                        await self._await_revision_mutation(
+                            self.revisions.relocate_external_change,
+                            occurrence.id,
+                            old_path,
+                            candidate_path,
+                            page_id,
+                            observation,
+                        )
+                    )
+                if result.status in {"renamed", "applied", "ignored"}:
+                    for pending in pending_deletes:
+                        self.events.cancel_delete(pending.id, occurrence.id)
+                self._finish_result(occurrence, result)
+                self._propagate_cancellation(cancellation_requested)
+                return action
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail_startup_occurrence(occurrence, exc)
+            raise
+
+    async def _queue_startup_missing(
+        self,
+        page: dict[str, Any],
+    ) -> bool:
+        page_id = str(page["page_id"])
+        page_path = str(page["path"])
+        async with self._page_lock(page_id):
+            current = self.events.page_by_path(page_path)
+            if (
+                current is None
+                or str(current.get("page_id")) != page_id
+                or self._absolute_path(page_path).exists()
+                or self.events.has_active_intent(page_id)
+            ):
+                return False
+            existing = self.events.find_pending_delete_for_path(page_path)
+            if existing is not None and existing.page_id == page_id:
+                return False
+            occurrence = self.events.begin_occurrence(
+                "delete",
+                page_path,
+                detected_at=datetime.now(timezone.utc),
+                occurrence_id=self._startup_occurrence_id(
+                    "missing",
+                    page_id,
+                    page_path,
+                    str(page.get("file_hash") or ""),
+                ),
+            )
+            self._remember_event_time(occurrence.detected_at)
+            await self._queue_delete(occurrence, occurrence.detected_at)
+            return True
+
+    async def _reconcile_inventory(
+        self,
+        inventory: StartupInventory,
+        replayed_paths: set[str],
+        *,
+        stability_poll_interval: float = 0.05,
+    ) -> dict[str, int]:
+        entries, seen_paths, inventory_failed = inventory
+        counters = {
+            "renamed": 0,
+            "relocated": 0,
+            "ingested": 0,
+            "missing": 0,
+            "duplicate_page_ids": 0,
+            "failed": inventory_failed,
+        }
+        entries_by_path = {entry[0]: entry for entry in entries}
+        entries_by_id: dict[str, list[StartupInventoryEntry]] = {}
+        for entry in entries:
+            if entry[2] is not None:
+                entries_by_id.setdefault(entry[2], []).append(entry)
+
+        pages = self.events.list_wiki_pages(
+            lifecycle_statuses=("active", "invalid", "deleted")
+        )
+        pages_by_path = {str(page["path"]): page for page in pages}
+        pages_by_id: dict[str, list[dict[str, Any]]] = {}
+        for page in pages:
+            if page.get("page_id"):
+                pages_by_id.setdefault(str(page["page_id"]), []).append(page)
+
+        isolated_paths: set[str] = set()
+        processed_paths: set[str] = set()
+        duplicate_ids = {
+            page_id: candidates
+            for page_id, candidates in entries_by_id.items()
+            if len(candidates) > 1
+        }
+        for page_id, candidates in sorted(duplicate_ids.items()):
+            counters["duplicate_page_ids"] += 1
+            isolated_paths.update(candidate[0] for candidate in candidates)
+            paths = ", ".join(candidate[0] for candidate in candidates)
+            for page_path, observation, _ in candidates:
+                try:
+                    self._record_startup_issue(
+                        page_path=page_path,
+                        file_hash=(
+                            observation.file_hash if observation is not None else ""
+                        ),
+                        page_id=page_id,
+                        issue_type="duplicate_page_id",
+                        error_summary=(
+                            "startup inventory found duplicate managed page ID at: "
+                            f"{paths}"
+                        ),
+                    )
+                except Exception as exc:
+                    self.last_error = str(exc)[:500]
+                    counters["failed"] += 1
+
+        movable_pages = [
+            page
+            for page in pages
+            if page.get("page_id")
+            and page.get("lifecycle_status") in {"active", "invalid"}
+        ]
+        for page in movable_pages:
+            page_id = str(page["page_id"])
+            old_path = str(page["path"])
+            if old_path in seen_paths:
+                continue
+            candidates = entries_by_id.get(page_id, [])
+            if candidates:
+                if page_id in duplicate_ids or len(pages_by_id[page_id]) != 1:
+                    continue
+                candidate = candidates[0]
+                candidate_path = candidate[0]
+                if candidate_path in replayed_paths:
+                    processed_paths.add(candidate_path)
+                    continue
+                occupied = pages_by_path.get(candidate_path)
+                if (
+                    occupied is not None
+                    and str(occupied.get("page_id")) != page_id
+                ):
+                    isolated_paths.add(candidate_path)
+                    counters["failed"] += 1
+                    try:
+                        self._record_startup_issue(
+                            page_path=candidate_path,
+                            file_hash=candidate[1].file_hash,
+                            page_id=page_id,
+                            issue_type="occupied_startup_move",
+                            error_summary=(
+                                "startup move target belongs to another database page"
+                            ),
+                        )
+                    except Exception as exc:
+                        self.last_error = str(exc)[:500]
+                    continue
+                if self.events.has_active_intent(page_id):
+                    isolated_paths.add(candidate_path)
+                    counters["failed"] += 1
+                    try:
+                        self._record_startup_issue(
+                            page_path=candidate_path,
+                            file_hash=candidate[1].file_hash,
+                            page_id=page_id,
+                            issue_type="startup_move_intent",
+                            error_summary="startup move is blocked by an active intent",
+                        )
+                    except Exception as exc:
+                        self.last_error = str(exc)[:500]
+                    continue
+                processed_paths.add(candidate_path)
+                try:
+                    action = await self._apply_startup_move(
+                        page=page,
+                        candidate_path=candidate_path,
+                        stability_poll_interval=stability_poll_interval,
+                    )
+                    counters[
+                        "renamed" if action == "rename" else "relocated"
+                    ] += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    counters["failed"] += 1
+                continue
+
+            if self.events.has_active_intent(page_id):
+                counters["failed"] += 1
+                try:
+                    self._record_startup_issue(
+                        page_path=old_path,
+                        file_hash=str(page.get("file_hash") or ""),
+                        page_id=page_id,
+                        issue_type="startup_missing_intent",
+                        error_summary="missing startup page has an active intent",
+                    )
+                except Exception as exc:
+                    self.last_error = str(exc)[:500]
+                continue
+            counters["missing"] += 1
+            try:
+                await self._queue_startup_missing(page)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = str(exc)[:500]
+                counters["failed"] += 1
+
+        for page_path, observation, page_id in entries:
+            if (
+                observation is None
+                or page_path in replayed_paths
+                or page_path in isolated_paths
+                or page_path in processed_paths
+            ):
+                continue
+            bound_page = pages_by_path.get(page_path)
+            if bound_page is not None:
+                bound_id = (
+                    str(bound_page["page_id"])
+                    if bound_page.get("page_id")
+                    else None
+                )
+                if page_id is not None and bound_id != page_id:
+                    counters["failed"] += 1
+                    try:
+                        self._record_startup_issue(
+                            page_path=page_path,
+                            file_hash=observation.file_hash,
+                            page_id=page_id,
+                            issue_type="startup_identity_mismatch",
+                            error_summary=(
+                                "startup file identity does not match its database path"
+                            ),
+                        )
+                    except Exception as exc:
+                        self.last_error = str(exc)[:500]
+                    continue
+                if (
+                    bound_page.get("lifecycle_status") == "active"
+                    and bound_page.get("file_hash") == observation.file_hash
+                    and self.events.find_pending_delete_for_path(page_path)
+                    is None
+                ):
+                    continue
+                if bound_id is not None and self.events.has_active_intent(bound_id):
+                    counters["failed"] += 1
+                    try:
+                        self._record_startup_issue(
+                            page_path=page_path,
+                            file_hash=observation.file_hash,
+                            page_id=bound_id,
+                            issue_type="startup_ingest_intent",
+                            error_summary=(
+                                "startup external change is blocked by an active intent"
+                            ),
+                        )
+                    except Exception as exc:
+                        self.last_error = str(exc)[:500]
+                    continue
+            elif page_id is not None and page_id in pages_by_id:
+                counters["failed"] += 1
+                try:
+                    self._record_startup_issue(
+                        page_path=page_path,
+                        file_hash=observation.file_hash,
+                        page_id=page_id,
+                        issue_type="unproven_startup_move",
+                        error_summary=(
+                            "managed identity is already assigned without unique "
+                            "startup move evidence"
+                        ),
+                    )
+                except Exception as exc:
+                    self.last_error = str(exc)[:500]
+                continue
+
+            try:
+                applied = await self._apply_startup_ingest(
+                    page_path=page_path,
+                    page_id=page_id,
+                    bound_page=bound_page,
+                    stability_poll_interval=stability_poll_interval,
+                )
+                counters["ingested"] += int(applied)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                counters["failed"] += 1
+        return counters
+
+    async def reconcile_startup(
+        self,
+        *,
+        stability_poll_interval: float = 0.05,
+        reconcile_intents: bool = True,
+    ) -> dict[str, int]:
+        if reconcile_intents:
+            _, cancellation_requested = await self._await_revision_mutation(
+                self.intent_executor.reconcile_all
+            )
+            self._propagate_cancellation(cancellation_requested)
+
+        replayed_paths, replayed, replay_failed = (
+            await self._replay_pending_occurrences(stability_poll_interval)
+        )
+        inventory = await self._inventory(stability_poll_interval)
+        result = await self._reconcile_inventory(
+            inventory,
+            replayed_paths,
+            stability_poll_interval=stability_poll_interval,
+        )
+        result["replayed"] = replayed
+        result["failed"] += replay_failed
+        result["projection_jobs"] = 0
+        projection_jobs, cancellation_requested = (
+            await self._await_revision_mutation(
+                self.revisions.ensure_projection_jobs,
+                None,
+            )
+        )
+        result["projection_jobs"] = len(projection_jobs)
+        self._propagate_cancellation(cancellation_requested)
+        return result
 
     def _managed_page_id(self, observation: FileObservationInput) -> str | None:
         if observation.content_truncated or observation.content_bytes is None:
@@ -381,16 +1210,22 @@ class VaultSyncService:
         occurrence: VaultWatchOccurrence,
         *,
         stability_poll_interval: float,
-    ) -> None:
+    ) -> bool:
         try:
             if occurrence.kind == "delete":
                 await self._queue_delete(occurrence, occurrence.detected_at)
+            elif occurrence.kind in {"rename", "relocate"}:
+                await self._replay_startup_move(
+                    occurrence,
+                    stability_poll_interval=stability_poll_interval,
+                )
             else:
                 async with self._semaphore:
                     await self._process_add_or_modify(
                         occurrence,
                         stability_poll_interval=stability_poll_interval,
                     )
+            return False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -404,6 +1239,7 @@ class VaultSyncService:
                 )
             except VaultOccurrenceConflict:
                 pass
+            return True
 
     async def handle_batch(
         self,

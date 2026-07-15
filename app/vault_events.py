@@ -285,6 +285,26 @@ class VaultEventStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def list_wiki_pages(
+        self,
+        *,
+        lifecycle_statuses: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        if not lifecycle_statuses:
+            return []
+        placeholders = ",".join("?" for _ in lifecycle_statuses)
+        with connect_app(self.settings) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT path,page_id,file_hash,semantic_hash,lifecycle_status
+                FROM wiki_pages
+                WHERE lifecycle_status IN ({placeholders})
+                ORDER BY path
+                """,
+                lifecycle_statuses,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def has_active_intent(self, page_id: str) -> bool:
         with connect_app(self.settings) as conn:
             row = conn.execute(
@@ -364,7 +384,10 @@ class VaultEventStore:
     def get_pending_delete(self, delete_id: str) -> PendingVaultDelete | None:
         with connect_app(self.settings) as conn:
             row = conn.execute(
-                "SELECT * FROM pending_vault_deletes WHERE id=?",
+                """
+                SELECT * FROM pending_vault_deletes
+                WHERE id=? AND status='pending'
+                """,
                 (delete_id,),
             ).fetchone()
         return PendingVaultDelete.from_row(row) if row is not None else None
