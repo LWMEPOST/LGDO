@@ -25,6 +25,8 @@ import type {
   SourcePreview,
   SourceRecord,
   SpaceFilter,
+  VaultReconcileJob,
+  VaultStatus,
   WikiPage,
   WikiMutationResponse,
   WikiPageContentResponse,
@@ -39,7 +41,7 @@ import {
   findSpaceFilter,
 } from "./utils/space";
 
-export function App() {
+export function App({ navigateTo = (url: string) => window.location.assign(url) }: { navigateTo?: (url: string) => void } = {}) {
   const [activeSection, setActiveSection] = useState<SectionId>("overview");
   const [searchText, setSearchText] = useState("");
   const [activeSpaceFilterId, setActiveSpaceFilterId] = useState("all");
@@ -49,6 +51,7 @@ export function App() {
   const [reviews, setReviews] = useState<ReviewItem[]>([]);
   const [gaps, setGaps] = useState<KnowledgeGap[]>([]);
   const [ragStatus, setRagStatus] = useState<RagStatus | null>(null);
+  const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [accounts, setAccounts] = useState<AccountRecord[]>([]);
   const [authLoading, setAuthLoading] = useState(true);
@@ -153,16 +156,18 @@ export function App() {
     setReviews([]);
     setGaps([]);
     setRagStatus(null);
+    setVaultStatus(null);
   }
 
   async function refresh(user = currentUser) {
-    const [nextSources, nextReports, nextPages, nextReviews, nextGaps, nextRagStatus] = await Promise.all([
+    const [nextSources, nextReports, nextPages, nextReviews, nextGaps, nextRagStatus, nextVaultStatus] = await Promise.all([
       api<SourceRecord[]>("/api/internal/sources"),
       api<IngestReport[]>("/api/internal/ingest/reports"),
       api<WikiPage[]>("/api/internal/wiki/pages"),
       api<ReviewItem[]>("/api/internal/reviews?status=pending"),
       api<KnowledgeGap[]>("/api/internal/gaps"),
       api<RagStatus>("/api/internal/rag/status"),
+      api<VaultStatus>("/api/internal/vault/status").catch(() => null),
     ]);
     setSources(nextSources);
     setReports(nextReports);
@@ -170,6 +175,7 @@ export function App() {
     setReviews(nextReviews);
     setGaps(nextGaps);
     setRagStatus(nextRagStatus);
+    setVaultStatus(nextVaultStatus);
     if (user?.role === "admin" || user?.acl_tags?.includes("*")) {
       setAccounts(await api<AccountRecord[]>("/api/internal/accounts"));
     }
@@ -292,6 +298,17 @@ export function App() {
     });
     showToast("已生成知识缺口");
     await refresh();
+  }
+
+  async function openInObsidian(path: string) {
+    const result = await api<{ url: string }>(`/api/internal/wiki/pages/${encodePath(path)}/obsidian-link`);
+    navigateTo(result.url);
+  }
+
+  async function requestVaultReconcile() {
+    const job = await api<VaultReconcileJob>("/api/internal/vault/reconcile", { method: "POST" });
+    setVaultStatus((current) => current ? { ...current, reconcile: job } : null);
+    showToast(`Vault 对账已进入${job.status}`);
   }
 
   async function loadPage(path: string) {
@@ -521,6 +538,14 @@ export function App() {
     [scopedSources, scopedReports, scopedPages, scopedGaps, reviews],
   );
 
+  if (authLoading) {
+    return <div className="login-shell"><section className="login-panel"><h1>正在检查登录状态</h1></section></div>;
+  }
+
+  if (!currentUser) {
+    return <LoginView login={login} error={authError} />;
+  }
+
   const content = {
     overview: (
       <Overview
@@ -538,7 +563,7 @@ export function App() {
     ingest: (
       <IngestTask
         scanForm={scanForm}
-        setScanForm={setScanForm}
+        setScanForm={(form) => setScanForm((current) => ({ ...current, ...form }))}
         scan={scan}
         compileWiki={compileWiki}
         reports={reports}
@@ -564,8 +589,36 @@ export function App() {
         showToast={showToast}
       />
     ),
-    wiki: <WikiTask pages={scopedPages} activeSpaceFilter={activeSpaceFilter} clearSpaceFilter={clearSpaceFilter} editor={editor} setEditor={setEditor} loadPage={loadPage} savePage={savePage} markPageStale={markPageStale} showToast={showToast} />,
-    qa: <QaTask askForm={askForm} setAskForm={setAskForm} ask={ask} answer={answer} feedback={feedback} setFeedback={setFeedback} createGap={createGap} showToast={showToast} currentUser={currentUser} />,
+    wiki: (
+      <WikiTask
+        pages={scopedPages}
+        activeSpaceFilter={activeSpaceFilter}
+        clearSpaceFilter={clearSpaceFilter}
+        editor={editor}
+        setEditor={setEditor}
+        loadPage={loadPage}
+        savePage={savePage}
+        markPageStale={markPageStale}
+        openInObsidian={openInObsidian}
+        requestReconcile={requestVaultReconcile}
+        vaultStatus={vaultStatus}
+        currentUser={currentUser}
+        showToast={showToast}
+      />
+    ),
+    qa: (
+      <QaTask
+        askForm={askForm}
+        setAskForm={(form) => setAskForm((current) => ({ ...current, ...form }))}
+        ask={ask}
+        answer={answer}
+        feedback={feedback}
+        setFeedback={(nextFeedback) => setFeedback((current) => ({ ...current, ...nextFeedback }))}
+        createGap={createGap}
+        showToast={showToast}
+        currentUser={currentUser}
+      />
+    ),
     gaps: <GapsTask gaps={scopedGaps} updateGap={updateGap} showToast={showToast} />,
     reviews: <ReviewsTask reviews={reviews} loadPage={loadPage} updateReview={updateReview} showToast={showToast} />,
     accounts: (
@@ -578,14 +631,6 @@ export function App() {
       />
     ),
   }[activeSection];
-
-  if (authLoading) {
-    return <div className="login-shell"><section className="login-panel"><h1>正在检查登录状态</h1></section></div>;
-  }
-
-  if (!currentUser) {
-    return <LoginView login={login} error={authError} />;
-  }
 
   return (
     <Layout

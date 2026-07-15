@@ -1633,6 +1633,123 @@ th {
   }
 }
 
+.sync-status {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  border-left: 3px solid var(--success);
+  padding: 8px 0 8px 9px;
+  background: transparent;
+}
+
+.sync-status.unknown {
+  border-left-color: var(--line-strong);
+  color: var(--muted);
+}
+
+.sync-status.unknown .sync-status-copy > strong {
+  color: var(--muted);
+}
+
+.sync-status.warn {
+  border-left-color: var(--warn);
+}
+
+.sync-status.warn .sync-status-copy > strong {
+  color: var(--warn);
+}
+
+.sync-status-copy {
+  min-width: 0;
+  flex: 1 1 180px;
+}
+
+.sync-status-copy > strong {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.sync-status-metrics {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  margin-top: 2px;
+  color: var(--subtle);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.sync-status-metrics span {
+  overflow-wrap: anywhere;
+}
+
+button.icon-button {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  flex: 0 0 32px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius, 6px);
+  padding: 0;
+  color: var(--muted);
+  background: #ffffff;
+  box-shadow: none;
+}
+
+button.icon-button:hover:not(:disabled) {
+  border-color: #b8c8ed;
+  color: var(--accent);
+  background: var(--accent-soft);
+  transform: none;
+}
+
+button.icon-button:active {
+  transform: none;
+}
+
+button.icon-button:focus-visible {
+  outline: 2px solid rgba(51, 112, 255, 0.42);
+  outline-offset: 2px;
+}
+
+button.icon-button:disabled {
+  border-color: var(--line);
+  color: var(--subtle);
+  background: var(--bg);
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.editor-path-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: end;
+  gap: 8px;
+}
+
+@media (max-width: 760px) {
+  .sync-status {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .sync-status > .icon-button {
+    margin-left: auto;
+  }
+}
+
 /* Workbench Calm refresh */
 :root {
   --bg: #f3f5f8;

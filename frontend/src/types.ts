@@ -48,6 +48,32 @@ export interface WikiPage {
   pending_write_intent_id?: string | null;
   write_in_progress?: boolean;
   write_intent_id?: string | null;
+  sync_error?: string | null;
+}
+
+export interface VaultReconcileJob {
+  job_id: string;
+  status: string;
+  result?: Record<string, number> | null;
+  error_summary?: string | null;
+}
+
+export interface VaultStatus {
+  configured: boolean;
+  running: boolean;
+  clean: boolean;
+  degraded: boolean;
+  last_event_at?: string | null;
+  last_error?: string | null;
+  pending_occurrences: number;
+  failed_occurrences: number;
+  pending_deletes: number;
+  open_issues: number;
+  invalid_pages: number;
+  projection_backlog: number;
+  projection: Record<string, unknown>;
+  obsidian: Record<string, unknown>;
+  reconcile?: VaultReconcileJob | null;
 }
 
 export interface ReviewItem {
