@@ -232,3 +232,48 @@ def test_vault_status_falls_back_without_state_or_absolute_path_leak(
         "drifted": [],
         "vault_name": settings.effective_obsidian_vault_name,
     }
+
+
+def test_vault_status_sanitizes_failed_reconcile_paths_but_admin_get_does_not(
+    configured_client,
+    monkeypatch,
+):
+    settings, client = configured_client
+    store = app.state.vault_sync.events
+    fixed_uuid = type("FixedUuid", (), {"hex": "f" * 32})()
+    monkeypatch.setattr("app.vault_events.uuid.uuid4", lambda: fixed_uuid)
+    job = store.request_reconcile("admin")
+    owner = "status-path-test"
+    now = datetime.now(timezone.utc)
+    assert store.claim_reconcile(
+        job.id,
+        owner,
+        now=now,
+        lease_seconds=30,
+    )
+    vault_backslash = str(settings.vault_path.resolve())
+    vault_forward = vault_backslash.replace("\\", "/")
+    error = (
+        f"inventory failed for {vault_backslash}\\wiki\\private\\secret.md; "
+        "recovery backup at "
+        f"{vault_forward}/.lgdo/obsidian-backups/job-1/page.md"
+    )
+    assert store.fail_reconcile(job.id, owner, error)
+    assert store.latest_reconcile().id == job.id
+
+    status = client.get("/api/internal/vault/status")
+    admin_get = client.get(f"/api/internal/vault/reconcile/{job.id}")
+
+    assert status.status_code == 200
+    summary = status.json()["reconcile"]["error_summary"]
+    assert "inventory failed" in summary
+    assert "recovery backup" in summary
+    assert vault_backslash not in summary
+    assert vault_forward not in summary
+    assert "wiki/private/secret.md" not in summary.replace("\\", "/")
+    assert "obsidian-backups" not in summary
+    assert vault_forward not in status.text
+    assert vault_backslash.replace("\\", "\\\\") not in status.text
+
+    assert admin_get.status_code == 200
+    assert admin_get.json()["error_summary"] == error

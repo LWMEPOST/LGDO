@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from typing import NoReturn
@@ -136,10 +137,17 @@ def _safe_vault_error(value: object, vault_path: Path) -> str | None:
     if value is None:
         return None
     summary = str(value)[:500]
-    candidates = {str(vault_path), str(vault_path.resolve())}
-    for candidate in candidates:
-        summary = summary.replace(candidate, "<vault>")
-        summary = summary.replace(candidate.replace("\\", "/"), "<vault>")
+    resolved = str(vault_path.resolve())
+    candidates = {resolved, resolved.replace("\\", "/")}
+    if vault_path.is_absolute():
+        configured = str(vault_path)
+        candidates.update({configured, configured.replace("\\", "/")})
+    for candidate in sorted(candidates, key=len, reverse=True):
+        path_pattern = re.compile(
+            re.escape(candidate) + r"(?:(?:[\\/])[^;,\r\n]*)?",
+            flags=re.IGNORECASE,
+        )
+        summary = path_pattern.sub("<vault>", summary)
     return summary
 
 
@@ -239,6 +247,10 @@ def vault_status_endpoint(
         job = active or event_store.latest_reconcile()
         if job is not None:
             reconcile = _vault_reconcile_payload(job)
+            reconcile["error_summary"] = _safe_vault_error(
+                reconcile["error_summary"],
+                settings.vault_path,
+            )
             active_reconcile = job.status in {"queued", "running"}
             reconcile_failed = job.status == "failed"
     except Exception:
