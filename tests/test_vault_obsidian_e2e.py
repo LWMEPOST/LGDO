@@ -365,7 +365,6 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
 
     await asyncio.wait_for(worker.start(), timeout=POLL_TIMEOUT_SECONDS)
     await asyncio.wait_for(service.start(), timeout=POLL_TIMEOUT_SECONDS)
-    await asyncio.sleep(0.1)
     try:
         old_target.parent.mkdir(parents=True, exist_ok=True)
         add_started = loop.time()
@@ -590,7 +589,6 @@ async def test_real_watcher_ignores_managed_exact_byte_writeback_loop(
     loop = asyncio.get_running_loop()
 
     await asyncio.wait_for(service.start(), timeout=POLL_TIMEOUT_SECONDS)
-    await asyncio.sleep(0.1)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         settle_started = loop.time()

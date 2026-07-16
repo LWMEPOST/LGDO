@@ -315,6 +315,218 @@ async def test_adapter_survives_normalization_failure_and_processes_next_batch(
 
 
 @pytest.mark.asyncio
+async def test_adapter_start_marks_ready_after_first_anext_has_started(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    ready_states = []
+    anext_task = None
+    adapter = None
+
+    class BlockingWatch:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            nonlocal anext_task
+            anext_task = asyncio.current_task()
+            ready_states.append(adapter._ready.is_set())
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            raise StopAsyncIteration
+
+    def blocking_watch(*_args, **_kwargs):
+        return BlockingWatch()
+
+    async def handler(_events):
+        pass
+
+    adapter = VaultWatchAdapter(
+        Settings(_env_file=None, vault_path=vault),
+        handler,
+        watch_factory=blocking_watch,
+    )
+
+    await adapter.start()
+    assert entered.is_set()
+    await adapter.stop()
+
+    assert ready_states == [False]
+    assert cancelled.is_set()
+    assert anext_task is not None and anext_task.done()
+    assert adapter._task is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_propagates_failure_from_first_anext(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    entered = asyncio.Event()
+
+    class FailingWatch:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            entered.set()
+            raise RuntimeError("first iteration failed")
+
+    def failing_watch(*_args, **_kwargs):
+        return FailingWatch()
+
+    async def handler(_events):
+        pass
+
+    adapter = VaultWatchAdapter(
+        Settings(_env_file=None, vault_path=vault),
+        handler,
+        watch_factory=failing_watch,
+    )
+
+    with pytest.raises(RuntimeError, match="first iteration failed"):
+        await adapter.start()
+
+    assert entered.is_set()
+    assert adapter._task is None
+    assert not adapter._ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_replaces_watcher_that_ended_after_ready(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    first_entered = asyncio.Event()
+    finish_first = asyncio.Event()
+    second_entered = asyncio.Event()
+    second_stopped = asyncio.Event()
+    factory_calls = 0
+
+    async def first_watch():
+        first_entered.set()
+        await finish_first.wait()
+        return
+        yield set()
+
+    async def second_watch():
+        try:
+            second_entered.set()
+            await asyncio.Future()
+            yield set()
+        finally:
+            second_stopped.set()
+
+    def watch_factory(*_args, **_kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        return first_watch() if factory_calls == 1 else second_watch()
+
+    async def handler(_events):
+        pass
+
+    adapter = VaultWatchAdapter(
+        Settings(_env_file=None, vault_path=vault),
+        handler,
+        watch_factory=watch_factory,
+    )
+
+    await adapter.start()
+    assert first_entered.is_set()
+    first_task = adapter._task
+    assert first_task is not None
+    finish_first.set()
+    await asyncio.wait_for(asyncio.shield(first_task), timeout=1)
+
+    await adapter.start()
+    try:
+        assert factory_calls == 2
+        assert second_entered.is_set()
+        assert adapter._task is not None
+        assert adapter._task is not first_task
+        assert not adapter._task.done()
+    finally:
+        await adapter.stop()
+
+    assert second_stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_rejects_watcher_that_ends_during_startup(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+
+    async def empty_watch():
+        return
+        yield set()
+
+    def watch_factory(*_args, **_kwargs):
+        return empty_watch()
+
+    async def handler(_events):
+        pass
+
+    adapter = VaultWatchAdapter(
+        Settings(_env_file=None, vault_path=vault),
+        handler,
+        watch_factory=watch_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="watcher stopped during startup"):
+        await adapter.start()
+
+    assert adapter._task is None
+    assert not adapter._ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_adapter_accepts_anext_returning_future(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "wiki").mkdir(parents=True)
+    loop = asyncio.get_running_loop()
+    first_batch = None
+    closed = asyncio.Event()
+
+    class FutureWatch:
+        def __aiter__(self):
+            return self
+
+        def __anext__(self):
+            nonlocal first_batch
+            first_batch = loop.create_future()
+            return first_batch
+
+        async def aclose(self):
+            closed.set()
+
+    def future_watch(*_args, **_kwargs):
+        return FutureWatch()
+
+    async def handler(_events):
+        pass
+
+    adapter = VaultWatchAdapter(
+        Settings(_env_file=None, vault_path=vault),
+        handler,
+        watch_factory=future_watch,
+    )
+
+    try:
+        await adapter.start()
+        assert first_batch is not None
+        assert not first_batch.done()
+    finally:
+        await adapter.stop()
+
+    assert first_batch is not None and first_batch.cancelled()
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_adapter_start_recovers_after_immediate_watcher_failure(tmp_path):
     vault = tmp_path / "vault"
     (vault / "wiki").mkdir(parents=True)

@@ -61,53 +61,72 @@ class WikiRagProjector:
         try:
             rows = self.write_physical_rows(job, worker_id)
         except ProjectionSuperseded:
-            self._finish_superseded(job, worker_id)
+            try:
+                self._finish_superseded(job, worker_id)
+            except ProjectionLeaseLost:
+                self.cleanup_epoch(str(job.page_id), job.projection_epoch)
+                raise
             raise
 
         superseded = False
-        with connect_app_write(self.settings) as conn:
-            page = row_to_dict(
-                conn.execute(
-                    """
-                    SELECT current_revision_id, projection_epoch, lifecycle_status
-                    FROM wiki_pages WHERE page_id=?
-                    """,
-                    (job.page_id,),
-                ).fetchone()
-            )
-            if not self._page_matches_job(page, job):
-                if not self.outbox.finish_claimed(
-                    conn,
-                    job_id=job.id,
-                    worker_id=worker_id,
-                    status="superseded",
-                    last_error="desired revision or epoch changed",
-                ):
-                    raise ProjectionLeaseLost(job.id)
-                superseded = True
-            else:
-                updated = conn.execute(
-                    """
-                    UPDATE wiki_pages
-                    SET rag_visible_revision_id=?, rag_visible_epoch=?
-                    WHERE page_id=? AND current_revision_id=?
-                      AND projection_epoch=? AND lifecycle_status='active'
-                    """,
-                    (
-                        job.revision_id,
-                        job.projection_epoch,
-                        job.page_id,
-                        job.revision_id,
-                        job.projection_epoch,
-                    ),
+        try:
+            with connect_app_write(self.settings) as conn:
+                suffix = (
+                    " FOR UPDATE"
+                    if self.settings.database_backend == "postgres"
+                    else ""
                 )
-                if updated.rowcount != 1 or not self.outbox.finish_claimed(
-                    conn,
-                    job_id=job.id,
-                    worker_id=worker_id,
-                    status="succeeded",
-                ):
-                    raise ProjectionLeaseLost(job.id)
+                page = row_to_dict(
+                    conn.execute(
+                        """
+                        SELECT current_revision_id, projection_epoch, lifecycle_status
+                        FROM wiki_pages WHERE page_id=?
+                        """
+                        + suffix,
+                        (job.page_id,),
+                    ).fetchone()
+                )
+                if not self._page_matches_job(page, job):
+                    if not self.outbox.finish_claimed(
+                        conn,
+                        job_id=job.id,
+                        worker_id=worker_id,
+                        status="superseded",
+                        last_error="desired revision or epoch changed",
+                    ):
+                        raise ProjectionLeaseLost(job.id)
+                    self._cleanup_epoch(
+                        conn,
+                        str(job.page_id),
+                        job.projection_epoch,
+                    )
+                    superseded = True
+                else:
+                    updated = conn.execute(
+                        """
+                        UPDATE wiki_pages
+                        SET rag_visible_revision_id=?, rag_visible_epoch=?
+                        WHERE page_id=? AND current_revision_id=?
+                          AND projection_epoch=? AND lifecycle_status='active'
+                        """,
+                        (
+                            job.revision_id,
+                            job.projection_epoch,
+                            job.page_id,
+                            job.revision_id,
+                            job.projection_epoch,
+                        ),
+                    )
+                    if updated.rowcount != 1 or not self.outbox.finish_claimed(
+                        conn,
+                        job_id=job.id,
+                        worker_id=worker_id,
+                        status="succeeded",
+                    ):
+                        raise ProjectionLeaseLost(job.id)
+        except ProjectionLeaseLost:
+            self.cleanup_epoch(str(job.page_id), job.projection_epoch)
+            raise
 
         if superseded:
             raise ProjectionSuperseded(job.id)
@@ -150,23 +169,67 @@ class WikiRagProjector:
     def cleanup_epoch(self, page_id: str, projection_epoch: int) -> int:
         init_app_db(self.settings)
         with connect_app_write(self.settings) as conn:
-            suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
-            running = conn.execute(
+            return self._cleanup_epoch(conn, page_id, projection_epoch)
+
+    def _cleanup_epoch(
+        self,
+        conn: Any,
+        page_id: str,
+        projection_epoch: int,
+    ) -> int:
+        suffix = " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+        page = row_to_dict(
+            conn.execute(
                 """
-                SELECT id FROM knowledge_projection_jobs
-                WHERE page_id=? AND projection_epoch=? AND status='running'
-                LIMIT 1
+                SELECT current_revision_id,projection_epoch,lifecycle_status,
+                       rag_visible_revision_id,rag_visible_epoch
+                FROM wiki_pages WHERE page_id=?
                 """
                 + suffix,
-                (page_id, projection_epoch),
+                (page_id,),
             ).fetchone()
-            if running is not None:
-                return 0
-            deleted = conn.execute(
-                "DELETE FROM wiki_chunks WHERE page_id=? AND projection_epoch=?",
-                (page_id, projection_epoch),
+        )
+        owner_rows = conn.execute(
+            """
+            SELECT status,operation,revision_id
+            FROM knowledge_projection_jobs
+            WHERE target='rag' AND page_id=? AND projection_epoch=?
+              AND status IN ('running','succeeded')
+            """
+            + suffix,
+            (page_id, projection_epoch),
+        ).fetchall()
+        current_epoch = bool(
+            page is not None
+            and page.get("lifecycle_status") == "active"
+            and int(page.get("projection_epoch") or 0) == projection_epoch
+        )
+        visible_owner = bool(
+            current_epoch
+            and page.get("current_revision_id") is not None
+            and page.get("rag_visible_revision_id") == page.get("current_revision_id")
+            and int(page.get("rag_visible_epoch") or 0) == projection_epoch
+        )
+        succeeded_owner = bool(
+            current_epoch
+            and any(
+                row["status"] == "succeeded"
+                and row["operation"] == "upsert"
+                and row["revision_id"] == page.get("current_revision_id")
+                for row in owner_rows
             )
-            return int(deleted.rowcount or 0)
+        )
+        if (
+            visible_owner
+            or succeeded_owner
+            or any(row["status"] == "running" for row in owner_rows)
+        ):
+            return 0
+        deleted = conn.execute(
+            "DELETE FROM wiki_chunks WHERE page_id=? AND projection_epoch=?",
+            (page_id, projection_epoch),
+        )
+        return int(deleted.rowcount or 0)
 
     def _load_snapshot(self, job: ProjectionJob) -> _WikiRevisionSnapshot:
         with connect_app(self.settings) as conn:
@@ -289,6 +352,13 @@ class WikiRagProjector:
 
     def _finish_superseded(self, job: ProjectionJob, worker_id: str) -> None:
         with connect_app_write(self.settings) as conn:
+            suffix = (
+                " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+            )
+            conn.execute(
+                "SELECT page_id FROM wiki_pages WHERE page_id=?" + suffix,
+                (job.page_id,),
+            ).fetchone()
             if not self.outbox.finish_claimed(
                 conn,
                 job_id=job.id,
@@ -297,6 +367,11 @@ class WikiRagProjector:
                 last_error="desired revision or epoch changed",
             ):
                 raise ProjectionLeaseLost(job.id)
+            self._cleanup_epoch(
+                conn,
+                str(job.page_id),
+                job.projection_epoch,
+            )
 
     @staticmethod
     def _page_matches_job(page: dict[str, Any] | None, job: ProjectionJob) -> bool:

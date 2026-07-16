@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -185,10 +186,56 @@ def test_lost_old_epoch_cannot_flip_or_delete_new_epoch(projector, seeded_page):
 
     with pytest.raises(ProjectionSuperseded):
         projector.project(old, worker_id="old-owner")
-    projector.cleanup_epoch(old.page_id, old.projection_epoch)
 
     assert seeded_page.visible() == ("wrev_new", 5)
     assert seeded_page.chunk_epochs() == [5]
+
+
+def test_old_physical_write_released_after_new_epoch_wins_keeps_only_new_rows(
+    projector, seeded_page, monkeypatch
+):
+    old = seeded_page.job(revision_id="wrev_old", projection_epoch=20)
+    new = seeded_page.job(revision_id="wrev_new", projection_epoch=21)
+    seeded_page.set_desired(old.revision_id, old.projection_epoch)
+
+    rows_ready = threading.Event()
+    release_old_write = threading.Event()
+    old_errors = []
+    original_write = projector._write_physical_rows
+
+    def block_old_epoch(rows):
+        if rows and rows[0]["projection_epoch"] == old.projection_epoch:
+            rows_ready.set()
+            if not release_old_write.wait(timeout=2):
+                raise AssertionError("test did not release the old epoch write")
+        return original_write(rows)
+
+    monkeypatch.setattr(projector, "_write_physical_rows", block_old_epoch)
+
+    def project_old_epoch():
+        try:
+            projector.project(old, worker_id="old-owner")
+        except Exception as exc:
+            old_errors.append(exc)
+
+    old_thread = threading.Thread(target=project_old_epoch, daemon=True)
+    old_thread.start()
+    assert rows_ready.wait(timeout=2)
+
+    try:
+        seeded_page.set_desired(new.revision_id, new.projection_epoch)
+        projector.project(new, worker_id="new-owner")
+        assert seeded_page.visible() == (new.revision_id, new.projection_epoch)
+        assert seeded_page.chunk_epochs() == [new.projection_epoch]
+    finally:
+        release_old_write.set()
+
+    old_thread.join(timeout=2)
+    assert not old_thread.is_alive()
+    assert len(old_errors) == 1
+    assert isinstance(old_errors[0], ProjectionSuperseded)
+    assert seeded_page.visible() == (new.revision_id, new.projection_epoch)
+    assert seeded_page.chunk_epochs() == [new.projection_epoch]
 
 
 def test_same_revision_new_epoch_requires_new_rows(projector, seeded_page):
@@ -231,7 +278,7 @@ def test_projection_copies_source_ids_from_immutable_revision(projector, seeded_
     assert json.loads(source_ids_json) == ["src_new", "src_shared"]
 
 
-def test_lost_lease_rolls_back_late_watermark_update(
+def test_lost_lease_rolls_back_late_watermark_and_cleans_epoch(
     projection_settings, seeded_page
 ):
     outbox = FakeOutbox(finish_result=False)
@@ -242,7 +289,7 @@ def test_lost_lease_rolls_back_late_watermark_update(
         projector.project(seeded_page.job("wrev_new", 11), "old-owner")
 
     assert seeded_page.visible() == (None, None)
-    assert seeded_page.chunk_epochs() == [11]
+    assert seeded_page.chunk_epochs() == []
 
 
 def test_cleanup_keeps_epoch_referenced_by_running_job(projector, seeded_page):
@@ -279,6 +326,46 @@ def test_cleanup_keeps_epoch_referenced_by_running_job(projector, seeded_page):
 
     assert projector.cleanup_epoch(job.page_id, job.projection_epoch) == 0
     assert seeded_page.chunk_epochs() == [12]
+
+
+def test_cleanup_ignores_running_gbrain_job_for_old_rag_epoch(
+    projector, seeded_page
+):
+    old_epoch = 14
+    seeded_page.set_desired("wrev_old", old_epoch)
+    old_job = seeded_page.job("wrev_old", old_epoch)
+    projector.write_physical_rows(old_job, "rag-owner")
+    seeded_page.set_desired("wrev_new", old_epoch + 1)
+    with connect_app(seeded_page.settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO knowledge_projection_jobs(
+              id,idempotency_key,target,operation,page_id,revision_id,projection_epoch,
+              payload_json,status,attempts,available_at,lease_owner,lease_expires_at,
+              created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "pjob-gbrain-old-epoch",
+                "gbrain:upsert:old-epoch",
+                "gbrain",
+                "upsert",
+                old_job.page_id,
+                old_job.revision_id,
+                old_job.projection_epoch,
+                "{}",
+                "running",
+                1,
+                "t0",
+                "gbrain-owner",
+                "t1",
+                "t0",
+                "t0",
+            ),
+        )
+
+    assert projector.cleanup_epoch(old_job.page_id, old_job.projection_epoch) == 1
+    assert seeded_page.chunk_epochs() == []
 
 
 def test_visible_loader_requires_current_revision_and_epoch(projector, seeded_page):

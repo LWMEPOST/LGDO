@@ -208,61 +208,104 @@ class VaultWatchAdapter:
         self._ready = asyncio.Event()
 
     async def run(self, max_batches: int | None = None) -> None:
-        self._ready.set()
         watcher = self.watch_factory(
             self.settings.vault_path / "wiki",
             debounce=self.settings.vault_watch_debounce_ms,
             step=min(250, self.settings.vault_watch_debounce_ms),
             recursive=True,
         )
+        iterator = watcher.__aiter__()
+        first_batch_task: asyncio.Task[set[tuple[Change, str]]] | None = None
 
-        if max_batches == 0:
-            return
+        async def wait_for_first_batch() -> set[tuple[Change, str]]:
+            return await anext(iterator)
 
-        handled = 0
-        async for changes in watcher:
-            try:
-                events = normalize_watchfiles_batch(
-                    changes,
-                    self.settings.vault_path,
-                )
-                if not events:
-                    continue
-                await self.handler(events)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.error_handler(exc)
-
-            handled += 1
-            if max_batches is not None and handled >= max_batches:
+        try:
+            if max_batches == 0:
+                self._ready.set()
                 return
+
+            first_batch_task = asyncio.create_task(
+                wait_for_first_batch(),
+                name="vault-watchfiles-first-batch",
+            )
+            await asyncio.sleep(0)
+            if first_batch_task.done():
+                changes = await first_batch_task
+                self._ready.set()
+            else:
+                self._ready.set()
+                changes = await first_batch_task
+
+            handled = 0
+            while True:
+                try:
+                    events = normalize_watchfiles_batch(
+                        changes,
+                        self.settings.vault_path,
+                    )
+                    if events:
+                        await self.handler(events)
+                        handled += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.error_handler(exc)
+                    handled += 1
+
+                if max_batches is not None and handled >= max_batches:
+                    return
+                changes = await anext(iterator)
+        except StopAsyncIteration:
+            return
+        finally:
+            if first_batch_task is not None and not first_batch_task.done():
+                first_batch_task.cancel()
+                await asyncio.gather(first_batch_task, return_exceptions=True)
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
+
+    async def _wait_until_ready_or_done(self, task: asyncio.Task[None]) -> None:
+        ready_wait = asyncio.create_task(self._ready.wait())
+        try:
+            await asyncio.wait(
+                {task, ready_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task.done():
+                await task
+            else:
+                await ready_wait
+        finally:
+            if not ready_wait.done():
+                ready_wait.cancel()
+            await asyncio.gather(ready_wait, return_exceptions=True)
 
     async def start(self) -> None:
         task = self._task
-        if task is not None:
-            if not task.done():
-                await self._ready.wait()
-                return
+        if task is not None and task.done():
             try:
                 await task
             finally:
                 if self._task is task:
                     self._task = None
                     self._ready.clear()
+            task = None
 
-        self._ready.clear()
-        task = asyncio.create_task(self.run(), name="vault-watchfiles")
-        self._task = task
-        await self._ready.wait()
-        await asyncio.sleep(0)
-        if task.done():
-            try:
-                await task
-            finally:
-                if self._task is task:
-                    self._task = None
-                    self._ready.clear()
+        if task is None:
+            self._ready.clear()
+            task = asyncio.create_task(self.run(), name="vault-watchfiles")
+            self._task = task
+
+        try:
+            await self._wait_until_ready_or_done(task)
+            if task.done():
+                raise RuntimeError("vault watcher stopped during startup")
+        finally:
+            if task.done() and self._task is task:
+                self._task = None
+                self._ready.clear()
 
     async def stop(self) -> None:
         task = self._task

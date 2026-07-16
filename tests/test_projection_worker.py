@@ -825,6 +825,462 @@ def test_worker_rejects_a_late_rag_result_after_lease_loss(settings, monkeypatch
     )
 
 
+@pytest.mark.asyncio
+async def test_late_old_epoch_upsert_is_cleaned_after_delete_wins(
+    settings, monkeypatch
+):
+    outbox = ProjectionOutbox(settings)
+    page_id = "page-late-delete"
+    revision_id = "wrev-late-delete"
+    old_epoch = 1
+    delete_epoch = 2
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,projection_epoch,
+              lifecycle_status,rag_visible_revision_id,rag_visible_epoch
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/late-delete.md",
+                page_id,
+                "product",
+                "policy",
+                "Late delete",
+                "[]",
+                "draft",
+                "t0",
+                "t0",
+                revision_id,
+                old_epoch,
+                "active",
+                None,
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_page_revisions(
+              id,page_id,page_path,revision_number,file_hash,semantic_hash,
+              content,origin,base_revision_id,source_ids_json,actor,note,
+              metadata_json,idempotency_key,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                revision_id,
+                page_id,
+                "wiki/product/late-delete.md",
+                1,
+                "hash-late-delete",
+                "semantic-late-delete",
+                "# Late delete\n\nThis stale content must not survive deletion.",
+                "manual",
+                None,
+                "[]",
+                "tester",
+                None,
+                "{}",
+                "test:late-delete",
+                "t0",
+            ),
+        )
+        old_job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="upsert",
+            page_id=page_id,
+            revision_id=revision_id,
+            projection_epoch=old_epoch,
+            payload={"path": "wiki/product/late-delete.md"},
+        )
+
+    rows_ready = threading.Event()
+    release_old_write = threading.Event()
+    original_write = projection_worker.WikiRagProjector._write_physical_rows
+
+    def block_before_physical_write(projector, rows):
+        rows_ready.set()
+        if not release_old_write.wait(timeout=2):
+            raise AssertionError("test did not release the stale physical write")
+        return original_write(projector, rows)
+
+    monkeypatch.setattr(
+        projection_worker.WikiRagProjector,
+        "_write_physical_rows",
+        block_before_physical_write,
+    )
+    old_worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+    old_run = asyncio.create_task(old_worker.run_once("rag"))
+    assert await asyncio.to_thread(rows_ready.wait, 2)
+
+    with connect_app_write(settings) as conn:
+        assert outbox.supersede_stale(conn, page_id, delete_epoch) == 1
+        conn.execute(
+            """
+            UPDATE wiki_pages
+            SET projection_epoch=?,lifecycle_status='deleted'
+            WHERE page_id=?
+            """,
+            (delete_epoch, page_id),
+        )
+        delete_job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="delete",
+            page_id=page_id,
+            revision_id=None,
+            projection_epoch=delete_epoch,
+            payload={"path": "wiki/product/late-delete.md", "reason": "deleted"},
+        )
+
+    delete_worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+    try:
+        delete_result = await delete_worker.run_once("rag")
+    finally:
+        release_old_write.set()
+    old_result = await old_run
+
+    with connect_app(settings) as conn:
+        old_job = conn.execute(
+            "SELECT status FROM knowledge_projection_jobs WHERE id=?",
+            (old_job_id,),
+        ).fetchone()
+        delete_job = conn.execute(
+            "SELECT status FROM knowledge_projection_jobs WHERE id=?",
+            (delete_job_id,),
+        ).fetchone()
+        page = conn.execute(
+            """
+            SELECT lifecycle_status,projection_epoch,rag_visible_revision_id,
+                   rag_visible_epoch
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (page_id,),
+        ).fetchone()
+        old_chunks = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_chunks
+            WHERE page_id=? AND projection_epoch=?
+            """,
+            (page_id, old_epoch),
+        ).fetchone()[0]
+
+    assert (delete_result.claimed, delete_result.succeeded) == (1, 1)
+    assert (old_result.claimed, old_result.succeeded, old_result.failed) == (1, 0, 0)
+    assert old_job["status"] == "superseded"
+    assert delete_job["status"] == "succeeded"
+    assert tuple(page) == ("deleted", delete_epoch, None, None)
+    assert old_chunks == 0
+
+
+@pytest.mark.asyncio
+async def test_lost_old_owner_does_not_delete_same_epoch_winner_chunks(
+    settings, monkeypatch
+):
+    outbox = ProjectionOutbox(settings)
+    page_id = "page-same-epoch-takeover"
+    revision_id = "wrev-same-epoch-takeover"
+    epoch = 1
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,projection_epoch,
+              lifecycle_status,rag_visible_revision_id,rag_visible_epoch
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/same-epoch-takeover.md",
+                page_id,
+                "product",
+                "policy",
+                "Same epoch takeover",
+                "[]",
+                "draft",
+                "t0",
+                "t0",
+                revision_id,
+                epoch,
+                "active",
+                None,
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_page_revisions(
+              id,page_id,page_path,revision_number,file_hash,semantic_hash,
+              content,origin,base_revision_id,source_ids_json,actor,note,
+              metadata_json,idempotency_key,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                revision_id,
+                page_id,
+                "wiki/product/same-epoch-takeover.md",
+                1,
+                "hash-same-epoch-takeover",
+                "semantic-same-epoch-takeover",
+                "# Same epoch takeover\n\nThe winning chunks must remain.",
+                "manual",
+                None,
+                "[]",
+                "tester",
+                None,
+                "{}",
+                "test:same-epoch-takeover",
+                "t0",
+            ),
+        )
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="upsert",
+            page_id=page_id,
+            revision_id=revision_id,
+            projection_epoch=epoch,
+            payload={"path": "wiki/product/same-epoch-takeover.md"},
+        )
+
+    old_rows_written = threading.Event()
+    release_old_owner = threading.Event()
+    old_worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+    original_write = projection_worker.WikiRagProjector.write_physical_rows
+
+    def pause_old_owner_after_write(projector, job, worker_id):
+        rows = original_write(projector, job, worker_id)
+        if worker_id == old_worker.worker_id:
+            old_rows_written.set()
+            if not release_old_owner.wait(timeout=2):
+                raise AssertionError("test did not release the old projection owner")
+        return rows
+
+    monkeypatch.setattr(
+        projection_worker.WikiRagProjector,
+        "write_physical_rows",
+        pause_old_owner_after_write,
+    )
+    old_run = asyncio.create_task(old_worker.run_once("rag"))
+    assert await asyncio.to_thread(old_rows_written.wait, 2)
+
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            UPDATE knowledge_projection_jobs
+            SET lease_expires_at=?
+            WHERE id=? AND status='running' AND lease_owner=?
+            """,
+            ((NOW - timedelta(seconds=1)).isoformat(), job_id, old_worker.worker_id),
+        )
+
+    new_worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+    try:
+        new_result = await new_worker.run_once("rag")
+        with connect_app(settings) as conn:
+            winner_job = conn.execute(
+                "SELECT status,attempts FROM knowledge_projection_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            visible_before_release = conn.execute(
+                """
+                SELECT rag_visible_revision_id,rag_visible_epoch
+                FROM wiki_pages WHERE page_id=?
+                """,
+                (page_id,),
+            ).fetchone()
+            chunks_before_release = conn.execute(
+                """
+                SELECT COUNT(*) FROM wiki_chunks
+                WHERE page_id=? AND projection_epoch=?
+                """,
+                (page_id, epoch),
+            ).fetchone()[0]
+        assert (new_result.claimed, new_result.succeeded) == (1, 1)
+        assert tuple(winner_job) == ("succeeded", 2)
+        assert tuple(visible_before_release) == (revision_id, epoch)
+        assert chunks_before_release == 1
+    finally:
+        release_old_owner.set()
+
+    old_result = await old_run
+    with connect_app(settings) as conn:
+        final_job = conn.execute(
+            "SELECT status,attempts FROM knowledge_projection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        final_page = conn.execute(
+            """
+            SELECT rag_visible_revision_id,rag_visible_epoch
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (page_id,),
+        ).fetchone()
+        final_chunks = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_chunks
+            WHERE page_id=? AND projection_epoch=?
+            """,
+            (page_id, epoch),
+        ).fetchone()[0]
+
+    assert (old_result.claimed, old_result.succeeded, old_result.failed) == (1, 0, 0)
+    assert tuple(final_job) == ("succeeded", 2)
+    assert tuple(final_page) == (revision_id, epoch)
+    assert final_chunks == 1
+
+
+def test_superseded_cleanup_failure_is_recorded_as_worker_failure(settings):
+    outbox = ProjectionOutbox(settings)
+    page_id = "page-cleanup-failure"
+    current_revision_id = "wrev-cleanup-current"
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,projection_epoch,
+              lifecycle_status,rag_visible_revision_id,rag_visible_epoch
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/cleanup-failure.md",
+                page_id,
+                "product",
+                "policy",
+                "Cleanup failure",
+                "[]",
+                "draft",
+                "t0",
+                "t0",
+                current_revision_id,
+                2,
+                "active",
+                current_revision_id,
+                2,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_page_revisions(
+              id,page_id,page_path,revision_number,file_hash,semantic_hash,
+              content,origin,base_revision_id,source_ids_json,actor,note,
+              metadata_json,idempotency_key,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                current_revision_id,
+                page_id,
+                "wiki/product/cleanup-failure.md",
+                2,
+                "hash-cleanup-current",
+                "semantic-cleanup-current",
+                "# Current revision",
+                "manual",
+                None,
+                "[]",
+                "tester",
+                None,
+                "{}",
+                "test:cleanup-current",
+                "t0",
+            ),
+        )
+        old_job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="upsert",
+            page_id=page_id,
+            revision_id="wrev-cleanup-old",
+            projection_epoch=1,
+            payload={"path": "wiki/product/cleanup-failure.md"},
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_chunks(
+              id,page_id,revision_id,projection_epoch,chunk_index,page_path,
+              domain,title,text,token_json,embedding_json,embedding_model,
+              source_ids_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "chunk-cleanup-old",
+                page_id,
+                "wrev-cleanup-old",
+                1,
+                0,
+                "wiki/product/cleanup-failure.md",
+                "product",
+                "Cleanup failure",
+                "stale content",
+                "[]",
+                "[]",
+                "local-hash-v1",
+                "[]",
+                "t0",
+                "t0",
+            ),
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER fail_old_epoch_cleanup
+            BEFORE DELETE ON wiki_chunks
+            WHEN OLD.page_id='page-cleanup-failure'
+              AND OLD.projection_epoch=1
+            BEGIN
+              SELECT RAISE(ABORT, 'old epoch cleanup failed');
+            END
+            """
+        )
+    worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+
+    result = asyncio.run(worker.run_once("rag"))
+
+    with connect_app(settings) as conn:
+        job = conn.execute(
+            """
+            SELECT status,last_error,lease_owner
+            FROM knowledge_projection_jobs WHERE id=?
+            """,
+            (old_job_id,),
+        ).fetchone()
+        chunks = conn.execute(
+            """
+            SELECT COUNT(*) FROM wiki_chunks
+            WHERE page_id=? AND projection_epoch=1
+            """,
+            (page_id,),
+        ).fetchone()[0]
+
+    assert (result.claimed, result.failed, result.superseded) == (1, 1, 0)
+    assert job["status"] == "failed"
+    assert job["last_error"] == "old epoch cleanup failed"
+    assert job["lease_owner"] is None
+    assert chunks == 1
+
+
 def test_rag_delete_removes_all_page_chunks_and_finishes_atomically(settings):
     outbox = ProjectionOutbox(settings)
     page_id = "page-rag-delete"
@@ -920,6 +1376,115 @@ def test_rag_delete_removes_all_page_chunks_and_finishes_atomically(settings):
     assert tuple(job) == ("succeeded", None)
     assert tuple(page) == ("deleted", epoch, None, None)
     assert chunks == 0
+
+
+def test_rag_delete_finish_cas_failure_rolls_back_page_chunks_and_job(settings):
+    class CasFailingOutbox(ProjectionOutbox):
+        def finish_claimed(self, conn, **kwargs):
+            conn.execute(
+                "UPDATE knowledge_projection_jobs SET lease_owner='competitor' WHERE id=?",
+                (kwargs["job_id"],),
+            )
+            return super().finish_claimed(conn, **kwargs)
+
+    outbox = CasFailingOutbox(settings)
+    page_id = "page-delete-cas-failure"
+    revision_id = "wrev-visible-before-delete"
+    delete_epoch = 4
+    visible_epoch = 3
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,projection_epoch,
+              lifecycle_status,rag_visible_revision_id,rag_visible_epoch
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wiki/product/delete-cas.md",
+                page_id,
+                "product",
+                "policy",
+                "Delete CAS",
+                "[]",
+                "draft",
+                "t0",
+                "t0",
+                revision_id,
+                delete_epoch,
+                "deleted",
+                revision_id,
+                visible_epoch,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_chunks(
+              id,page_id,revision_id,projection_epoch,chunk_index,page_path,
+              domain,title,text,token_json,embedding_json,embedding_model,
+              source_ids_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "chunk-delete-cas",
+                page_id,
+                revision_id,
+                visible_epoch,
+                0,
+                "wiki/product/delete-cas.md",
+                "product",
+                "Delete CAS",
+                "visible content",
+                "[]",
+                "[]",
+                "local-hash-v1",
+                "[]",
+                "t0",
+                "t0",
+            ),
+        )
+        job_id = outbox.enqueue(
+            conn,
+            target="rag",
+            operation="delete",
+            page_id=page_id,
+            revision_id=None,
+            projection_epoch=delete_epoch,
+            payload={"path": "wiki/product/delete-cas.md", "reason": "deleted"},
+        )
+
+    worker = projection_worker.ProjectionWorker(
+        settings,
+        outbox=outbox,
+        now=lambda: NOW,
+    )
+    result = asyncio.run(worker.run_once("rag"))
+
+    with connect_app(settings) as conn:
+        job = conn.execute(
+            """
+            SELECT status,lease_owner,last_error
+            FROM knowledge_projection_jobs WHERE id=?
+            """,
+            (job_id,),
+        ).fetchone()
+        page = conn.execute(
+            """
+            SELECT rag_visible_revision_id,rag_visible_epoch
+            FROM wiki_pages WHERE page_id=?
+            """,
+            (page_id,),
+        ).fetchone()
+        chunks = conn.execute(
+            "SELECT COUNT(*) FROM wiki_chunks WHERE page_id=?",
+            (page_id,),
+        ).fetchone()[0]
+
+    assert (result.claimed, result.succeeded, result.failed) == (1, 0, 0)
+    assert tuple(job) == ("running", worker.worker_id, None)
+    assert tuple(page) == (revision_id, visible_epoch)
+    assert chunks == 1
 
 
 def test_stale_rag_delete_is_superseded_without_deleting_restored_chunks(settings):
