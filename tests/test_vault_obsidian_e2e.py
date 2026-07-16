@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import hashlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 import urllib.request
 
 import httpx
@@ -86,25 +86,67 @@ def _forbid_external_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx.AsyncClient, "send", async_forbidden)
 
 
+def _remaining_budget(label: str, *, started: float, deadline: float) -> float:
+    elapsed = asyncio.get_running_loop().time() - started
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise AssertionError(
+            f"{label} exceeded local SLA; elapsed={elapsed:.3f}s "
+            f"budget={deadline - started:.3f}s"
+        )
+    return remaining
+
+
+async def _await_with_deadline(
+    label: str,
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    started: float,
+    deadline: float,
+) -> Any:
+    try:
+        result = await asyncio.wait_for(
+            operation(),
+            timeout=_remaining_budget(label, started=started, deadline=deadline),
+        )
+    except asyncio.TimeoutError as exc:
+        elapsed = asyncio.get_running_loop().time() - started
+        raise AssertionError(
+            f"{label} exceeded local SLA; elapsed={elapsed:.3f}s "
+            f"budget={deadline - started:.3f}s"
+        ) from exc
+    _remaining_budget(label, started=started, deadline=deadline)
+    return result
+
+
 async def _wait_for_state(
     label: str,
     read: Callable[[], Any],
     ready: Callable[[Any], bool],
     *,
-    timeout: float = POLL_TIMEOUT_SECONDS,
+    started: float,
+    deadline: float,
 ) -> Any:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
     last: Any = None
-    while loop.time() < deadline:
-        last = await asyncio.wait_for(
-            asyncio.to_thread(read),
-            timeout=min(1.0, max(0.01, deadline - loop.time())),
-        )
-        if ready(last):
-            return last
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"timed out waiting for {label}; last state={last!r}")
+    while True:
+        try:
+            last = await _await_with_deadline(
+                label,
+                lambda: asyncio.to_thread(read),
+                started=started,
+                deadline=deadline,
+            )
+            if ready(last):
+                _remaining_budget(label, started=started, deadline=deadline)
+                return last
+            await asyncio.sleep(
+                min(
+                    0.02,
+                    _remaining_budget(label, started=started, deadline=deadline),
+                )
+            )
+        except AssertionError as exc:
+            raise AssertionError(f"{exc}; last state={last!r}") from exc
 
 
 def _page_state(
@@ -252,9 +294,17 @@ def _occurrence_state(settings: Settings, page_path: str) -> dict[str, Any]:
         }
 
 
-async def _ask_once(settings: Settings, token: str):
-    return await asyncio.wait_for(
-        asyncio.to_thread(
+async def _ask_once(
+    settings: Settings,
+    token: str,
+    *,
+    label: str,
+    started: float,
+    deadline: float,
+):
+    return await _await_with_deadline(
+        label,
+        lambda: asyncio.to_thread(
             ask,
             settings,
             AskRequest(
@@ -263,18 +313,23 @@ async def _ask_once(settings: Settings, token: str):
                 require_citations=True,
             ),
         ),
-        timeout=2.0,
+        started=started,
+        deadline=deadline,
     )
 
 
 def _assert_current_wiki_citation(
     response: Any,
     *,
+    label: str,
+    started: float,
+    deadline: float,
     token: str,
     page_id: str,
     page_path: str,
     revision_id: str,
 ) -> None:
+    _remaining_budget(label, started=started, deadline=deadline)
     citation = next(
         (
             item
@@ -290,6 +345,7 @@ def _assert_current_wiki_citation(
     assert citation.revision_id == revision_id
     assert citation.chunk_id is not None
     assert token in citation.snippet
+    _remaining_budget(label, started=started, deadline=deadline)
 
 
 @pytest.mark.asyncio
@@ -305,12 +361,15 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
     new_page_path = "wiki/product/refund-current.md"
     old_target = settings.vault_path / old_page_path
     new_target = settings.vault_path / new_page_path
+    loop = asyncio.get_running_loop()
 
     await asyncio.wait_for(worker.start(), timeout=POLL_TIMEOUT_SECONDS)
     await asyncio.wait_for(service.start(), timeout=POLL_TIMEOUT_SECONDS)
     await asyncio.sleep(0.1)
     try:
         old_target.parent.mkdir(parents=True, exist_ok=True)
+        add_started = loop.time()
+        add_deadline = add_started + POLL_TIMEOUT_SECONDS
         old_target.write_text(
             "---\n"
             "title: Refund watcher policy\n"
@@ -344,12 +403,23 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
                 and state["occurrence_count"] >= 2
                 and b"lgdo_page_id:" in old_target.read_bytes()
             ),
+            started=add_started,
+            deadline=add_deadline,
         )
         page_id = str(added["page"]["page_id"])
         first_revision_id = str(added["page"]["current_revision_id"])
-        added_answer = await _ask_once(settings, "refundalpha731")
+        added_answer = await _ask_once(
+            settings,
+            "refundalpha731",
+            label="add projection and citation",
+            started=add_started,
+            deadline=add_deadline,
+        )
         _assert_current_wiki_citation(
             added_answer,
+            label="add projection and citation",
+            started=add_started,
+            deadline=add_deadline,
             token="refundalpha731",
             page_id=page_id,
             page_path=old_page_path,
@@ -358,6 +428,8 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
 
         managed_bytes = old_target.read_bytes()
         assert b"refundalpha731" in managed_bytes
+        modify_started = loop.time()
+        modify_deadline = modify_started + POLL_TIMEOUT_SECONDS
         old_target.write_bytes(
             managed_bytes.replace(b"refundalpha731", b"refundbeta842")
         )
@@ -381,17 +453,30 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
                 and hashlib.sha256(old_target.read_bytes()).hexdigest()
                 == state["page"]["file_hash"]
             ),
+            started=modify_started,
+            deadline=modify_deadline,
         )
         second_revision_id = str(modified["page"]["current_revision_id"])
-        modified_answer = await _ask_once(settings, "refundbeta842")
+        modified_answer = await _ask_once(
+            settings,
+            "refundbeta842",
+            label="modify projection and citation",
+            started=modify_started,
+            deadline=modify_deadline,
+        )
         _assert_current_wiki_citation(
             modified_answer,
+            label="modify projection and citation",
+            started=modify_started,
+            deadline=modify_deadline,
             token="refundbeta842",
             page_id=page_id,
             page_path=old_page_path,
             revision_id=second_revision_id,
         )
 
+        rename_started = loop.time()
+        rename_deadline = rename_started + POLL_TIMEOUT_SECONDS
         old_target.rename(new_target)
         renamed = await _wait_for_state(
             "exact-byte rename projection",
@@ -409,16 +494,29 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
                 and state["pending_deletes"] == 0
                 and state["pending_occurrences"] == 0
             ),
+            started=rename_started,
+            deadline=rename_deadline,
         )
-        renamed_answer = await _ask_once(settings, "refundbeta842")
+        renamed_answer = await _ask_once(
+            settings,
+            "refundbeta842",
+            label="rename projection and citation",
+            started=rename_started,
+            deadline=rename_deadline,
+        )
         _assert_current_wiki_citation(
             renamed_answer,
+            label="rename projection and citation",
+            started=rename_started,
+            deadline=rename_deadline,
             token="refundbeta842",
             page_id=page_id,
             page_path=new_page_path,
             revision_id=second_revision_id,
         )
 
+        pending_delete_started = loop.time()
+        pending_delete_deadline = pending_delete_started + POLL_TIMEOUT_SECONDS
         new_target.unlink()
         await _wait_for_state(
             "one deferred pending delete",
@@ -428,12 +526,19 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
                 and state["pending_deletes"] == 1
                 and state["pending_occurrences"] == 0
             ),
+            started=pending_delete_started,
+            deadline=pending_delete_deadline,
         )
-        expired = await asyncio.wait_for(
-            service.expire_deletes(
+
+        delete_started = loop.time()
+        delete_deadline = delete_started + POLL_TIMEOUT_SECONDS
+        expired = await _await_with_deadline(
+            "forced delete projection and refusal",
+            lambda: service.expire_deletes(
                 datetime.now(timezone.utc) + timedelta(seconds=6)
             ),
-            timeout=POLL_TIMEOUT_SECONDS,
+            started=delete_started,
+            deadline=delete_deadline,
         )
         assert expired == 1
 
@@ -448,12 +553,25 @@ async def test_real_watcher_converges_add_modify_rename_delete_into_local_citati
                 and state["all_chunks"] == 0
                 and state["rag_delete_statuses"] == ["succeeded"]
             ),
+            started=delete_started,
+            deadline=delete_deadline,
         )
         assert deleted["content_revision_count"] == 2
-        deleted_answer = await _ask_once(settings, "refundbeta842")
+        deleted_answer = await _ask_once(
+            settings,
+            "refundbeta842",
+            label="forced delete projection and refusal",
+            started=delete_started,
+            deadline=delete_deadline,
+        )
         assert deleted_answer.citations == []
         assert deleted_answer.answer == CITATION_REFUSAL
         assert deleted_answer.confidence == "low"
+        _remaining_budget(
+            "forced delete projection and refusal",
+            started=delete_started,
+            deadline=delete_deadline,
+        )
     finally:
         await asyncio.wait_for(service.stop(), timeout=POLL_TIMEOUT_SECONDS)
         await asyncio.wait_for(worker.stop(), timeout=POLL_TIMEOUT_SECONDS)
@@ -469,11 +587,14 @@ async def test_real_watcher_ignores_managed_exact_byte_writeback_loop(
     service = VaultSyncService(settings)
     page_path = "wiki/product/exact-loop.md"
     target = settings.vault_path / page_path
+    loop = asyncio.get_running_loop()
 
     await asyncio.wait_for(service.start(), timeout=POLL_TIMEOUT_SECONDS)
     await asyncio.sleep(0.1)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        settle_started = loop.time()
+        settle_deadline = settle_started + POLL_TIMEOUT_SECONDS
         target.write_text(
             "---\n"
             "title: Exact loop\n"
@@ -503,10 +624,15 @@ async def test_real_watcher_ignores_managed_exact_byte_writeback_loop(
                 and b"lgdo_page_id:" in target.read_bytes()
                 and b"lgdo_revision_id:" in target.read_bytes()
             ),
+            started=settle_started,
+            deadline=settle_deadline,
         )
         managed_bytes = target.read_bytes()
         occurrence_count = int(settled["occurrence_count"])
+        projection_epoch = int(settled["page"]["projection_epoch"])
 
+        rewrite_started = loop.time()
+        rewrite_deadline = rewrite_started + POLL_TIMEOUT_SECONDS
         target.write_bytes(managed_bytes)
         rewritten = await _wait_for_state(
             "explicit exact-byte rewrite terminal occurrence",
@@ -519,7 +645,10 @@ async def test_real_watcher_ignores_managed_exact_byte_writeback_loop(
                 and state["latest"]
                 and state["latest"]["status"] == "ignored"
             ),
+            started=rewrite_started,
+            deadline=rewrite_deadline,
         )
+        assert int(rewritten["page"]["projection_epoch"]) == projection_epoch
         assert rewritten["latest"]["result_revision_id"] == rewritten["page"][
             "current_revision_id"
         ]
@@ -537,5 +666,10 @@ async def test_real_watcher_ignores_managed_exact_byte_writeback_loop(
             ).fetchone()
         assert event["status"] == "ignored"
         assert observation["parse_status"] == "valid"
+        _remaining_budget(
+            "explicit exact-byte rewrite terminal occurrence",
+            started=rewrite_started,
+            deadline=rewrite_deadline,
+        )
     finally:
         await asyncio.wait_for(service.stop(), timeout=POLL_TIMEOUT_SECONDS)
