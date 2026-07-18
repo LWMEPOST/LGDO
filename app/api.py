@@ -264,8 +264,12 @@ def vault_status_endpoint(
     except Exception:
         reconcile = None
 
+    watcher_runtime_missing = bool(
+        settings.vault_watch_enabled and runtime is None
+    )
     degraded = bool(
-        counters["failed_occurrences"]
+        watcher_runtime_missing
+        or counters["failed_occurrences"]
         or counters["open_issues"]
         or counters["invalid_pages"]
         or projection_failed
@@ -770,6 +774,28 @@ def scan_endpoint(request: ScanRequest, user: UserContext = Depends(current_user
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+_UPLOAD_DOMAIN_RE = re.compile(r"^[^/\\\\]+$")
+
+
+def _resolve_upload_domain_path(upload_root: Path, domain: str) -> Path:
+    """Resolve an upload domain and prove it stays below the configured root."""
+    value = (domain or "").strip()
+    if not value:
+        raise ValueError("invalid upload domain")
+    if not _UPLOAD_DOMAIN_RE.fullmatch(value):
+        raise ValueError("upload domain path escapes upload root")
+    domain_path = Path(value)
+    if value in {".", ".."} or domain_path.is_absolute() or domain_path.drive:
+        raise ValueError("invalid upload domain")
+    root = upload_root.expanduser().resolve()
+    resolved = (root / domain_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("upload domain path escapes upload root") from exc
+    return resolved
+
+
 @router.post("/sources/upload", response_model=UploadResponse)
 def upload_endpoint(
     files: list[UploadFile] = File(...),
@@ -784,7 +810,15 @@ def upload_endpoint(
         settings = get_settings()
         import json
 
-        upload_dir = settings.upload_path / domain
+        upload_dir = _resolve_upload_domain_path(settings.upload_path, domain)
+        scan_request = ScanRequest(
+            root_path=str(upload_dir),
+            domain=domain,
+            owner=owner,
+            acl_tags=[tag.strip() for tag in acl_tags.split(",") if tag.strip()],
+            metadata_defaults=json.loads(metadata_defaults or "{}"),
+            force_reindex=True,
+        )
         upload_dir.mkdir(parents=True, exist_ok=True)
         saved_files: list[str] = []
         for upload in files:
@@ -799,17 +833,7 @@ def upload_endpoint(
                 shutil.copyfileobj(upload.file, out)
             saved_files.append(str(target))
 
-        scan = scan_sources(
-            settings,
-            ScanRequest(
-                root_path=str(upload_dir),
-                domain=domain,
-                owner=owner,
-                acl_tags=[tag.strip() for tag in acl_tags.split(",") if tag.strip()],
-                metadata_defaults=json.loads(metadata_defaults or "{}"),
-                force_reindex=True,
-            ),
-        )
+        scan = scan_sources(settings, scan_request)
         return UploadResponse(**scan.model_dump(), saved_files=saved_files)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

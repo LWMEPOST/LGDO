@@ -44,6 +44,23 @@ def test_round_trip_preserves_comments_order_and_body_while_managed_fields_chang
     assert b"review_status: reviewed" in rendered
 
 
+def test_managed_writeback_assigns_both_canonical_page_identity_fields():
+    document = parse_wiki_bytes(
+        b"---\ntitle: New Obsidian page\nsource_ids: [src_1]\n---\nBody\n"
+    )
+
+    rendered = render_managed_frontmatter(
+        document,
+        page_id="page_assigned",
+        revision_id="wrev_assigned",
+        write_token="write_assigned",
+    )
+    frontmatter = parse_wiki_bytes(rendered).frontmatter
+
+    assert frontmatter["id"] == "page_assigned"
+    assert frontmatter["lgdo_page_id"] == "page_assigned"
+
+
 def test_semantic_hash_ignores_managed_fields_comments_and_newline_style():
     first = parse_wiki_bytes(
         b"---\ntitle: Demo # one\nsource_ids: [src_1]\nlgdo_revision_id: old\n---\nBody\n"

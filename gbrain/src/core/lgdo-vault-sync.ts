@@ -801,24 +801,6 @@ async function walkManifestRoot(root: string, expectedPaths: Set<string>): Promi
   return { presence, protectedPaths, protectedPrefixes };
 }
 
-async function loadPersistedRecoveryMappings(
-  engine: BrainEngine,
-  sourceId: string,
-): Promise<LgdoProtectedMapping[]> {
-  const rows = await engine.executeRaw<{ result_json: unknown }>(
-    `SELECT result_json FROM lgdo_vault_sync_runs WHERE source_id = $1 ORDER BY created_at, idempotency_key`,
-    [sourceId],
-  );
-  const mappings: LgdoProtectedMapping[] = [];
-  for (const row of rows) {
-    const result = parseStoredResult(row.result_json);
-    for (const page of result.pages ?? []) {
-      if (page.status === 'recovery_required') mappings.push(...(page.protected_mappings ?? []));
-    }
-  }
-  return dedupeMappings(mappings);
-}
-
 function mappingIndex(mappings: LgdoProtectedMapping[]): { slugs: Set<string>; paths: Set<string> } {
   const slugs = new Set<string>();
   const paths = new Set<string>();
@@ -844,6 +826,7 @@ async function reconcileDeletedPages(
     reason: expectedPaths.has(sourcePath) ? 'present_invalid' : 'present_unlisted',
   }));
   const indexed = mappingIndex([...mappings, ...walkerMappings]);
+  const protectedExpectedPaths = new Set(expectedPages.map((page) => page.path));
   const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
     `SELECT slug, source_path FROM pages WHERE source_id = $1 ORDER BY slug`,
     [sourceId],
@@ -851,6 +834,7 @@ async function reconcileDeletedPages(
   const deletable = rows
     .filter((row) => {
       if (!row.source_path) return false;
+      if (protectedExpectedPaths.has(row.source_path)) return false;
       if (walk.presence.has(row.source_path)) return false;
       if (indexed.slugs.has(row.slug) || indexed.paths.has(row.source_path)) return false;
       for (const prefix of walk.protectedPrefixes) {
@@ -892,13 +876,9 @@ async function executeLgdoVaultSync(
   }
 
   const pageMappings = pages.flatMap((page) => page.protected_mappings);
-  const persistedRecovery = input.mode === 'reconcile'
-    ? await loadPersistedRecoveryMappings(ctx.engine, input.source_id)
-    : [];
   let protectedMappings = dedupeMappings([
     ...input.protected_mappings,
     ...pageMappings,
-    ...persistedRecovery,
   ]);
   let deleted: Array<{ source_id: string; slug: string }> = [];
   if (input.mode === 'reconcile') {

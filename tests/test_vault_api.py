@@ -251,6 +251,27 @@ def test_vault_status_falls_back_without_state_or_absolute_path_leak(
     }
 
 
+def test_vault_status_is_degraded_when_watcher_is_configured_without_runtime(
+    configured_client,
+):
+    settings, client = configured_client
+    settings.vault_watch_enabled = True
+    previous_state = dict(app.state._state)
+    app.state._state.clear()
+    try:
+        response = client.get("/api/internal/vault/status")
+    finally:
+        app.state._state.clear()
+        app.state._state.update(previous_state)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["configured"] is True
+    assert payload["running"] is False
+    assert payload["clean"] is False
+    assert payload["degraded"] is True
+
+
 def test_vault_status_sanitizes_failed_reconcile_paths_but_admin_get_does_not(
     configured_client,
     monkeypatch,

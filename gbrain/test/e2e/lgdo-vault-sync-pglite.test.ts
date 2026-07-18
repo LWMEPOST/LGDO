@@ -715,7 +715,10 @@ describe('trusted LGDO Vault sync against PGLite', () => {
 
     const reconciled = await runLgdoVaultSync(
       task4Context(),
-      task4Input('reconcile', [], 'recovery-reconcile'),
+      {
+        ...task4Input('reconcile', [], 'recovery-reconcile'),
+        protected_mappings: failed.pages[0].protected_mappings,
+      },
     );
     expect(reconciled.deleted).toEqual([]);
     expect(await engine.getPage('old/recovery', { sourceId: TASK4_SOURCE, includeDeleted: true })).not.toBeNull();

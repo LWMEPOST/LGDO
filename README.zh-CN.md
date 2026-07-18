@@ -70,34 +70,43 @@ source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 cp .env.example .env
 
+# 设置首次管理员密码（不再提供默认 admin/admin）
+# AUTH_BOOTSTRAP_ADMIN_PASSWORD=请替换为强密码
+
 # 启动后端
 uvicorn app.main:app --reload
 
 # 前端，可选开发模式
 cd frontend
 npm install
-npm run dev
+npm run dev -- --port 8011
 ```
 
 然后在浏览器中打开 `http://127.0.0.1:8000/docs` 查看 API 文档，或访问 `/console` 打开管理控制台。
 
-管理控制台默认启用本地账户登录。初始化管理员为 `admin / admin`，首次登录后建议在账户权限页修改密码。
+管理控制台默认启用本地账户登录。只有显式设置 `AUTH_BOOTSTRAP_ADMIN_PASSWORD` 时才会创建初始化管理员；生产环境不要开启 `AUTH_DEV_FALLBACK_ENABLED`。
 
 ### 三行命令跑通第一个引用问答
 
 ```bash
+# 先通过 /api/internal/auth/login 获取 token
+export TOKEN='<登录接口返回的 token>'
+
 # 1. 扫描示例资料入库
 curl -X POST http://127.0.0.1:8000/api/internal/sources/scan \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"root_path":"samples/product_service","domain":"product","owner":"admin","acl_tags":["internal"]}'
 
 # 2. 编译知识页
 curl -X POST http://127.0.0.1:8000/api/internal/wiki/compile \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"domain":"product"}'
 
 # 3. 发起必须带引用的问答
 curl -X POST http://127.0.0.1:8000/api/internal/ask \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"question":"灵创AI平台的核心价值主张是什么？","domain":"product","require_citations":true}'
 ```
@@ -128,7 +137,17 @@ LGDO Knowledge Core 采用 **LLMWiki + GBrain + DeepSeek + Obsidian** 的组合�
 | **LLMWiki** | 将原始资料编译为可审阅、可引用、可版本化的 Markdown 知识页，承担资料到知识资产的转换层。 |
 | **GBrain** | 作为 MCP 图谱记忆层，补足纯向量检索对实体关系、跨文档依赖、角色权限聚合的表达能力。 |
 | **DeepSeek** | 作为可选生成模型，在检索证据充分时生成自然语言回答；未配置时系统回退到本地抽取式回答。 |
-| **Obsidian** | 作为 Markdown 知识库工作流的兼容出口，便于人工编辑、审阅、归档和长期维护。 |
+| **Obsidian** | 作为共享 Vault 的人工维护端：LGDO 写入托管 Markdown，watcher 接收外部编辑并进入 revision/冲突流程；当前不包含原生 Obsidian 插件。 |
+
+#### Obsidian 集成边界
+
+当前采用 **共享 Vault + 文件 watcher + API deep link**，而不是 Obsidian Plugin API：
+
+- 托管页面的 frontmatter 同时写入 `id` 与 `lgdo_page_id`，两者均为稳定 `page_id`。
+- Obsidian 的新增、修改、rename、delete、restore 由 `VaultSyncService` 观察、去抖、reconcile，并写入 immutable revision。
+- 生成内容与人工内容冲突时保留人工文件，创建 review/conflict 和可恢复备份，不直接覆盖。
+- `/api/internal/wiki/pages/{path}/obsidian-link` 返回 `obsidian://` deep link。
+- 项目没有 Obsidian 插件包、插件 `manifest.json` 或插件进程；仓库内其他组件的同名 manifest 与 Obsidian 插件无关。若需要在 Obsidian 内展示冲突和同步按钮，应把现有 API 封装成后续插件，而不是在插件中复制 revision 逻辑。
 
 ### 数据分层
 
@@ -136,8 +155,8 @@ LGDO Knowledge Core 采用 **LLMWiki + GBrain + DeepSeek + Obsidian** 的组合�
 | ---- | ------- | ---- |
 | 🗄️ **原始证据层** | `uploads/`, `vault/raw/`, `sources` | 保存原始文件、解析文本、hash 指纹、来源标签。 |
 | 📐 **标准化层** | `vault/normalized/`, `vault/jsonl/` | 保存 canonical Markdown、检索 chunks、采集报告。 |
-| 📝 **知识衍生层** | `vault/wiki/`, `wiki_pages`, `review_items` | 生成可读、可审阅的 Markdown 知识页。 |
-| 🔍 **检索层** | `document_chunks`, `rag_document_chunks` | 提供 pgvector 向量索引，支撑引用问答。 |
+| 📝 **知识衍生层** | `vault/wiki/`, `wiki_pages`, `wiki_page_revisions`, `review_items` | 保存共享 Vault 的事实内容、immutable revision 与冲突审阅。 |
+| 🔍 **检索/图谱投影层** | `document_chunks`, `wiki_chunks`, `gbrain_page_projections`, `gbrain_projection_protections`, `projection_state` | 保存可重建的 RAG/GBrain 派生投影与 generation 水位。 |
 | 🔄 **反馈治理层** | `query_logs`, `feedback`, `knowledge_gaps`, `audit_logs` | 记录问答、反馈、缺口、审计。 |
 
 ### 组件总览
@@ -179,13 +198,13 @@ LGDO Knowledge Core 的能力围绕一个核心理念：**不只是存文档，�
 | **T3** | 实体关系 | 必须通过知识图谱遍历关系。 | 哪些系统依赖审核引擎，V2.5 -> V3.0 升级影响哪些服务？ |
 | **T4** | 否定/边界 | 否定检索、边界条件、幻觉陷阱。 | 平台不支持哪些图片格式？第 8 天还能退款吗？ |
 
-> T3 层是区分“会检索”和“懂关系”的分水岭。纯向量 RAG 在 T3 层准确率仅 12.5%，接入 GBrain 知识图谱后跃升至 75%。
+> GBrain 是可选关系检索来源，不应预设一定提升准确率。当前可复现的 31 题基线中，GBrain OFF 为 16/31，ON 为 14/31，且 ON 的 P95 增加约 949 ms；在扩大图谱覆盖和建立逐题贡献证明前，生产默认应保持关闭。详见 `docs/方案设计.md`。
 
 ---
 
 ## 📊 评测
 
-我们在 **31 道升级版评测题**（覆盖四层难度）上测试 LGDO Knowledge Core，使用 PostgreSQL + pgvector + DeepSeek + GBrain，数据集为 91 份中文企业文档、334 个文件、763 万字符。
+仓库内置 **31 道升级版评测题**（覆盖四层难度）。较新的可追溯基线记录在 `docs/方案设计.md`：GBrain OFF 为 16/31，ON 为 14/31。历史 91 文档/334 文件指标依赖仓库外数据路径，不能仅凭当前仓库复现。
 
 ### 解析性能
 
@@ -200,10 +219,12 @@ LGDO Knowledge Core 的能力围绕一个核心理念：**不只是存文档，�
 
 | 检查项 | 结果 |
 | ------ | :--: |
-| 后端测试（pytest） | 35 passed |
-| 前端生产构建 | 通过（JS 178.65 kB / CSS 17.22 kB） |
-| 基础 QA（30 题） | 100% 正确 |
-| 升级 QA（31 题） | 93.55% 正确 |
+| Python 全量 | 771 passed，9 skipped（2026-07-18） |
+| Revision/watcher/API | 213 passed（2026-07-18） |
+| PostgreSQL | 31 passed（2026-07-18） |
+| GBrain TypeScript | 31 单元/契约 + 13 PGLite E2E，typecheck 通过（2026-07-18） |
+| 前端 | 32 passed，生产构建通过（2026-07-18） |
+| 真实动态 GBrain watcher SLA | add 1.935s，rename 1.665s，delete-expiry 5.714s |
 
 ---
 
@@ -216,7 +237,7 @@ LGDO Knowledge Core 是一个内部知识库中台，不是面向终端客户的
 - **OCR 通道已预留但未完整接入。** 扫描件和图片型 PDF 当前会产生 warning，需要后续接入 PaddleOCR 或 Tesseract。
 - **企业 IM 集成属于第二阶段。** 企业微信、钉钉、飞书的接入和客服系统写回尚未实现。
 - **跨文档实体对齐仍有盲区。** 例如“部门总监”和“部门负责人”可能需要显式配置别名映射。
-- **延迟优化空间大。** 当前平均延迟约 23s（含 GBrain 图谱遍历），不适合直接用于低延迟 C 端场景。
+- **延迟和质量仍需按部署数据重测。** 历史 benchmark 依赖仓库外数据；当前 GBrain ON 基线没有证明质量增益，生产启用前必须在目标数据集上做 ON/OFF 与 P95 门禁。
 
 ---
 
@@ -305,11 +326,18 @@ DEEPSEEK_MODEL=deepseek-chat
 ```bash
 # .env
 GBRAIN_ENABLED=true
+GBRAIN_ENDPOINT=http://127.0.0.1:8787/mcp
+GBRAIN_QUERY_API_KEY=<只读 token>
+GBRAIN_PROJECTION_API_KEY=<read/write token>
+GBRAIN_MANAGED_SOURCE_ID=lgdo-managed
+GBRAIN_SOURCE_ID=lgdo-managed
+GBRAIN_IMPORT_ALLOWED_ROOT=<VAULT_PATH>/wiki
 GBRAIN_HOME=data/gbrain
 GBRAIN_REPO_PATH=gbrain
+GBRAIN_IMPORT_ON_COMPILE=false
 ```
 
-GBrain 默认关闭。开启后提供实体关系遍历、跨文档依赖分析、缺口推理。
+GBrain 默认关闭。查询与 projection 凭据必须分离；服务端还要把 canonical `<VAULT_PATH>/wiki` 注册为该 managed source 的允许 root。`GBRAIN_IMPORT_ON_COMPILE=true` 只表示编译事务写入异步 outbox，不会同步执行 600 秒导入。
 
 ---
 
@@ -334,6 +362,48 @@ powershell -ExecutionPolicy Bypass -File scripts/status-gbrain.ps1
 
 根目录 `.env` 使用 `GBRAIN_ENDPOINT=http://127.0.0.1:8787/mcp`。GBrain 异常、超时或无授权结果时，LGDO 可通过 `DASHSCOPE_EMBEDDING_ENABLED=true` 使用阿里云 `text-embedding-v3` 对本地候选块进行语义重排；阿里云也不可用时自动保留 BM25/关键词结果。百炼专属端点单批最多 10 条，代码会自动拆批。
 
+### Obsidian 与前端开发服务器
+
+启动完整本地工作流时，FastAPI 默认使用 `8000`，GBrain HTTP MCP 使用 `8787`，前端开发服务器使用 `8011`：
+
+```powershell
+Set-Location frontend
+npm run dev -- --port 8011
+```
+
+打开 Obsidian 并将 Vault 指向 `.env` 的实际 `VAULT_PATH`（默认 `vault/`）。`resources/obsidian-vault/` 只是随项目发布的安装模板，不是运行 Vault。`vault/wiki/` 是可人工编辑的事实目录。应用启动时只补齐缺失的 `.obsidian/`、`templates/` 和 `indexes/` 资产；已有但漂移的文件会保留并在状态接口中报告。显式刷新会先写入 `.lgdo/obsidian-backups/` 再合并或替换受管资产：
+
+```powershell
+# 首次安装缺失资产
+powershell -ExecutionPolicy Bypass -File scripts/install-obsidian-vault.ps1 -VaultPath vault
+
+# 显式刷新已有资产；刷新前自动备份
+powershell -ExecutionPolicy Bypass -File scripts/install-obsidian-vault.ps1 -VaultPath vault -Refresh
+
+# 直接打开托管页面；VaultName 应与 OBSIDIAN_VAULT_NAME 或 Vault 文件夹名一致
+powershell -ExecutionPolicy Bypass -File scripts/open-obsidian.ps1 -VaultName vault -PagePath 'wiki/product/faq/demo.md'
+```
+
+LGDO watcher 通过文件系统接收编辑，不需要插件即可同步；冲突审阅仍在 LGDO 控制台/API 中。GBrain 关闭时本地 revision、watcher、RAG/citation 工作流仍可运行。以下运维命令从本地登录响应中提取 Bearer token，不依赖开发身份回退：
+
+```powershell
+$login = Invoke-RestMethod -Method Post `
+  -Uri 'http://127.0.0.1:8000/api/internal/auth/login' `
+  -ContentType 'application/json' `
+  -Body (@{ username = 'admin'; password = $env:LGDO_ADMIN_PASSWORD } | ConvertTo-Json)
+$headers = @{ Authorization = "Bearer $($login.token)" }
+
+Invoke-RestMethod -Headers $headers -Uri 'http://127.0.0.1:8000/api/internal/vault/status'
+Invoke-RestMethod -Method Post -Headers $headers -Uri 'http://127.0.0.1:8000/api/internal/vault/reconcile'
+
+# page_path 作为 path 参数时必须进行 URL 编码；响应的 url 可交给 Start-Process 打开
+$pagePath = [Uri]::EscapeDataString('wiki/product/faq/demo.md').Replace('%2F', '/')
+$link = Invoke-RestMethod -Headers $headers -Uri "http://127.0.0.1:8000/api/internal/wiki/pages/$pagePath/obsidian-link"
+Start-Process $link.url
+```
+
+架构图：[技术栈结构图](docs/技术栈结构图.drawio) · [系统四层架构图](docs/系统四层架构图.drawio)。
+
 ## 🔌 常用接口
 
 | 方法 | 路径 | 说明 |
@@ -353,6 +423,16 @@ powershell -ExecutionPolicy Bypass -File scripts/status-gbrain.ps1
 | `POST` | `/api/internal/wiki/compile` | 编译 Markdown 知识页 |
 | `GET` | `/api/internal/wiki/pages` | 知识页列表 |
 | `PUT` | `/api/internal/wiki/pages/{path}` | 保存知识页内容 |
+| `GET` | `/api/internal/wiki/pages/{path}/revisions` | 查看页面 revision 历史 |
+| `GET` | `/api/internal/wiki/pages/{path}/conflicts` | 查看页面冲突 |
+| `POST` | `/api/internal/wiki/conflicts/{review_id}/resolve` | 解决内容冲突 |
+| `POST` | `/api/internal/wiki/write-intents/{intent_id}/release-backup` | 显式释放修复备份 |
+| `GET` | `/api/internal/wiki/pages/{path}/obsidian-link` | 获取 Obsidian deep link |
+| `GET` | `/api/internal/vault/status` | watcher、对账、Obsidian 资产与投影状态 |
+| `POST` | `/api/internal/vault/reconcile` | 排队执行 Vault 对账 |
+| `GET` | `/api/internal/vault/reconcile/{job_id}` | 查询对账结果 |
+| `GET` | `/api/internal/projection-jobs` | 查看 RAG/GBrain projection outbox |
+| `POST` | `/api/internal/projection-jobs/{job_id}/retry` | 重试失败的 projection job |
 | `GET` | `/api/internal/reviews` | 审阅队列 |
 | `GET` | `/api/internal/gaps` | 知识缺口列表 |
 | `POST` | `/api/internal/ask` | 内部问答（带引用） |
@@ -370,9 +450,11 @@ powershell -ExecutionPolicy Bypass -File scripts/status-gbrain.ps1
 - [x] 人工审阅队列与知识缺口闭环
 - [x] 四层评测体系（T1-T4）
 - [x] PostgreSQL + pgvector 向量检索
-- [x] GBrain 知识图谱集成与贡献度量化
-- [x] BGE-M3 embedding + hybrid search
-- [x] **本地登录与账户 ACL 管理**：初始化管理员、会话 token 鉴权、角色、ACL 标签和账户管理界面
+- [x] GBrain 知识图谱的可选查询与异步 projection 集成
+- [ ] GBrain 在目标数据集上的稳定正贡献与延迟门禁
+- [x] 可配置 embedding provider + hybrid search（默认 `local-hash-v1`）
+- [ ] BGE-M3 生产启用、重建索引与高维 pgvector schema
+- [x] **本地登录与账户 ACL 管理**：显式 bootstrap 密码、会话 token 鉴权、角色、ACL 标签和账户管理界面
 - [x] **ACL 感知的内部控制台保护**：内部 API 需要认证，管理写操作按 admin/editor 分层，QA 身份来自当前会话
 - [x] **实体别名对齐**：实体别名表和别名管理 API，用于跨文档规范名称
 - [ ] **企业 SSO 加固**：OIDC 角色/ACL 映射、token 哈希存储、密码策略、登录限流和账户审计筛选
@@ -389,7 +471,7 @@ powershell -ExecutionPolicy Bypass -File scripts/status-gbrain.ps1
 - 向量检索基于 [pgvector](https://github.com/pgvector/pgvector)（PostgreSQL 向量扩展）
 - 知识图谱基于 [GBrain](https://github.com/garrytan/gbrain)（MCP stdio adapter + PGLite）
 - 前端管理控制台基于 [React 18](https://react.dev/) + [Vite](https://vitejs.dev/)
-- embedding 模型使用 [BGE-M3](https://huggingface.co/BAAI/bge-m3)（BAAI 多语言向量模型）
+- 可选 embedding provider 支持 [BGE-M3](https://huggingface.co/BAAI/bge-m3)；默认 provider 为 `local-hash-v1`
 - RAG 评测框架参考 [BEIR](https://github.com/beir-cellar/beir) 和 MTEB 的评测理念
 
 ---

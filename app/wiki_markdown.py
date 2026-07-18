@@ -147,6 +147,7 @@ def render_managed_frontmatter(
     existing_page_id = metadata.get("lgdo_page_id") or metadata.get("id")
     if existing_page_id and str(existing_page_id) != page_id:
         raise MarkdownParseError("page_identity_conflict", "frontmatter 页面身份与目标页面不一致")
+    metadata["id"] = page_id
     metadata["lgdo_page_id"] = page_id
     metadata["lgdo_revision_id"] = revision_id
     metadata["lgdo_write_token"] = write_token

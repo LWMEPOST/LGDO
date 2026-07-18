@@ -14,7 +14,7 @@ import httpx
 
 from app.config import Settings
 from app.db import connect_app_write, json_dump
-from app.projection_jobs import ProjectionJob, ProjectionOutbox
+from app.projection_jobs import TERMINAL_STATUSES, ProjectionJob, ProjectionOutbox
 
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -323,6 +323,15 @@ class GBrainBatchRepository:
         batch_id = f"gbbatch_{uuid.uuid4().hex}"
 
         with connect_app_write(self.settings) as conn:
+            resumed = self._resume_batch(
+                conn,
+                jobs,
+                worker_id=worker_id,
+                lease_expires_at=lease_expires_at,
+                timestamp=timestamp,
+            )
+            if resumed is not None:
+                return resumed
             retained: list[ProjectionJob] = []
             for claimed in sorted(jobs, key=lambda item: (item.created_at, item.id)):
                 row = conn.execute(
@@ -333,7 +342,11 @@ class GBrainBatchRepository:
                     raise ProjectionLeaseLost("job", claimed.id)
                 current = ProjectionJob.from_row(dict(row))
                 if current.operation in {"upsert", "rename", "restore"}:
-                    page = self._page_snapshot(conn, current.page_id)
+                    page = self._page_snapshot(
+                        conn,
+                        current.page_id,
+                        for_update=True,
+                    )
                     if not self._page_matches_job(page, current):
                         if not self.outbox.finish_claimed(
                             conn,
@@ -443,6 +456,112 @@ class GBrainBatchRepository:
             segments=tuple(segments),
         )
 
+    def _resume_batch(
+        self,
+        conn: Any,
+        jobs: Sequence[ProjectionJob],
+        *,
+        worker_id: str,
+        lease_expires_at: str,
+        timestamp: str,
+    ) -> GBrainBatch | None:
+        job_ids = {job.id for job in jobs}
+        if not job_ids:
+            return None
+        placeholders = ",".join("?" for _ in job_ids)
+        rows = conn.execute(
+            f"""
+            SELECT b.* FROM gbrain_projection_batches b
+            JOIN gbrain_projection_batch_jobs bj ON bj.batch_id=b.id
+            WHERE bj.job_id IN ({placeholders})
+              AND b.status IN ('running','failed')
+            ORDER BY b.created_at,b.id
+            """,
+            tuple(sorted(job_ids)),
+        ).fetchall()
+        batch_ids = {str(row["id"]) for row in rows}
+        if not batch_ids:
+            return None
+        if len(batch_ids) != 1:
+            raise ProjectionProtocolError("claimed jobs belong to multiple resumable GBrain batches")
+        batch_id = next(iter(batch_ids))
+        batch = dict(rows[0])
+        member_rows = conn.execute(
+            """
+            SELECT bj.job_id,j.status,j.lease_owner
+            FROM gbrain_projection_batch_jobs bj
+            JOIN knowledge_projection_jobs j ON j.id=bj.job_id
+            WHERE bj.batch_id=? ORDER BY bj.job_id
+            """,
+            (batch_id,),
+        ).fetchall()
+        nonterminal_member_ids = {
+            str(row["job_id"])
+            for row in member_rows
+            if row["status"] not in TERMINAL_STATUSES
+        }
+        if nonterminal_member_ids != job_ids:
+            raise ProjectionLeaseLost("batch members", batch_id)
+        for row in member_rows:
+            if str(row["job_id"]) not in job_ids:
+                continue
+            if row["status"] != "running" or row["lease_owner"] != worker_id:
+                raise ProjectionLeaseLost("job", str(row["job_id"]))
+
+        renewed = conn.execute(
+            """
+            UPDATE gbrain_projection_batches
+            SET status='running',lease_owner=?,lease_expires_at=?,last_error=NULL,
+                finished_at=NULL,updated_at=?
+            WHERE id=? AND status IN ('running','failed')
+            """,
+            (worker_id, lease_expires_at, timestamp, batch_id),
+        )
+        if renewed.rowcount != 1:
+            raise ProjectionLeaseLost("batch", batch_id)
+        conn.execute(
+            """
+            UPDATE gbrain_projection_segments
+            SET status=CASE WHEN status='succeeded' THEN status ELSE 'pending' END,
+                lease_owner=?,lease_expires_at=?,last_error=NULL,
+                started_at=CASE WHEN status='succeeded' THEN started_at ELSE NULL END,
+                finished_at=CASE WHEN status='succeeded' THEN finished_at ELSE NULL END
+            WHERE batch_id=?
+            """,
+            (worker_id, lease_expires_at, batch_id),
+        )
+        segments = conn.execute(
+            """
+            SELECT * FROM gbrain_projection_segments
+            WHERE batch_id=? ORDER BY segment_index
+            """,
+            (batch_id,),
+        ).fetchall()
+        try:
+            expected_values = json.loads(batch["included_snapshot_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ProjectionProtocolError("stored GBrain batch snapshot is invalid") from exc
+        if not isinstance(expected_values, dict):
+            raise ProjectionProtocolError("stored GBrain batch snapshot must be an object")
+        expected_pages = self._decode_expected_pages(expected_values.get("expected_pages"))
+        return GBrainBatch(
+            id=batch_id,
+            mode=str(batch["mode"]),
+            worker_id=worker_id,
+            expected_pages=expected_pages,
+            segments=tuple(
+                GBrainSegment(
+                    id=str(row["id"]),
+                    batch_id=batch_id,
+                    index=int(row["segment_index"]),
+                    mode=str(row["mode"]),
+                    expected_pages=self._decode_expected_pages(row["expected_pages_json"]),
+                    idempotency_key=str(row["idempotency_key"]),
+                )
+                for row in segments
+            ),
+        )
+
     async def execute_batch(
         self,
         batch_id: str,
@@ -489,12 +608,23 @@ class GBrainBatchRepository:
                 instant=instant,
                 start_segment=True,
             )
+            request_mode = str(segment_row["mode"])
+            request_protections = tuple(accumulated)
+            if request_mode == "reconcile":
+                request_protections = self._reconcile_request_protections(
+                    batch_id,
+                    segment_id,
+                    worker_id=worker_id,
+                    source_id=source_id,
+                    snapshot=snapshot,
+                    protections=accumulated,
+                )
             request = GBrainSyncRequest(
                 source_id=source_id,
                 root=root,
-                mode=str(segment_row["mode"]),
+                mode=request_mode,
                 expected_pages=expected_pages,
-                protected_mappings=tuple(accumulated),
+                protected_mappings=request_protections,
                 no_embed=bool(self.settings.gbrain_import_no_embed),
                 idempotency_key=str(segment_row["idempotency_key"]),
             )
@@ -529,14 +659,35 @@ class GBrainBatchRepository:
                     ),
                 ]
             )
+            page_response_protections = self._dedupe_protections(
+                [
+                    mapping
+                    for page in response.pages
+                    for mapping in page.protected_mappings
+                ]
+            )
             accumulated = self._dedupe_protections(
                 [*accumulated, *response_protections]
+            )
+            request_keys = {
+                self._protection_key(mapping)
+                for mapping in request.protected_mappings
+            }
+            page_response_keys = {
+                self._protection_key(mapping)
+                for mapping in page_response_protections
+            }
+            segment_protections = tuple(
+                mapping
+                for mapping in response.protected_mappings
+                if self._protection_key(mapping) not in request_keys
+                and self._protection_key(mapping) not in page_response_keys
             )
             self._persist_segment_protections(
                 batch_id,
                 segment_id,
                 worker_id=worker_id,
-                protections=response_protections,
+                protections=segment_protections,
                 member_job_ids=member_job_ids,
                 timestamp=timestamp,
             )
@@ -793,26 +944,31 @@ class GBrainBatchRepository:
             if updated.rowcount != 1:
                 raise ProjectionLeaseLost("batch", batch_id)
 
-    @staticmethod
     def _require_batch_segment(
+        self,
         conn: Any,
         batch_id: str,
         segment_id: str,
         worker_id: str,
     ) -> None:
+        lock_clause = (
+            " FOR UPDATE" if self.settings.database_backend == "postgres" else ""
+        )
         batch = conn.execute(
-            """
+            f"""
             SELECT 1 FROM gbrain_projection_batches
             WHERE id=? AND status='running' AND lease_owner=?
+            {lock_clause}
             """,
             (batch_id, worker_id),
         ).fetchone()
         if batch is None:
             raise ProjectionLeaseLost("batch", batch_id)
         segment = conn.execute(
-            """
+            f"""
             SELECT 1 FROM gbrain_projection_segments
             WHERE id=? AND batch_id=? AND status='running' AND lease_owner=?
+            {lock_clause}
             """,
             (segment_id, batch_id, worker_id),
         ).fetchone()
@@ -854,6 +1010,151 @@ class GBrainBatchRepository:
         with connect_app_write(self.settings) as conn:
             return self._active_protections(conn, source_id)
 
+    def _reconcile_request_protections(
+        self,
+        batch_id: str,
+        segment_id: str,
+        *,
+        worker_id: str,
+        source_id: str,
+        snapshot: Mapping[str, Any],
+        protections: Sequence[ProtectedMapping],
+    ) -> tuple[ProtectedMapping, ...]:
+        raw_jobs = snapshot.get("jobs")
+        raw_mappings = snapshot.get("mappings")
+        with connect_app_write(self.settings) as conn:
+            self._require_batch_segment(conn, batch_id, segment_id, worker_id)
+            protection_rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT id,gbrain_source_id,page_id,slug,source_path,reason
+                    FROM gbrain_projection_protections
+                    WHERE gbrain_source_id=? AND active=1
+                    ORDER BY created_at,id
+                    """,
+                    (source_id,),
+                ).fetchall()
+            ]
+            active = self._dedupe_protections(
+                tuple(
+                    ProtectedMapping(
+                        source_id=str(row["gbrain_source_id"]),
+                        slug=row.get("slug"),
+                        source_path=row.get("source_path"),
+                        reason=str(row["reason"]),
+                    )
+                    for row in protection_rows
+                )
+            )
+            active_keys = {
+                (mapping.source_id, mapping.slug, mapping.source_path, mapping.reason)
+                for mapping in active
+            }
+            active = self._dedupe_protections(
+                (
+                    *(
+                        mapping
+                        for mapping in protections
+                        if (
+                            mapping.source_id,
+                            mapping.slug,
+                            mapping.source_path,
+                            mapping.reason,
+                        )
+                        in active_keys
+                    ),
+                    *active,
+                )
+            )
+            if not isinstance(raw_jobs, list) or not isinstance(raw_mappings, list):
+                return active
+
+            snapshot_jobs = [item for item in raw_jobs if isinstance(item, dict)]
+            snapshot_mappings = [item for item in raw_mappings if isinstance(item, dict)]
+            current_rows = conn.execute(
+                """
+                SELECT j.* FROM gbrain_projection_batch_jobs bj
+                JOIN knowledge_projection_jobs j ON j.id=bj.job_id
+                WHERE bj.batch_id=? AND bj.operation='delete'
+                ORDER BY j.created_at,j.id
+                """,
+                (batch_id,),
+            ).fetchall()
+            current_jobs = [ProjectionJob.from_row(dict(row)) for row in current_rows]
+            authoritative: dict[str, list[dict[str, Any]]] = {}
+            page_ids = {
+                str(row["page_id"])
+                for row in protection_rows
+                if row.get("page_id") is not None
+            }
+            for page_id in page_ids:
+                desired = [
+                    item
+                    for item in snapshot_jobs
+                    if item.get("operation") == "delete"
+                    and str(item.get("page_id")) == page_id
+                ]
+                owners = [job for job in current_jobs if str(job.page_id) == page_id]
+                if len(desired) != 1 or len(owners) != 1:
+                    continue
+                owner = owners[0]
+                if (
+                    not self._job_matches_snapshot(owner, desired[0])
+                    or owner.status != "running"
+                    or owner.lease_owner != worker_id
+                    or not self._page_matches_delete_job(
+                        self._page_snapshot(conn, page_id), owner
+                    )
+                ):
+                    continue
+                mappings = [
+                    item
+                    for item in snapshot_mappings
+                    if str(item.get("page_id")) == page_id
+                    and item.get("gbrain_source_id") == source_id
+                ]
+                if mappings:
+                    authoritative[page_id] = mappings
+
+            grouped: dict[
+                tuple[str, str | None, str | None, str], list[dict[str, Any]]
+            ] = {}
+            for row in protection_rows:
+                key = (
+                    str(row["gbrain_source_id"]),
+                    row.get("slug"),
+                    row.get("source_path"),
+                    str(row["reason"]),
+                )
+                grouped.setdefault(key, []).append(row)
+            releasable: set[tuple[str, str | None, str | None, str]] = set()
+            for key, rows in grouped.items():
+                matches: list[bool] = []
+                for row in rows:
+                    page_id = row.get("page_id")
+                    candidates = authoritative.get(str(page_id), []) if page_id is not None else []
+                    matched = [
+                        mapping
+                        for mapping in candidates
+                        if self._protection_matches_mapping(row, mapping)
+                        and self._mapping_matches_snapshot(conn, mapping)
+                    ]
+                    matches.append(len(matched) == 1)
+                if matches and all(matches):
+                    releasable.add(key)
+            return tuple(
+                mapping
+                for mapping in active
+                if (
+                    mapping.source_id,
+                    mapping.slug,
+                    mapping.source_path,
+                    mapping.reason,
+                )
+                not in releasable
+            )
+
     @staticmethod
     def _snapshot_protections(snapshot: Mapping[str, Any]) -> tuple[ProtectedMapping, ...]:
         return GBrainBatchRepository._decode_protections(
@@ -886,9 +1187,15 @@ class GBrainBatchRepository:
     ) -> tuple[ProtectedMapping, ...]:
         unique: dict[tuple[str, str | None, str | None, str], ProtectedMapping] = {}
         for mapping in protections:
-            key = (mapping.source_id, mapping.slug, mapping.source_path, mapping.reason)
+            key = GBrainBatchRepository._protection_key(mapping)
             unique.setdefault(key, mapping)
         return tuple(unique.values())
+
+    @staticmethod
+    def _protection_key(
+        mapping: ProtectedMapping,
+    ) -> tuple[str, str | None, str | None, str]:
+        return (mapping.source_id, mapping.slug, mapping.source_path, mapping.reason)
 
     @staticmethod
     def _persist_protections(
@@ -904,8 +1211,19 @@ class GBrainBatchRepository:
                 WHERE gbrain_source_id=? AND COALESCE(slug,'')=COALESCE(?, '')
                   AND COALESCE(source_path,'')=COALESCE(?, '')
                   AND reason=? AND active=1
+                  AND (
+                    page_id=?
+                    OR (page_id IS NULL AND CAST(? AS TEXT) IS NULL)
+                  )
                 """,
-                (mapping.source_id, mapping.slug, mapping.source_path, mapping.reason),
+                (
+                    mapping.source_id,
+                    mapping.slug,
+                    mapping.source_path,
+                    mapping.reason,
+                    page_id,
+                    page_id,
+                ),
             ).fetchone()
             if existing is not None:
                 continue
@@ -964,7 +1282,7 @@ class GBrainBatchRepository:
                 batch_id,
                 segment_id,
                 worker_id=worker_id,
-                mapping_snapshot=snapshot.get("mappings", []),
+                snapshot=snapshot,
                 deleted=response.deleted,
                 timestamp=timestamp,
             )
@@ -1028,9 +1346,20 @@ class GBrainBatchRepository:
             self._require_batch_segment(conn, batch_id, segment_id, worker_id)
             jobs = self._page_member_jobs(conn, batch_id, expected.page_id)
             self._require_job_owners(jobs, worker_id)
-            page = self._page_snapshot(conn, expected.page_id)
+            self._persist_protections(
+                conn,
+                result.protected_mappings,
+                timestamp,
+                expected.page_id,
+            )
+            page = self._page_snapshot(
+                conn,
+                expected.page_id,
+                for_update=True,
+            )
             if not self._page_matches_expected(page, expected):
                 self._supersede_jobs(conn, jobs, worker_id, page)
+                self._require_batch_segment(conn, batch_id, segment_id, worker_id)
                 return
             if not result.slug or not result.content_hash or result.page_generation is None:
                 self._fail_page_attribution(
@@ -1042,6 +1371,7 @@ class GBrainBatchRepository:
                     timestamp,
                     "GBrain page result omitted mapping identity",
                 )
+                self._require_batch_segment(conn, batch_id, segment_id, worker_id)
                 return
             occupying = conn.execute(
                 """
@@ -1061,8 +1391,16 @@ class GBrainBatchRepository:
                     timestamp,
                     "ambiguous GBrain slug attribution",
                 )
+                self._require_batch_segment(conn, batch_id, segment_id, worker_id)
                 return
-            if len(jobs) > 1:
+            desired_states = {
+                (job.page_id, job.revision_id, job.projection_epoch)
+                for job in jobs
+            }
+            expected_state = (
+                expected.page_id, expected.revision_id, expected.projection_epoch
+            )
+            if len(desired_states) > 1 or (desired_states and expected_state not in desired_states):
                 self._fail_page_attribution(
                     conn,
                     jobs,
@@ -1072,6 +1410,7 @@ class GBrainBatchRepository:
                     timestamp,
                     "ambiguous GBrain page job attribution",
                 )
+                self._require_batch_segment(conn, batch_id, segment_id, worker_id)
                 return
 
             conn.execute(
@@ -1090,7 +1429,7 @@ class GBrainBatchRepository:
                 (source_id, result.slug),
             ).fetchone()
             mapping_id = str(existing["id"]) if existing is not None else f"gproj_{uuid.uuid4().hex}"
-            last_job_id = jobs[0].id if jobs else batch_id
+            last_job_id = jobs[-1].id if jobs else batch_id
             conn.execute(
                 """
                 INSERT INTO gbrain_page_projections(
@@ -1144,11 +1483,18 @@ class GBrainBatchRepository:
                 """
                 UPDATE gbrain_projection_protections
                 SET active=0,resolved_at=?
-                WHERE gbrain_source_id=? AND active=1
+                WHERE gbrain_source_id=? AND page_id=? AND active=1
                   AND (slug=? OR source_path=?)
                 """,
-                (timestamp, source_id, result.slug, result.source_path),
+                (
+                    timestamp,
+                    source_id,
+                    expected.page_id,
+                    result.slug,
+                    result.source_path,
+                ),
             )
+            self._require_batch_segment(conn, batch_id, segment_id, worker_id)
 
     def _attribute_page_failure(
         self,
@@ -1173,10 +1519,17 @@ class GBrainBatchRepository:
                 ),
             )
             self._persist_protections(conn, protections, timestamp, expected.page_id)
-            page = self._page_snapshot(conn, expected.page_id)
+            page = self._page_snapshot(
+                conn,
+                expected.page_id,
+                for_update=True,
+            )
+            stale_expected = not self._page_matches_expected(page, expected)
             for job in jobs:
                 status: Literal["failed", "superseded"] = (
-                    "superseded" if result.status == "superseded" else "failed"
+                    "superseded"
+                    if stale_expected or result.status == "superseded"
+                    else "failed"
                 )
                 if not self.outbox.finish_claimed(
                     conn,
@@ -1186,8 +1539,9 @@ class GBrainBatchRepository:
                     last_error=result.error or f"GBrain page result: {result.status}",
                 ):
                     raise ProjectionLeaseLost("job", job.id)
-            if result.status == "superseded":
+            if stale_expected or result.status == "superseded":
                 self._enqueue_current_page(conn, page)
+            self._require_batch_segment(conn, batch_id, segment_id, worker_id)
 
     def _fail_page_attribution(
         self,
@@ -1222,10 +1576,12 @@ class GBrainBatchRepository:
         segment_id: str,
         *,
         worker_id: str,
-        mapping_snapshot: Any,
+        snapshot: Mapping[str, Any],
         deleted: Sequence[GBrainDeletedResult],
         timestamp: str,
     ) -> None:
+        mapping_snapshot = snapshot.get("mappings", [])
+        job_snapshot = snapshot.get("jobs", [])
         mappings = mapping_snapshot if isinstance(mapping_snapshot, list) else []
         for deletion in deleted:
             candidates = [
@@ -1244,10 +1600,31 @@ class GBrainBatchRepository:
                 self._require_batch_segment(conn, batch_id, segment_id, worker_id)
                 owners = self._delete_member_jobs(conn, batch_id, page_ids)
                 self._require_job_owners(owners, worker_id)
+                self._require_job_snapshots(owners, job_snapshot)
                 if not candidates:
                     continue
                 if len(candidates) == 1 and len(owners) <= 1:
                     mapping = candidates[0]
+                    page = self._page_snapshot(
+                        conn,
+                        mapping.get("page_id"),
+                        for_update=True,
+                    )
+                    if owners and not self._page_matches_delete_job(page, owners[0]):
+                        self._supersede_jobs(
+                            conn,
+                            owners,
+                            worker_id,
+                            page,
+                        )
+                        continue
+                    if (
+                        not owners
+                        and mapping.get("page_id") is not None
+                        and not self._page_matches_deleted_mapping(page, mapping)
+                    ):
+                        self._enqueue_current_page(conn, page)
+                        continue
                     self._set_mapping_status_from_snapshot(
                         conn,
                         mapping,
@@ -1264,6 +1641,15 @@ class GBrainBatchRepository:
                             status="succeeded",
                         ):
                             raise ProjectionLeaseLost("job", owner.id)
+                        conn.execute(
+                            """
+                            UPDATE gbrain_projection_protections
+                            SET active=0,resolved_at=?
+                            WHERE gbrain_source_id=? AND page_id=? AND active=1
+                              AND (slug=? OR source_path=?)
+                            """,
+                            (timestamp, deletion.source_id, owner.page_id, deletion.slug, mapping.get("source_path")),
+                        )
                     continue
 
                 for mapping in candidates:
@@ -1364,7 +1750,7 @@ class GBrainBatchRepository:
             JOIN knowledge_projection_jobs j ON j.id=bj.job_id
             WHERE bj.batch_id=? AND bj.page_id=?
               AND bj.operation IN ('upsert','rename','restore')
-            ORDER BY j.id
+            ORDER BY j.created_at,j.id
             """,
             (batch_id, page_id),
         ).fetchall()
@@ -1392,6 +1778,82 @@ class GBrainBatchRepository:
             for row in rows
             if str(row["page_id"]) in page_ids
         ]
+
+    @staticmethod
+    def _job_matches_snapshot(job: ProjectionJob, snapshot: Mapping[str, Any]) -> bool:
+        return bool(
+            snapshot.get("id") == job.id
+            and snapshot.get("page_id") == job.page_id
+            and snapshot.get("revision_id") == job.revision_id
+            and int(snapshot.get("projection_epoch") or 0) == job.projection_epoch
+            and snapshot.get("operation") == job.operation
+        )
+
+    @classmethod
+    def _require_job_snapshots(
+        cls,
+        jobs: Sequence[ProjectionJob],
+        snapshots: Any,
+    ) -> None:
+        raw = snapshots if isinstance(snapshots, list) else []
+        for job in jobs:
+            matches = [
+                item
+                for item in raw
+                if isinstance(item, dict) and cls._job_matches_snapshot(job, item)
+            ]
+            if len(matches) != 1:
+                raise ProjectionLeaseLost("job snapshot", job.id)
+
+    @staticmethod
+    def _page_matches_delete_job(
+        page: Mapping[str, Any] | None,
+        job: ProjectionJob,
+    ) -> bool:
+        return bool(
+            page
+            and page.get("lifecycle_status") in {"deleted", "invalid"}
+            and int(page.get("projection_epoch") or 0) == job.projection_epoch
+            and (
+                job.revision_id is None
+                or page.get("current_revision_id") == job.revision_id
+            )
+        )
+
+    @staticmethod
+    def _page_matches_deleted_mapping(
+        page: Mapping[str, Any] | None,
+        mapping: Mapping[str, Any],
+    ) -> bool:
+        del mapping
+        return bool(page and page.get("lifecycle_status") in {"deleted", "invalid"})
+
+    @staticmethod
+    def _protection_matches_mapping(
+        protection: Mapping[str, Any],
+        mapping: Mapping[str, Any],
+    ) -> bool:
+        slug = protection.get("slug")
+        source_path = protection.get("source_path")
+        return bool(
+            (slug is not None or source_path is not None)
+            and (slug is None or slug == mapping.get("slug"))
+            and (source_path is None or source_path == mapping.get("source_path"))
+        )
+
+    @staticmethod
+    def _mapping_matches_snapshot(conn: Any, snapshot: Mapping[str, Any]) -> bool:
+        mapping_id = snapshot.get("id")
+        if mapping_id is None:
+            return False
+        row = conn.execute(
+            "SELECT * FROM gbrain_page_projections WHERE id=?",
+            (mapping_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        current = dict(row)
+        return all(current.get(key) == value for key, value in snapshot.items())
 
     @staticmethod
     def _require_job_owners(jobs: Sequence[ProjectionJob], worker_id: str) -> None:
@@ -1431,17 +1893,28 @@ class GBrainBatchRepository:
             and page.get("revision_semantic_hash")
         )
 
-    @staticmethod
-    def _page_snapshot(conn: Any, page_id: str | None) -> dict[str, Any] | None:
+    def _page_snapshot(
+        self,
+        conn: Any,
+        page_id: str | None,
+        *,
+        for_update: bool = False,
+    ) -> dict[str, Any] | None:
         if page_id is None:
             return None
+        lock_clause = (
+            " FOR UPDATE OF p"
+            if for_update and self.settings.database_backend == "postgres"
+            else ""
+        )
         row = conn.execute(
-            """
+            f"""
             SELECT p.*,r.file_hash AS revision_file_hash,
                    r.semantic_hash AS revision_semantic_hash
             FROM wiki_pages p
             LEFT JOIN wiki_page_revisions r ON r.id=p.current_revision_id
             WHERE p.page_id=?
+            {lock_clause}
             """,
             (page_id,),
         ).fetchone()
@@ -1471,7 +1944,7 @@ class GBrainBatchRepository:
         )
 
     def _expected_for_job(self, conn: Any, job: ProjectionJob) -> ExpectedPage | None:
-        page = self._page_snapshot(conn, job.page_id)
+        page = self._page_snapshot(conn, job.page_id, for_update=True)
         if not self._page_matches_job(page, job):
             return None
         return self._expected_from_page(page)

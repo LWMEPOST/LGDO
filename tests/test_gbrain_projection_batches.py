@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import pytest
@@ -291,6 +291,36 @@ def _seed_mapping(
             ),
         )
     return resolved_slug
+
+
+def _seed_protection(
+    settings: Settings,
+    *,
+    page_id: str | None,
+    slug: str,
+    source_path: str,
+    reason: str,
+    protection_id: str | None = None,
+) -> str:
+    protection_id = protection_id or f"gprotect_{reason}"
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO gbrain_projection_protections(
+              id,gbrain_source_id,page_id,slug,source_path,reason,
+              active,created_at,resolved_at)
+            VALUES (?, 'lgdo-managed',?,?,?,?,1,?,NULL)
+            """,
+            (
+                protection_id,
+                page_id,
+                slug,
+                source_path,
+                reason,
+                NOW.isoformat(),
+            ),
+        )
+    return protection_id
 
 
 def _page_result(
@@ -820,6 +850,242 @@ def test_deterministic_page_failure_allows_non_success_raw_hashes(
     assert _job_statuses(settings, job_id) == {job_id: expected_job_status}
 
 
+def test_failure_for_old_revision_supersedes_job_and_requeues_current_page(settings):
+    old = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=old)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    current = _advance_page(settings, old)
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    statuses={old.page_id: ("error", (), "stale failure")},
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        current_job = conn.execute(
+            """
+            SELECT status FROM knowledge_projection_jobs
+            WHERE page_id=? AND revision_id=? AND projection_epoch=?
+            """,
+            (current.page_id, current.revision_id, current.projection_epoch),
+        ).fetchone()
+        protection = conn.execute(
+            """
+            SELECT active FROM gbrain_projection_protections
+            WHERE page_id=? ORDER BY created_at DESC,id DESC LIMIT 1
+            """,
+            (old.page_id,),
+        ).fetchone()
+
+    assert _job_statuses(settings, job_id)[job_id] == "superseded"
+    assert current_job is not None
+    assert current_job["status"] == "pending"
+    assert protection is not None
+    assert protection["active"] == 1
+
+
+def test_expired_batch_is_reclaimed_with_same_segment_idempotency_key(settings):
+    page = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    repository = GBrainBatchRepository(settings)
+    first = repository.create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    first_key = first.segments[0].idempotency_key
+    takeover = NOW + timedelta(seconds=181)
+
+    claimed = ProjectionOutbox(settings).claim(
+        target="gbrain",
+        worker_id="worker-b",
+        limit=500,
+        lease_seconds=180,
+        now=takeover,
+    )
+    resumed = repository.create_batch(
+        claimed,
+        worker_id="worker-b",
+        lease_seconds=180,
+        now=takeover,
+    )
+
+    with connect_app(settings) as conn:
+        batch_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_projection_batches"
+        ).fetchone()["count"]
+        segment = conn.execute(
+            "SELECT status,lease_owner,idempotency_key FROM gbrain_projection_segments WHERE batch_id=?",
+            (first.id,),
+        ).fetchone()
+        job = conn.execute(
+            "SELECT status,lease_owner FROM knowledge_projection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+
+    assert resumed is not None
+    assert resumed.id == first.id
+    assert resumed.segments[0].idempotency_key == first_key
+    assert batch_count == 1
+    assert (segment["status"], segment["lease_owner"]) == ("pending", "worker-b")
+    assert (job["status"], job["lease_owner"]) == ("running", "worker-b")
+
+
+def test_reclaimed_batch_replays_persisted_segment_request(settings):
+    page = _seed_page(settings, 1)
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    repository = GBrainBatchRepository(settings)
+    first = repository.create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    takeover = NOW + timedelta(seconds=181)
+    claimed = ProjectionOutbox(settings).claim(
+        target="gbrain",
+        worker_id="worker-b",
+        limit=500,
+        lease_seconds=180,
+        now=takeover,
+    )
+    resumed = repository.create_batch(
+        claimed,
+        worker_id="worker-b",
+        lease_seconds=180,
+        now=takeover,
+    )
+    client = ScriptedProjectionClient(
+        lambda request: _response(
+            request,
+            statuses={page.page_id: ("imported", (), None)},
+        )
+    )
+
+    result = asyncio.run(
+        repository.execute_batch(
+            resumed.id,
+            worker_id="worker-b",
+            client=client,
+            lease_seconds=180,
+            now=takeover,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert [request.idempotency_key for request in client.requests] == [
+        first.segments[0].idempotency_key
+    ]
+    assert _job_statuses(settings, job_id)[job_id] == "succeeded"
+
+
+def test_partial_multisegment_batch_resumes_without_reclaiming_terminal_members(settings):
+    pages = [_seed_page(settings, index) for index in range(101)]
+    page_jobs = [_enqueue(settings, operation="upsert", page=page) for page in pages]
+    control_job = _enqueue(settings, operation="reconcile", page=None)
+    repository = GBrainBatchRepository(settings)
+    first = repository.create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    assert first is not None
+    original_keys = tuple(segment.idempotency_key for segment in first.segments)
+    failed_client = ScriptedProjectionClient(
+        lambda request: _response(request),
+        ProjectionNetworkError("final reconcile timed out"),
+    )
+
+    with pytest.raises(ProjectionNetworkError, match="final reconcile timed out"):
+        asyncio.run(
+            repository.execute_batch(
+                first.id,
+                worker_id=WORKER,
+                client=failed_client,
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    assert [request.mode for request in failed_client.requests] == [
+        "incremental",
+        "reconcile",
+    ]
+    assert _job_statuses(settings, *page_jobs[:100]) == {
+        job_id: "succeeded" for job_id in page_jobs[:100]
+    }
+    assert _job_statuses(settings, page_jobs[100], control_job) == {
+        page_jobs[100]: "running",
+        control_job: "running",
+    }
+
+    takeover = NOW + timedelta(seconds=181)
+    claimed = ProjectionOutbox(settings).claim(
+        target="gbrain",
+        worker_id="worker-b",
+        limit=500,
+        lease_seconds=180,
+        now=takeover,
+    )
+    assert {job.id for job in claimed} == {page_jobs[100], control_job}
+
+    resumed = repository.create_batch(
+        claimed,
+        worker_id="worker-b",
+        lease_seconds=180,
+        now=takeover,
+    )
+    assert resumed is not None
+    assert resumed.id == first.id
+    assert tuple(segment.idempotency_key for segment in resumed.segments) == original_keys
+
+    retry_client = ScriptedProjectionClient(lambda request: _response(request))
+    result = asyncio.run(
+        repository.execute_batch(
+            resumed.id,
+            worker_id="worker-b",
+            client=retry_client,
+            lease_seconds=180,
+            now=takeover,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert len(retry_client.requests) == 1
+    assert retry_client.requests[0].mode == "reconcile"
+    assert retry_client.requests[0].idempotency_key == original_keys[1]
+    assert retry_client.requests[0].expected_pages == (pages[100].expected(),)
+    assert _job_statuses(settings, page_jobs[100], control_job) == {
+        page_jobs[100]: "succeeded",
+        control_job: "succeeded",
+    }
+    with connect_app(settings) as conn:
+        batch_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_projection_batches"
+        ).fetchone()["count"]
+        segment_rows = conn.execute(
+            """
+            SELECT segment_index,status,idempotency_key
+            FROM gbrain_projection_segments
+            WHERE batch_id=? ORDER BY segment_index
+            """,
+            (first.id,),
+        ).fetchall()
+    assert batch_count == 1
+    assert [
+        (row["segment_index"], row["status"], row["idempotency_key"])
+        for row in segment_rows
+    ] == [
+        (0, "succeeded", original_keys[0]),
+        (1, "succeeded", original_keys[1]),
+    ]
+
+
 @pytest.mark.parametrize(
     ("identity_field", "wrong_value"),
     [
@@ -949,6 +1215,341 @@ def test_successful_rename_stales_old_current_mapping_before_new_upsert(settings
     assert _generation(settings) == 1
 
 
+def test_same_desired_state_page_jobs_share_one_success_attribution(settings):
+    page = _seed_page(settings, 1)
+    rename_job = _enqueue(settings, operation="rename", page=page)
+    upsert_job = _enqueue(settings, operation="upsert", page=page)
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE knowledge_projection_jobs SET created_at=? WHERE id=?",
+            ("2098-01-01T00:00:00+00:00", rename_job),
+        )
+        conn.execute(
+            "UPDATE knowledge_projection_jobs SET created_at=? WHERE id=?",
+            ("2098-01-01T00:00:01+00:00", upsert_job),
+        )
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    statuses={page.page_id: ("imported", (), None)},
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        mapping = conn.execute(
+            "SELECT last_job_id,status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()
+        protection_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_projection_protections"
+        ).fetchone()["count"]
+    assert _job_statuses(settings, rename_job, upsert_job) == {
+        rename_job: "succeeded",
+        upsert_job: "succeeded",
+    }
+    assert (mapping["last_job_id"], mapping["status"]) == (upsert_job, "current")
+    assert protection_count == 0
+    assert _generation(settings) == 1
+
+
+def test_page_success_resolves_only_current_page_protections(settings):
+    page = _seed_page(settings, 1)
+    other = _seed_page(settings, 2)
+    slug = page.expected().path
+    own_id = _seed_protection(
+        settings,
+        page_id=page.page_id,
+        slug=slug,
+        source_path=slug,
+        reason="page-success",
+        protection_id="gprotect_success_own",
+    )
+    other_id = _seed_protection(
+        settings,
+        page_id=other.page_id,
+        slug=slug,
+        source_path=slug,
+        reason="page-success",
+        protection_id="gprotect_success_other",
+    )
+    unknown_id = _seed_protection(
+        settings,
+        page_id=None,
+        slug=slug,
+        source_path=slug,
+        reason="page-success",
+        protection_id="gprotect_success_unknown",
+    )
+    job_id = _enqueue(settings, operation="upsert", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    statuses={page.page_id: ("imported", (), None)},
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        protections = conn.execute(
+            "SELECT id,active,resolved_at FROM gbrain_projection_protections ORDER BY id"
+        ).fetchall()
+    by_id = {row["id"]: (row["active"], row["resolved_at"]) for row in protections}
+    assert by_id[own_id][0] == 0
+    assert by_id[own_id][1] is not None
+    assert by_id[other_id] == (1, None)
+    assert by_id[unknown_id] == (1, None)
+    assert _job_statuses(settings, job_id)[job_id] == "succeeded"
+
+
+def test_same_desired_state_page_jobs_roll_back_when_any_finish_cas_fails(
+    settings,
+    monkeypatch,
+):
+    page = _seed_page(settings, 1)
+    rename_job = _enqueue(settings, operation="rename", page=page)
+    upsert_job = _enqueue(settings, operation="upsert", page=page)
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE knowledge_projection_jobs SET created_at=? WHERE id=?",
+            ("2098-01-01T00:00:00+00:00", rename_job),
+        )
+        conn.execute(
+            "UPDATE knowledge_projection_jobs SET created_at=? WHERE id=?",
+            ("2098-01-01T00:00:01+00:00", upsert_job),
+        )
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    repository = GBrainBatchRepository(settings)
+    finish_claimed = repository.outbox.finish_claimed
+    finished: list[str] = []
+
+    def lose_second_finish(conn, **kwargs):
+        job_id = str(kwargs["job_id"])
+        finished.append(job_id)
+        if job_id == upsert_job:
+            return False
+        return finish_claimed(conn, **kwargs)
+
+    monkeypatch.setattr(repository.outbox, "finish_claimed", lose_second_finish)
+
+    with pytest.raises(ProjectionLeaseLost, match=upsert_job):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        statuses={page.page_id: ("imported", (), None)},
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    with connect_app(settings) as conn:
+        mapping_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_page_projections"
+        ).fetchone()["count"]
+        protection_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_projection_protections"
+        ).fetchone()["count"]
+    assert finished == [rename_job, upsert_job]
+    assert _job_statuses(settings, rename_job, upsert_job) == {
+        rename_job: "running",
+        upsert_job: "running",
+    }
+    assert mapping_count == 0
+    assert protection_count == 0
+    assert _generation(settings) == 0
+
+
+def test_page_response_protection_rolls_back_with_page_attribution(
+    settings,
+    monkeypatch,
+):
+    page = _seed_page(settings, 1)
+    rename_job = _enqueue(settings, operation="rename", page=page)
+    upsert_job = _enqueue(settings, operation="upsert", page=page)
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE knowledge_projection_jobs SET created_at=? WHERE id=?",
+            ("2098-01-01T00:00:00+00:00", rename_job),
+        )
+        conn.execute(
+            "UPDATE knowledge_projection_jobs SET created_at=? WHERE id=?",
+            ("2098-01-01T00:00:01+00:00", upsert_job),
+        )
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    repository = GBrainBatchRepository(settings)
+    finish_claimed = repository.outbox.finish_claimed
+    protection = ProtectedMapping(
+        source_id="lgdo-managed",
+        slug=page.expected().path.removesuffix(".md"),
+        source_path=page.expected().path,
+        reason="page-response-protection",
+    )
+
+    def lose_second_finish(conn, **kwargs):
+        if kwargs["job_id"] == upsert_job:
+            return False
+        return finish_claimed(conn, **kwargs)
+
+    monkeypatch.setattr(repository.outbox, "finish_claimed", lose_second_finish)
+
+    with pytest.raises(ProjectionLeaseLost, match=upsert_job):
+        asyncio.run(
+            repository.execute_batch(
+                batch.id,
+                worker_id=WORKER,
+                client=ScriptedProjectionClient(
+                    lambda request: _response(
+                        request,
+                        statuses={page.page_id: ("imported", (protection,), None)},
+                    )
+                ),
+                lease_seconds=180,
+                now=NOW,
+            )
+        )
+
+    with connect_app(settings) as conn:
+        mapping_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_page_projections"
+        ).fetchone()["count"]
+        protection_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_projection_protections"
+        ).fetchone()["count"]
+    assert _job_statuses(settings, rename_job, upsert_job) == {
+        rename_job: "running",
+        upsert_job: "running",
+    }
+    assert mapping_count == 0
+    assert protection_count == 0
+    assert _generation(settings) == 0
+
+
+def test_same_page_protection_dto_keeps_distinct_page_owners(settings):
+    first = _seed_page(settings, 1)
+    second = _seed_page(settings, 2)
+    first_job = _enqueue(settings, operation="upsert", page=first)
+    second_job = _enqueue(settings, operation="upsert", page=second)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    shared = ProtectedMapping(
+        source_id="lgdo-managed",
+        slug="shared/protected",
+        source_path="shared/protected.md",
+        reason="same-page-dto",
+    )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    statuses={
+                        first.page_id: ("error", (shared,), "first failure"),
+                        second.page_id: ("error", (shared,), "second failure"),
+                    },
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT page_id,slug,source_path,reason,active
+            FROM gbrain_projection_protections
+            ORDER BY page_id
+            """
+        ).fetchall()
+    assert [row["page_id"] for row in rows] == [first.page_id, second.page_id]
+    assert all(row["active"] == 1 for row in rows)
+    assert _job_statuses(settings, first_job, second_job) == {
+        first_job: "failed",
+        second_job: "failed",
+    }
+
+
+def test_different_desired_state_page_jobs_still_fail_closed(settings):
+    page = _seed_page(settings, 1)
+    rename_job = _enqueue(settings, operation="rename", page=page)
+    upsert_job = _enqueue(settings, operation="upsert", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE knowledge_projection_jobs SET projection_epoch=? WHERE id=?",
+            (page.projection_epoch + 1, upsert_job),
+        )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    statuses={page.page_id: ("imported", (), None)},
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        mapping_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM gbrain_page_projections"
+        ).fetchone()["count"]
+        protection = conn.execute(
+            "SELECT reason,active FROM gbrain_projection_protections"
+        ).fetchone()
+    assert _job_statuses(settings, rename_job, upsert_job) == {
+        rename_job: "failed",
+        upsert_job: "failed",
+    }
+    assert mapping_count == 0
+    assert "ambiguous" in protection["reason"]
+    assert protection["active"] == 1
+    assert _generation(settings) == 0
+
+
 def test_slug_owned_by_another_page_fails_closed_and_persists_protection(settings):
     target = _seed_page(settings, 1)
     other = _seed_page(settings, 2)
@@ -1065,6 +1666,314 @@ def test_unique_delete_marks_mapping_deleted_bumps_generation_and_finishes_owner
     assert mapping["invalidated_at"] is not None
     assert _job_statuses(settings, job_id)[job_id] == "succeeded"
     assert _generation(settings) == 1
+
+
+def test_authoritative_delete_omits_only_its_page_protections_and_resolves_them(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    other = _seed_page(settings, 2)
+    slug = _seed_mapping(settings, page)
+    own_id = _seed_protection(
+        settings,
+        page_id=page.page_id,
+        slug=slug,
+        source_path=page.expected().path,
+        reason="own-page-error",
+    )
+    other_id = _seed_protection(
+        settings,
+        page_id=other.page_id,
+        slug="other/protected",
+        source_path="other/protected.md",
+        reason="other-page-error",
+    )
+    unknown_id = _seed_protection(
+        settings,
+        page_id=None,
+        slug="unknown/protected",
+        source_path="unknown/protected.md",
+        reason="unknown-owner",
+    )
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    def delete_owned_mapping(request: GBrainSyncRequest) -> GBrainSyncResponse:
+        assert {mapping.reason for mapping in request.protected_mappings} == {
+            "other-page-error",
+            "unknown-owner",
+        }
+        return _response(
+            request,
+            deleted=(GBrainDeletedResult(source_id="lgdo-managed", slug=slug),),
+        )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(delete_owned_mapping),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        protections = conn.execute(
+            "SELECT id,active,resolved_at FROM gbrain_projection_protections ORDER BY id"
+        ).fetchall()
+    by_id = {row["id"]: (row["active"], row["resolved_at"]) for row in protections}
+    assert by_id[own_id][0] == 0
+    assert by_id[own_id][1] is not None
+    assert by_id[other_id] == (1, None)
+    assert by_id[unknown_id] == (1, None)
+    assert _job_statuses(settings, job_id)[job_id] == "succeeded"
+
+
+def test_authoritative_delete_accepts_production_null_revision_job(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    with connect_app_write(settings) as conn:
+        job_id = ProjectionOutbox(settings).enqueue(
+            conn,
+            target="gbrain",
+            operation="delete",
+            page_id=page.page_id,
+            revision_id=None,
+            projection_epoch=page.projection_epoch,
+            payload={"path": page.path, "reason": "deleted"},
+        )
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    deleted=(GBrainDeletedResult(source_id="lgdo-managed", slug=slug),),
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        mapping_status = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()["status"]
+    assert mapping_status == "deleted"
+    assert _job_statuses(settings, job_id)[job_id] == "succeeded"
+    assert _generation(settings) == 1
+
+
+def test_null_owner_collision_keeps_same_protection_in_delete_request(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    own_id = _seed_protection(
+        settings,
+        page_id=page.page_id,
+        slug=slug,
+        source_path=page.expected().path,
+        reason="shared-error",
+        protection_id="gprotect_owned",
+    )
+    unknown_id = _seed_protection(
+        settings,
+        page_id=None,
+        slug=slug,
+        source_path=page.expected().path,
+        reason="shared-error",
+        protection_id="gprotect_unknown",
+    )
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    def protect_colliding_mapping(request: GBrainSyncRequest) -> GBrainSyncResponse:
+        assert request.protected_mappings == (
+            ProtectedMapping(
+                source_id="lgdo-managed",
+                slug=slug,
+                source_path=page.expected().path,
+                reason="shared-error",
+            ),
+        )
+        return _response(request)
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(protect_colliding_mapping),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        protections = conn.execute(
+            "SELECT id,active,resolved_at FROM gbrain_projection_protections ORDER BY id"
+        ).fetchall()
+        mapping_status = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()["status"]
+    by_id = {row["id"]: (row["active"], row["resolved_at"]) for row in protections}
+    assert by_id[own_id] == (1, None)
+    assert by_id[unknown_id] == (1, None)
+    assert mapping_status == "current"
+    assert _job_statuses(settings, job_id)[job_id] == "failed"
+
+
+def test_failed_authoritative_delete_keeps_its_page_protection_active(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    own_id = _seed_protection(
+        settings,
+        page_id=page.page_id,
+        slug=slug,
+        source_path=page.expected().path,
+        reason="own-page-error",
+    )
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(lambda request: _response(request)),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        protection = conn.execute(
+            "SELECT active,resolved_at FROM gbrain_projection_protections WHERE id=?",
+            (own_id,),
+        ).fetchone()
+    assert (protection["active"], protection["resolved_at"]) == (1, None)
+    assert _job_statuses(settings, job_id)[job_id] == "failed"
+
+
+def test_restored_page_keeps_delete_protection_and_fails_closed(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    own_id = _seed_protection(
+        settings,
+        page_id=page.page_id,
+        slug=slug,
+        source_path=page.expected().path,
+        reason="own-page-error",
+    )
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE wiki_pages SET lifecycle_status='active' WHERE page_id=?",
+            (page.page_id,),
+        )
+
+    def observe_restored_page(request: GBrainSyncRequest) -> GBrainSyncResponse:
+        assert {mapping.reason for mapping in request.protected_mappings} == {
+            "own-page-error"
+        }
+        return _response(request)
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(observe_restored_page),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        protection = conn.execute(
+            "SELECT active,resolved_at FROM gbrain_projection_protections WHERE id=?",
+            (own_id,),
+        ).fetchone()
+        mapping = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()
+    assert (protection["active"], protection["resolved_at"]) == (1, None)
+    assert mapping["status"] == "current"
+    assert _job_statuses(settings, job_id)[job_id] == "failed"
+
+
+def test_restore_during_delete_request_cannot_clear_page_protection(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    own_id = _seed_protection(
+        settings,
+        page_id=page.page_id,
+        slug=slug,
+        source_path=page.expected().path,
+        reason="own-page-error",
+    )
+    job_id = _enqueue(settings, operation="delete", page=page)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    def restore_then_report_delete(request: GBrainSyncRequest) -> GBrainSyncResponse:
+        assert request.protected_mappings == ()
+        with connect_app_write(settings) as conn:
+            conn.execute(
+                "UPDATE wiki_pages SET lifecycle_status='active' WHERE page_id=?",
+                (page.page_id,),
+            )
+        return _response(
+            request,
+            deleted=(GBrainDeletedResult(source_id="lgdo-managed", slug=slug),),
+        )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(restore_then_report_delete),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        protection = conn.execute(
+            "SELECT active,resolved_at FROM gbrain_projection_protections WHERE id=?",
+            (own_id,),
+        ).fetchone()
+        mapping = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()
+        replacement = conn.execute(
+            """
+            SELECT status FROM knowledge_projection_jobs
+            WHERE target='gbrain' AND operation='upsert' AND page_id=?
+              AND revision_id=? AND projection_epoch=?
+            """,
+            (page.page_id, page.revision_id, page.projection_epoch),
+        ).fetchone()
+    assert (protection["active"], protection["resolved_at"]) == (1, None)
+    assert mapping["status"] == "current"
+    assert _job_statuses(settings, job_id)[job_id] == "superseded"
+    assert replacement["status"] == "pending"
 
 
 @pytest.mark.parametrize(
@@ -1230,6 +2139,126 @@ def test_orphan_mapping_and_unmanaged_ghost_deletions_are_legal(settings):
     assert orphan_status == "deleted"
     assert _job_statuses(settings, control_job)[control_job] == "succeeded"
     assert _generation(settings) == 1
+
+
+def test_restored_orphan_mapping_ignores_stale_reconcile_delete(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    control_job = _enqueue(settings, operation="reconcile", page=None)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE wiki_pages SET lifecycle_status='active' WHERE page_id=?",
+            (page.page_id,),
+        )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    deleted=(GBrainDeletedResult(source_id="lgdo-managed", slug=slug),),
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        mapping = conn.execute(
+            "SELECT status,invalidated_at FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()
+        replacement = conn.execute(
+            """
+            SELECT status FROM knowledge_projection_jobs
+            WHERE target='gbrain' AND operation='upsert' AND page_id=?
+              AND revision_id=? AND projection_epoch=?
+            """,
+            (page.page_id, page.revision_id, page.projection_epoch),
+        ).fetchone()
+    assert (mapping["status"], mapping["invalidated_at"]) == ("current", None)
+    assert replacement["status"] == "pending"
+    assert _job_statuses(settings, control_job)[control_job] == "succeeded"
+    assert _generation(settings) == 0
+
+
+def test_ownerless_cleanup_accepts_deleted_page_after_epoch_advance(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            "UPDATE wiki_pages SET projection_epoch=? WHERE page_id=?",
+            (page.projection_epoch + 1, page.page_id),
+        )
+    control_job = _enqueue(settings, operation="reconcile", page=None)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    deleted=(GBrainDeletedResult(source_id="lgdo-managed", slug=slug),),
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        mapping_status = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()["status"]
+    assert mapping_status == "deleted"
+    assert _job_statuses(settings, control_job)[control_job] == "succeeded"
+    assert _generation(settings) == 1
+
+
+def test_ownerless_cleanup_fails_closed_when_page_row_is_missing(settings):
+    page = _seed_page(settings, 1, lifecycle_status="deleted")
+    slug = _seed_mapping(settings, page)
+    with connect_app_write(settings) as conn:
+        conn.execute("DELETE FROM wiki_pages WHERE page_id=?", (page.page_id,))
+    control_job = _enqueue(settings, operation="reconcile", page=None)
+    batch = GBrainBatchRepository(settings).create_batch(
+        _claim(settings), worker_id=WORKER, lease_seconds=180, now=NOW
+    )
+
+    asyncio.run(
+        GBrainBatchRepository(settings).execute_batch(
+            batch.id,
+            worker_id=WORKER,
+            client=ScriptedProjectionClient(
+                lambda request: _response(
+                    request,
+                    deleted=(GBrainDeletedResult(source_id="lgdo-managed", slug=slug),),
+                )
+            ),
+            lease_seconds=180,
+            now=NOW,
+        )
+    )
+
+    with connect_app(settings) as conn:
+        mapping_status = conn.execute(
+            "SELECT status FROM gbrain_page_projections WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()["status"]
+    assert mapping_status == "current"
+    assert _job_statuses(settings, control_job)[control_job] == "succeeded"
+    assert _generation(settings) == 0
 
 
 def test_ambiguous_delete_owners_fail_and_protect_stale_mapping(settings):

@@ -84,11 +84,11 @@ class Settings(BaseSettings):
     oidc_role_claim: str = "role"
     oidc_acl_claim: str = "acl_tags"
     oidc_groups_claim: str = "groups"
-    auth_dev_fallback_enabled: bool = True
+    auth_dev_fallback_enabled: bool = False
     auth_dev_user_id: str = "admin"
     auth_dev_username: str = "管理员"
     auth_trust_request_user_context: bool = False
-    auth_bootstrap_admin_password: str = "admin"
+    auth_bootstrap_admin_password: str | None = None
     auth_session_ttl_hours: int = 12
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")

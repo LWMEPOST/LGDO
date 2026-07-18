@@ -749,6 +749,98 @@ def test_manual_save_requires_current_revision_and_keeps_generated_pointer(
     assert len(result.projection_job_ids) == 2
 
 
+def test_manual_save_projects_validated_content_metadata_and_clears_owner(
+    legacy_page_fixture,
+):
+    service, page = legacy_page_fixture
+    seed_source(service.settings, "src_manual_next", domain="support")
+    content = external_page_bytes(
+        title="Manual metadata",
+        source_ids=("src_manual_next",),
+        domain="operations",
+        body="Manual metadata body",
+    ).replace(b"page_type: feature", b"page_type: policy")
+
+    result = service.prepare_manual_save(
+        ManualSaveCommand(
+            page_path=page.page_path,
+            content=content.decode("utf-8"),
+            expected_revision_id=page.current_revision_id,
+            request_id="manual-project-content-metadata",
+            actor="alice",
+            owner=None,
+            note=None,
+            review_status="stale",
+        )
+    )
+
+    with connect_app(service.settings) as conn:
+        stored = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (page.page_id,),
+            ).fetchone()
+        )
+    assert result.status == "applied"
+    assert (
+        stored["title"],
+        stored["domain"],
+        stored["page_type"],
+        json.loads(stored["source_ids_json"]),
+        stored["review_status"],
+        stored["owner"],
+    ) == (
+        "Manual metadata",
+        "operations",
+        "policy",
+        ["src_manual_next"],
+        "stale",
+        None,
+    )
+
+
+def test_manual_save_rejects_unknown_source_before_revision_or_intent(
+    legacy_page_fixture,
+):
+    service, page = legacy_page_fixture
+    content = page.content.replace("source_ids: [src_1]", "source_ids: [src_missing]")
+    with connect_app(service.settings) as conn:
+        revision_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()[0]
+        intent_count = conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()[0]
+
+    with pytest.raises(MarkdownParseError) as exc_info:
+        service.prepare_manual_save(
+            ManualSaveCommand(
+                page_path=page.page_path,
+                content=content,
+                expected_revision_id=page.current_revision_id,
+                request_id="manual-reject-unknown-source",
+                actor="alice",
+                owner=None,
+                note=None,
+                review_status="reviewed",
+            ),
+            execute_intent=False,
+        )
+
+    assert exc_info.value.code == "unknown_source"
+    with connect_app(service.settings) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()[0] == revision_count
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (page.page_id,),
+        ).fetchone()[0] == intent_count
+
+
 def test_manual_applied_audit_preserves_request_identity_and_revision_metadata(
     legacy_page_fixture,
 ):
@@ -3584,6 +3676,114 @@ def test_content_conflict_resolution_records_locked_branch_contract(
         }
 
 
+def test_merged_conflict_projects_validated_content_metadata_and_clears_owner(
+    content_conflict_fixture,
+):
+    scenario = content_conflict_fixture
+    service, conflict, current = (
+        scenario.service,
+        scenario.conflict,
+        scenario.current,
+    )
+    seed_source(service.settings, "src_merge_next", domain="support")
+    merged = external_page_bytes(
+        title="Merged metadata",
+        source_ids=("src_merge_next",),
+        domain="operations",
+        body="Merged conflict body",
+    ).replace(b"page_type: feature", b"page_type: policy").replace(
+        b"review_status: draft",
+        b"review_status: stale",
+    )
+
+    result = service.resolve_conflict(
+        ResolveConflictCommand(
+            review_id=conflict["id"],
+            resolution="merged_content",
+            merged_content=merged.decode("utf-8"),
+            expected_current_revision_id=conflict["base_revision_id"],
+            expected_generated_revision_id=conflict["candidate_revision_id"],
+            request_id="merge-project-content-metadata",
+            actor="alice",
+            note=None,
+        )
+    )
+
+    with connect_app(service.settings) as conn:
+        stored = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (current.page_id,),
+            ).fetchone()
+        )
+    assert result.status == "resolved"
+    assert (
+        stored["title"],
+        stored["domain"],
+        stored["page_type"],
+        json.loads(stored["source_ids_json"]),
+        stored["review_status"],
+        stored["owner"],
+    ) == (
+        "Merged metadata",
+        "operations",
+        "policy",
+        ["src_merge_next"],
+        "stale",
+        None,
+    )
+
+
+def test_merged_conflict_rejects_unknown_source_before_revision_or_intent(
+    content_conflict_fixture,
+):
+    scenario = content_conflict_fixture
+    service, conflict, current = (
+        scenario.service,
+        scenario.conflict,
+        scenario.current,
+    )
+    merged = external_page_bytes(
+        title="Invalid merge",
+        source_ids=("src_missing",),
+        domain="product",
+    ).decode("utf-8")
+    with connect_app(service.settings) as conn:
+        revision_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0]
+        intent_count = conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0]
+
+    with pytest.raises(MarkdownParseError) as exc_info:
+        service.resolve_conflict(
+            ResolveConflictCommand(
+                review_id=conflict["id"],
+                resolution="merged_content",
+                merged_content=merged,
+                expected_current_revision_id=conflict["base_revision_id"],
+                expected_generated_revision_id=conflict["candidate_revision_id"],
+                request_id="merge-reject-unknown-source",
+                actor="alice",
+                note=None,
+            )
+        )
+
+    assert exc_info.value.code == "unknown_source"
+    with connect_app(service.settings) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0] == revision_count
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vault_write_intents WHERE page_id=?",
+            (current.page_id,),
+        ).fetchone()[0] == intent_count
+
+
 def test_same_semantic_candidate_after_keep_does_not_reopen_content_conflict(
     content_conflict_fixture,
 ):
@@ -4607,6 +4807,56 @@ def test_deleted_identical_bytes_restore_creates_new_external_revision(
     assert revision["origin"] == "external"
 
 
+def test_deleted_page_restores_from_new_obsidian_path_as_external_revision(
+    legacy_page_fixture,
+):
+    service, before = legacy_page_fixture
+    old_path = before.page_path
+    new_path = "wiki/product/faq/restored-at-new-path.md"
+    old_target = service.settings.vault_path / old_path
+    new_target = service.settings.vault_path / new_path
+    old_target.unlink()
+    deleted = service.delete_page("delete-before-new-path-restore", old_path)
+    restored_bytes = before.raw_bytes.replace(b"# Demo", b"# Restored elsewhere")
+    new_target.parent.mkdir(parents=True, exist_ok=True)
+    new_target.write_bytes(restored_bytes)
+
+    restored = service.ingest_external_change(
+        "restore-at-new-path",
+        new_path,
+        capture_file_observation(
+            new_target,
+            max_content_bytes=1_000_000,
+            prefix_bytes=64 * 1024,
+        ),
+    )
+
+    with connect_app(service.settings) as conn:
+        page = dict(
+            conn.execute(
+                "SELECT * FROM wiki_pages WHERE page_id=?",
+                (before.page_id,),
+            ).fetchone()
+        )
+        revision = dict(
+            conn.execute(
+                "SELECT * FROM wiki_page_revisions WHERE id=?",
+                (restored.revision_id,),
+            ).fetchone()
+        )
+    assert deleted.status == "deleted"
+    assert restored.status == "applied"
+    assert restored.page_id == before.page_id
+    assert restored.page_path == new_path
+    assert restored.revision_id != before.current_revision_id
+    assert page["path"] == new_path
+    assert page["lifecycle_status"] == "active"
+    assert page["current_revision_id"] == restored.revision_id
+    assert revision["origin"] == "external"
+    assert revision["page_path"] == new_path
+    assert not old_target.exists()
+
+
 def test_invalid_identical_historical_bytes_restore_creates_new_external_revision(
     legacy_page_fixture,
 ):
@@ -4679,6 +4929,104 @@ def test_exact_rename_stays_audit_only(legacy_page_fixture):
     assert result.status == "renamed"
     assert result.current_revision_id == before.current_revision_id
     assert result.audit_revision_id != before.current_revision_id
+
+
+def test_exact_rename_rereads_destination_after_event_persistence(
+    legacy_page_fixture,
+    monkeypatch,
+):
+    service, before = legacy_page_fixture
+    old_path = before.page_path
+    new_path = "wiki/product/faq/rename-reread-destination.md"
+    old_target = service.settings.vault_path / old_path
+    new_target = service.settings.vault_path / new_path
+    old_target.rename(new_target)
+    original_persist = service._persist_lifecycle_occurrence
+
+    def persist_then_edit(*args, **kwargs):
+        persisted = original_persist(*args, **kwargs)
+        new_target.write_bytes(before.raw_bytes + b"\nConcurrent destination edit.\n")
+        return persisted
+
+    monkeypatch.setattr(service, "_persist_lifecycle_occurrence", persist_then_edit)
+    with connect_app(service.settings) as conn:
+        revision_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+
+    with pytest.raises(RevisionConflict):
+        service.rename_page("rename-reread-destination", old_path, new_path)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            ("rename-reread-destination",),
+        ).fetchone()
+        revisions_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+    assert page["path"] == old_path
+    assert page["current_revision_id"] == before.current_revision_id
+    assert event["status"] == "pending"
+    assert event["result_revision_id"] is None
+    assert revisions_after == revision_count
+
+
+def test_exact_rename_rechecks_source_absence_after_event_persistence(
+    legacy_page_fixture,
+    monkeypatch,
+):
+    service, before = legacy_page_fixture
+    old_path = before.page_path
+    new_path = "wiki/product/faq/rename-source-reappeared.md"
+    old_target = service.settings.vault_path / old_path
+    new_target = service.settings.vault_path / new_path
+    old_target.rename(new_target)
+    original_persist = service._persist_lifecycle_occurrence
+
+    def persist_then_recreate_source(*args, **kwargs):
+        persisted = original_persist(*args, **kwargs)
+        old_target.write_bytes(before.raw_bytes)
+        return persisted
+
+    monkeypatch.setattr(
+        service,
+        "_persist_lifecycle_occurrence",
+        persist_then_recreate_source,
+    )
+    with connect_app(service.settings) as conn:
+        revision_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+
+    with pytest.raises(RevisionConflict):
+        service.rename_page("rename-source-reappeared", old_path, new_path)
+
+    with connect_app(service.settings) as conn:
+        page = conn.execute(
+            "SELECT * FROM wiki_pages WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT * FROM vault_change_events WHERE id=?",
+            ("rename-source-reappeared",),
+        ).fetchone()
+        revisions_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_page_revisions WHERE page_id=?",
+            (before.page_id,),
+        ).fetchone()[0]
+    assert page["path"] == old_path
+    assert page["current_revision_id"] == before.current_revision_id
+    assert event["status"] == "pending"
+    assert event["result_revision_id"] is None
+    assert revisions_after == revision_count
 
 
 def test_finalize_external_revision_syncs_all_page_fields_and_clears_owner(

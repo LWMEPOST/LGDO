@@ -118,7 +118,14 @@ class FakeRevisionService:
             raise RuntimeError(f"bad add: {page_path}")
         return FakeResult("applied")
 
-    def rename_page(self, event_id, old_path, new_path):
+    def rename_page(
+        self,
+        event_id,
+        old_path,
+        new_path,
+        pending_delete_id=None,
+        pending_delete_owner=None,
+    ):
         self.calls.append(("rename", event_id, old_path, new_path))
         return FakeResult("renamed")
 
@@ -129,6 +136,8 @@ class FakeRevisionService:
         new_path,
         expected_page_id,
         observation,
+        pending_delete_id=None,
+        pending_delete_owner=None,
     ):
         self.calls.append(
             (
@@ -149,6 +158,18 @@ class FakeRevisionService:
     def ensure_projection_jobs(self, page_id=None):
         self.calls.append(("ensure_projection_jobs", page_id))
         return self.projection_jobs
+
+
+class RecordingWatcher:
+    def __init__(self):
+        self.starts = 0
+        self.stops = 0
+
+    async def start(self):
+        self.starts += 1
+
+    async def stop(self):
+        self.stops += 1
 
 
 def write_page(settings, page_path: str, content: bytes) -> None:
@@ -185,6 +206,54 @@ async def handle(
         detected_at=detected_at,
         stability_poll_interval=0.001,
     )
+
+
+@pytest.mark.asyncio
+async def test_delete_grace_preserves_subsecond_detection_and_expiry(settings):
+    page_id = "page_subsecond_delete"
+    page_path = "wiki/product/subsecond-delete.md"
+    content = managed_bytes(page_id)
+    seed_page(
+        settings,
+        page_id=page_id,
+        page_path=page_path,
+        content=content,
+    )
+    detected_at = datetime(
+        2026,
+        7,
+        15,
+        0,
+        0,
+        0,
+        900_123,
+        tzinfo=timezone.utc,
+    )
+    service = VaultSyncService(settings, revisions=FakeRevisionService())
+
+    await handle(
+        service,
+        [VaultFsEvent("delete", page_path)],
+        detected_at=detected_at,
+    )
+
+    with connect_app(settings) as conn:
+        occurrence = conn.execute(
+            "SELECT detected_at FROM vault_watch_occurrences WHERE kind='delete'"
+        ).fetchone()
+        pending = conn.execute(
+            """
+            SELECT detected_at,expires_at FROM pending_vault_deletes
+            WHERE page_id=? AND status='pending'
+            """,
+            (page_id,),
+        ).fetchone()
+    expected_expiry = detected_at + timedelta(
+        milliseconds=settings.vault_rename_grace_ms
+    )
+    assert datetime.fromisoformat(occurrence["detected_at"]) == detected_at
+    assert datetime.fromisoformat(pending["detected_at"]) == detected_at
+    assert datetime.fromisoformat(pending["expires_at"]) == expected_expiry
 
 
 @pytest.mark.asyncio
@@ -257,6 +326,92 @@ async def test_edited_pending_rename_uses_relocate_evidence(settings):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("edited", [False, True], ids=["rename", "relocate"])
+async def test_failed_live_move_keeps_pending_delete_active(settings, edited):
+    page_id = f"page_failed_live_move_{edited}"
+    old_path = f"wiki/product/failed-live-old-{edited}.md"
+    new_path = f"wiki/product/failed-live-new-{edited}.md"
+    original = managed_bytes(page_id)
+    moved = managed_bytes(page_id, body="Edited move") if edited else original
+    seed_page(
+        settings,
+        page_id=page_id,
+        page_path=old_path,
+        content=original,
+    )
+    detected_at = datetime(2026, 7, 15, 2, 15, tzinfo=timezone.utc)
+
+    class FailingMoveRevisionService(FakeRevisionService):
+        def __init__(self):
+            super().__init__()
+            self.pending_delete_id = None
+
+        def rename_page(
+            self,
+            event_id,
+            old_path,
+            new_path,
+            pending_delete_id=None,
+            pending_delete_owner=None,
+        ):
+            self.pending_delete_id = pending_delete_id
+            raise RuntimeError("rename transaction failed")
+
+        def relocate_external_change(
+            self,
+            event_id,
+            old_path,
+            new_path,
+            expected_page_id,
+            observation,
+            pending_delete_id=None,
+            pending_delete_owner=None,
+        ):
+            self.pending_delete_id = pending_delete_id
+            raise RuntimeError("relocate transaction failed")
+
+    revisions = FailingMoveRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+    write_page(settings, new_path, moved)
+
+    await handle(
+        service,
+        [VaultFsEvent("add", new_path)],
+        detected_at=detected_at + timedelta(milliseconds=100),
+    )
+
+    with connect_app(settings) as conn:
+        pending = conn.execute(
+            """
+            SELECT * FROM pending_vault_deletes
+            WHERE page_id=? AND old_page_path=? AND status='pending'
+            """,
+            (page_id, old_path),
+        ).fetchone()
+        page = conn.execute(
+            "SELECT path,lifecycle_status FROM wiki_pages WHERE page_id=?",
+            (page_id,),
+        ).fetchone()
+        add_occurrence = conn.execute(
+            """
+            SELECT status FROM vault_watch_occurrences
+            WHERE kind='add' AND page_path=?
+            """,
+            (new_path,),
+        ).fetchone()
+    assert pending is not None
+    assert revisions.pending_delete_id == pending["id"]
+    assert page["path"] == old_path
+    assert page["lifecycle_status"] == "active"
+    assert add_occurrence["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_pending_rename_uses_fresh_observation_under_page_lock(
     settings,
     monkeypatch,
@@ -304,7 +459,7 @@ async def test_pending_rename_uses_fresh_observation_under_page_lock(
         detected_at=detected_at + timedelta(milliseconds=100),
     )
 
-    assert observations == 2
+    assert observations == 3
     assert [call[0] for call in revisions.calls] == ["relocate"]
     assert revisions.calls[0][-1] == edited_observation.file_hash
 
@@ -799,6 +954,118 @@ async def test_true_delete_rechecks_path_and_intent_then_applies(settings):
 
 
 @pytest.mark.asyncio
+async def test_start_automatically_expires_due_deletes_and_is_idempotent(
+    settings,
+):
+    settings.vault_watch_enabled = True
+    settings.vault_watch_debounce_ms = 1
+    page_id = "page_automatic_delete_expiry"
+    old_path = "wiki/product/automatic-delete-expiry.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    deleted = threading.Event()
+
+    class NotifyingRevisionService(FakeRevisionService):
+        def delete_page(self, event_id, page_path):
+            result = super().delete_page(event_id, page_path)
+            deleted.set()
+            return result
+
+    revisions = NotifyingRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+    watcher = RecordingWatcher()
+    service._watcher = watcher
+    detected_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    await handle(
+        service,
+        [VaultFsEvent("delete", old_path)],
+        detected_at=detected_at,
+    )
+
+    try:
+        await service.start()
+        expiry_task = service._delete_expiry_task
+        await service.start()
+
+        assert await asyncio.to_thread(deleted.wait, 2)
+        assert service._delete_expiry_task is expiry_task
+        assert watcher.starts == 1
+    finally:
+        await service.stop()
+        await service.stop()
+
+    assert expiry_task.done()
+    assert service._delete_expiry_task is None
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_and_awaits_active_delete_expiry(settings, monkeypatch):
+    settings.vault_watch_enabled = True
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    service = VaultSyncService(settings, revisions=FakeRevisionService())
+    service._watcher = RecordingWatcher()
+
+    async def blocked_expiry():
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(service, "expire_deletes", blocked_expiry)
+
+    try:
+        await service.start()
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        expiry_task = service._delete_expiry_task
+
+        await service.stop()
+
+        assert cancelled.is_set()
+        assert expiry_task.done()
+        assert service._delete_expiry_task is None
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_delete_expiry_loop_records_top_level_failure_and_recovers(
+    settings,
+    monkeypatch,
+):
+    settings.vault_watch_enabled = True
+    settings.vault_watch_debounce_ms = 1
+    first_attempt = asyncio.Event()
+    recovered = asyncio.Event()
+    attempts = 0
+    service = VaultSyncService(settings, revisions=FakeRevisionService())
+    service._watcher = RecordingWatcher()
+
+    async def flaky_expiry():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first_attempt.set()
+            raise RuntimeError("delete expiry store unavailable")
+        recovered.set()
+        return 0
+
+    monkeypatch.setattr(service, "expire_deletes", flaky_expiry)
+
+    try:
+        await service.start()
+        await asyncio.wait_for(first_attempt.wait(), timeout=2)
+        await asyncio.wait_for(recovered.wait(), timeout=2)
+
+        assert attempts >= 2
+        assert service.last_error == "delete expiry store unavailable"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
 async def test_startup_unique_missing_path_is_explicit_offline_rename_evidence(
     settings,
 ):
@@ -859,6 +1126,47 @@ async def test_startup_edited_unique_missing_path_relocates_external_change(
         "ensure_projection_jobs",
     ]
     assert revisions.calls[0][2:5] == (old_path, new_path, page_id)
+
+
+@pytest.mark.asyncio
+async def test_startup_deleted_page_at_new_path_routes_through_external_ingest(
+    settings,
+):
+    page_id = "page_startup_deleted_restore"
+    old_path = "wiki/product/startup-deleted-old.md"
+    new_path = "wiki/product/startup-deleted-new.md"
+    content = managed_bytes(page_id)
+    seed_page(settings, page_id=page_id, page_path=old_path, content=content)
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            UPDATE wiki_pages SET lifecycle_status='deleted',deleted_at=?,updated_at=?
+            WHERE page_id=?
+            """,
+            (
+                "2026-07-15T00:00:00+00:00",
+                "2026-07-15T00:00:00+00:00",
+                page_id,
+            ),
+        )
+    write_page(settings, new_path, content)
+    revisions = FakeRevisionService()
+    service = VaultSyncService(settings, revisions=revisions)
+
+    result = await service.reconcile_startup(
+        stability_poll_interval=0.001,
+        reconcile_intents=False,
+    )
+
+    assert result["ingested"] == 1
+    assert result["renamed"] == 0
+    assert result["relocated"] == 0
+    assert result["failed"] == 0
+    assert [call[0] for call in revisions.calls] == [
+        "ingest",
+        "ensure_projection_jobs",
+    ]
+    assert revisions.calls[0][2] == new_path
 
 
 @pytest.mark.asyncio
@@ -1650,7 +1958,14 @@ async def test_startup_claim_finalization_failure_preserves_cancellation(
             raise RuntimeError("claim finalization database unavailable")
 
     class BlockingRenameRevisions(FakeRevisionService):
-        def rename_page(self, event_id, source_path, target_path):
+        def rename_page(
+            self,
+            event_id,
+            source_path,
+            target_path,
+            pending_delete_id=None,
+            pending_delete_owner=None,
+        ):
             self.calls.append(("rename", event_id, source_path, target_path))
             mutation_entered.set()
             if not release_mutation.wait(timeout=5):
@@ -1716,7 +2031,14 @@ async def test_startup_claim_release_failure_preserves_cancellation(
             raise RuntimeError("claim release database unavailable")
 
     class FailingRenameRevisions(FakeRevisionService):
-        def rename_page(self, event_id, source_path, target_path):
+        def rename_page(
+            self,
+            event_id,
+            source_path,
+            target_path,
+            pending_delete_id=None,
+            pending_delete_owner=None,
+        ):
             self.calls.append(("rename", event_id, source_path, target_path))
             mutation_entered.set()
             if not release_mutation.wait(timeout=5):

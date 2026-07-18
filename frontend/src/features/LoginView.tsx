@@ -6,8 +6,8 @@ interface LoginViewProps {
 }
 
 export function LoginView({ login, error }: LoginViewProps) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("admin");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   async function submit(event: FormEvent) {
@@ -54,7 +54,7 @@ export function LoginView({ login, error }: LoginViewProps) {
 
         <div className="login-footnote">
           <span className="tiny-dot ok"></span>
-          <span>默认本地管理员：admin / admin，可在账户权限中修改。</span>
+          <span>使用管理员配置的本地账户登录。</span>
         </div>
       </section>
     </main>

@@ -26,6 +26,7 @@ from app.gbrain import call_gbrain_tool
 from app.gbrain_projection import to_gbrain_manifest_path
 from app.projection_jobs import ProjectionOutbox
 from app.projection_worker import ProjectionWorker, WorkerRunResult
+from app.vault_sync import VaultSyncService
 
 
 pytestmark = pytest.mark.gbrain_e2e
@@ -246,7 +247,13 @@ def _run_worker(settings: Settings, deadline_seconds: float) -> WorkerRunResult:
     return asyncio.run(run())
 
 
-def _query(settings: Settings, text: str, *, limit: int = 20) -> list[dict[str, Any]]:
+def _query(
+    settings: Settings,
+    text: str,
+    *,
+    limit: int = 20,
+    timeout: float | None = None,
+) -> list[dict[str, Any]]:
     payload = call_gbrain_tool(
         settings,
         "query",
@@ -257,7 +264,11 @@ def _query(settings: Settings, text: str, *, limit: int = 20) -> list[dict[str, 
             "expand": False,
             "relational": False,
         },
-        timeout=settings.gbrain_query_timeout_seconds,
+        timeout=(
+            settings.gbrain_query_timeout_seconds
+            if timeout is None
+            else timeout
+        ),
     )
     assert isinstance(payload, list), f"query returned {type(payload).__name__}"
     return [dict(item) for item in payload if isinstance(item, dict)]
@@ -265,6 +276,51 @@ def _query(settings: Settings, text: str, *, limit: int = 20) -> list[dict[str, 
 
 def _hit_text(hit: dict[str, Any]) -> str:
     return str(hit.get("chunk_text") or hit.get("snippet") or hit.get("compiled_truth") or "")
+
+
+async def _wait_for_manifest_paths(
+    settings: Settings,
+    text: str,
+    predicate: Callable[[set[str]], bool],
+    *,
+    label: str,
+    deadline: float,
+) -> set[str]:
+    loop = asyncio.get_running_loop()
+    last_paths: set[str] = set()
+    last_exception: Exception | None = None
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            error = AssertionError(
+                f"{label} exceeded its SLA; last paths={sorted(last_paths)!r}; "
+                f"last exception={last_exception!r}"
+            )
+            if last_exception is not None:
+                raise error from last_exception
+            raise error
+        try:
+            hits = await asyncio.to_thread(
+                _query,
+                settings,
+                text,
+                timeout=remaining,
+            )
+            last_paths = {
+                str(hit["source_path"])
+                for hit in hits
+                if text in _hit_text(hit)
+                and isinstance(hit.get("source_path"), str)
+            }
+            if predicate(last_paths):
+                return last_paths
+        except Exception as exc:
+            last_exception = exc
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            continue
+        await asyncio.sleep(min(0.1, remaining))
 
 
 def _wait_for_query(
@@ -499,6 +555,166 @@ def test_live_projection_stays_up_and_query_returns_projection_identity(
     assert hit["source_path"] == "product/faq/live-demo.md"
     assert hit["content_hash"]
     assert int(hit["page_generation"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_obsidian_watcher_incremental_and_reconcile_meet_sla(
+    gbrain_pglite_server,
+    gbrain_e2e_settings: Settings,
+):
+    settings = gbrain_e2e_settings.model_copy(
+        deep=True,
+        update={
+            "projection_worker_enabled": True,
+            "projection_poll_seconds": 0.05,
+            "vault_watch_enabled": True,
+            "vault_watch_debounce_ms": 50,
+            "vault_watch_stability_timeout_seconds": 0.5,
+        },
+    )
+    suffix = uuid.uuid4().hex
+    token = f"obsidiansla{suffix}"
+    lgdo_source_id = f"src_obsidian_sla_{suffix[:12]}"
+    old_manifest = f"product/faq/obsidian-sla-before-{suffix[:8]}.md"
+    new_manifest = f"product/faq/obsidian-sla-after-{suffix[:8]}.md"
+    old_target = settings.vault_path / "wiki" / old_manifest
+    new_target = settings.vault_path / "wiki" / new_manifest
+    timestamp = datetime.now(timezone.utc).isoformat()
+    assert lgdo_source_id != gbrain_pglite_server.source_id
+
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,title,source_type,original_path,raw_path,content_hash,
+              size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                lgdo_source_id,
+                "product",
+                "Obsidian SLA source",
+                "markdown",
+                f"obsidian-sla-{suffix}.md",
+                f"raw/product/{lgdo_source_id}.md",
+                "a" * 64,
+                1,
+                "active",
+                "{}",
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    worker1 = ProjectionWorker(settings)
+    service1 = VaultSyncService(settings)
+    loop = asyncio.get_running_loop()
+    sla_started = loop.time()
+    try:
+        await service1.reconcile_before_watcher_start()
+        await worker1.start()
+        await service1.start()
+        add_deadline = loop.time() + 120
+        old_target.parent.mkdir(parents=True, exist_ok=True)
+        old_target.write_text(
+            "---\n"
+            "title: Obsidian watcher SLA\n"
+            f"source_ids: [{lgdo_source_id}]\n"
+            "domain: product\n"
+            "page_type: faq\n"
+            "review_status: draft\n"
+            "owner:\n"
+            "---\n"
+            "# Obsidian watcher SLA\n\n"
+            f"{token} proves the production watcher path.\n",
+            encoding="utf-8",
+        )
+        await _wait_for_manifest_paths(
+            settings,
+            token,
+            lambda paths: old_manifest in paths
+            and old_target.is_file()
+            and b"lgdo_page_id:" in old_target.read_bytes(),
+            label="Obsidian watcher incremental projection",
+            deadline=add_deadline,
+        )
+        add_elapsed = loop.time() - sla_started
+    finally:
+        try:
+            await service1.stop()
+        finally:
+            await worker1.stop()
+
+    rename_started = loop.time()
+    rename_deadline = loop.time() + 600
+    old_target.rename(new_target)
+    service2 = VaultSyncService(settings)
+    worker2 = ProjectionWorker(settings)
+    try:
+        remaining = rename_deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(
+                "offline rename reconcile exceeded its SLA before startup"
+            )
+        try:
+            await asyncio.wait_for(
+                service2.reconcile_before_watcher_start(),
+                timeout=remaining,
+            )
+        except TimeoutError as exc:
+            raise AssertionError(
+                "offline rename reconcile exceeded its SLA; "
+                "last paths=[]; last exception=TimeoutError()"
+            ) from exc
+
+        remaining = rename_deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(
+                "offline rename runtime startup exceeded its SLA"
+            )
+        try:
+            await asyncio.wait_for(worker2.start(), timeout=remaining)
+            remaining = rename_deadline - loop.time()
+            await asyncio.wait_for(service2.start(), timeout=remaining)
+        except TimeoutError as exc:
+            raise AssertionError(
+                "offline rename runtime startup exceeded its SLA; "
+                "last paths=[]; last exception=TimeoutError()"
+            ) from exc
+
+        await _wait_for_manifest_paths(
+            settings,
+            token,
+            lambda paths: new_manifest in paths and old_manifest not in paths,
+            label="offline rename reconcile projection",
+            deadline=rename_deadline,
+        )
+        rename_elapsed = loop.time() - rename_started
+
+        delete_started = loop.time()
+        delete_deadline = loop.time() + 600
+        new_target.unlink()
+        await _wait_for_manifest_paths(
+            settings,
+            token,
+            lambda paths: not paths.intersection(
+                {old_manifest, new_manifest}
+            ),
+            label="background delete expiry projection",
+            deadline=delete_deadline,
+        )
+        delete_elapsed = loop.time() - delete_started
+    finally:
+        try:
+            await service2.stop()
+        finally:
+            await worker2.stop()
+
+    print(
+        "Obsidian watcher SLA: "
+        f"add={add_elapsed:.3f}s offline_rename={rename_elapsed:.3f}s "
+        f"delete_expiry={delete_elapsed:.3f}s total={loop.time() - sla_started:.3f}s"
+    )
 
 
 def test_rename_removes_the_old_source_slug(

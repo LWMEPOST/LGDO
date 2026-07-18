@@ -71,7 +71,8 @@ def map_gbrain_hit(
         mapping["gbrain_page_generation"]
     ):
         return _rejected("stale")
-    if hit.source_path is not None and hit.source_path.strip() != mapping["source_path"]:
+    source_path = _nonempty_string(hit.source_path)
+    if source_path is None or source_path != mapping["source_path"]:
         return _rejected("stale")
 
     pages = conn.execute(

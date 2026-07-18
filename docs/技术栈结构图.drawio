@@ -1,0 +1,51 @@
+<mxfile host="app.diagrams.net" modified="2026-07-18T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="lgdo-tech-stack" name="技术栈结构图">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1200" pageHeight="800" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="frontend" value="前端与人工工作流" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#333333;fontStyle=1;fontColor=#333333;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="80" y="70" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="backend" value="LGDO 后端核心" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#333333;fontStyle=1;fontColor=#333333;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="450" y="70" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="models" value="外部模型与图谱服务" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#333333;fontStyle=1;fontColor=#333333;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="820" y="70" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="frontend-stack" value="React 18 + TypeScript + Vite&#xa;Obsidian Desktop + shared Vault&#xa;obsidian:// deep links&#xa;当前无原生 Obsidian 插件包" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacing=10;fillColor=#F5F5F5;strokeColor=#333333;fontColor=#333333;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="80" y="190" width="300" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="backend-stack" value="Python + FastAPI&#xa;LLMWiki compile_wiki&#xa;WikiRevisionService + CAS&#xa;VaultSyncService + filesystem watcher&#xa;Projection worker + outbox&#xa;LGDO DB: mappings / protections / generations" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacing=10;fillColor=#F5F5F5;strokeColor=#333333;fontColor=#333333;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="450" y="190" width="300" height="210" as="geometry"/>
+        </mxCell>
+        <mxCell id="models-stack" value="DeepSeek compatible API&#xa;HTTPS generation only&#xa;不持有 revision / Vault 状态" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacing=10;fillColor=#F5F5F5;strokeColor=#333333;fontColor=#333333;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="820" y="190" width="300" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="gbrain-stack" value="GBrain HTTP MCP :8787&#xa;Bun + TypeScript&#xa;GBrain-owned PGLite graph store&#xa;query + asynchronous projection" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacing=10;fillColor=#F5F5F5;strokeColor=#333333;fontColor=#333333;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="820" y="310" width="300" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge-ui-api" value="HTTP / JSON" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#333333;startArrow=classicBlockThin;endArrow=classicBlockThin;" edge="1" parent="1" source="frontend" target="backend">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge-api-model" value="DeepSeek HTTPS generation" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#333333;endArrow=classicBlockThin;" edge="1" parent="1" source="backend" target="models-stack">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge-api-gbrain" value="GBrain MCP query + async projection" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#333333;endArrow=classicBlockThin;" edge="1" parent="1" source="backend" target="gbrain-stack">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge-vault-files" value="Vault Markdown 双向文件流" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#3366CC;startArrow=classicBlockThin;endArrow=classicBlockThin;" edge="1" parent="1" source="frontend-stack" target="backend-stack"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="edge-ui-stack" style="edgeStyle=orthogonalEdgeStyle;dashed=1;strokeColor=#333333;endArrow=none;" edge="1" parent="1" source="frontend" target="frontend-stack"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="edge-backend-stack" style="edgeStyle=orthogonalEdgeStyle;dashed=1;strokeColor=#333333;endArrow=none;" edge="1" parent="1" source="backend" target="backend-stack"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="edge-model-stack" style="edgeStyle=orthogonalEdgeStyle;dashed=1;strokeColor=#333333;endArrow=none;" edge="1" parent="1" source="models" target="models-stack"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="edge-gbrain-stack" style="edgeStyle=orthogonalEdgeStyle;dashed=1;strokeColor=#333333;endArrow=none;" edge="1" parent="1" source="models" target="gbrain-stack"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="title" value="图 1  LGDO Knowledge Core 技术栈结构图" style="text;html=1;strokeColor=none;fillColor=none;fontColor=#333333;fontSize=16;fontStyle=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="300" y="470" width="600" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="note" value="权威状态：Wiki revision 与 Vault identity；GBrain 为派生图谱；DeepSeek 为可选生成层。" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#333333;fontColor=#333333;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="530" width="700" height="60" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

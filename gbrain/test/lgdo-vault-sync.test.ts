@@ -380,6 +380,75 @@ describe('LGDO manifest authority, reconcile, and idempotency', () => {
     expect(await engine.getPage('ghost', { sourceId: SOURCE_ID, includeDeleted: true })).toBeNull();
   });
 
+  test('does not delete a page imported from an expected file removed before inventory', async () => {
+    const expected = writeManifestPage('race.md', 'page-race');
+    const originalExecuteRaw = engine.executeRaw.bind(engine);
+    let identityReads = 0;
+    engine.executeRaw = (async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
+      const result = await originalExecuteRaw<T>(sql, params);
+      if (sql.includes("frontmatter->>'id' = $2") && params?.[1] === expected.page_id) {
+        identityReads += 1;
+        if (identityReads === 2) rmSync(join(ROOT, expected.path), { force: true });
+      }
+      return result;
+    }) as typeof engine.executeRaw;
+    try {
+      const result = await runLgdoVaultSync(
+        operationContext(),
+        syncInput('reconcile', [expected], { idempotency_key: 'post-import-delete-race' }),
+      );
+
+      expect(result.pages[0].status).toBe('imported');
+      expect(result.deleted).toEqual([]);
+      expect(await engine.getPage('race', { sourceId: SOURCE_ID, includeDeleted: true })).not.toBeNull();
+    } finally {
+      engine.executeRaw = originalExecuteRaw;
+    }
+  });
+
+  test('historical recovery results do not create permanent implicit protections', async () => {
+    await engine.putPage('historical-protected', {
+      type: 'concept',
+      title: 'Historical protected page',
+      compiled_truth: 'old recovery result must not protect this forever',
+      source_path: 'historical-protected.md',
+      frontmatter: { id: 'page-historical-protected' },
+    }, { sourceId: SOURCE_ID });
+    const oldResult = {
+      source_id: SOURCE_ID,
+      mode: 'incremental',
+      idempotency_key: 'historical-recovery',
+      pages: [{
+        page_id: 'page-old', revision_id: 'rev-old', projection_epoch: 1,
+        path: 'old.md', file_hash: '0'.repeat(64), source_id: SOURCE_ID,
+        slug: 'historical-protected', source_path: 'historical-protected.md',
+        raw_file_hash_before: null, raw_file_hash_after: null,
+        content_hash: null, page_generation: null, status: 'recovery_required',
+        error: 'historical failure', protected_mappings: [{
+          source_id: SOURCE_ID,
+          slug: 'historical-protected',
+          source_path: 'historical-protected.md',
+          reason: 'rename_recovery_required',
+        }],
+      }],
+      deleted: [], protected_mappings: [], imported: 0, skipped: 0,
+      errors: 1, chunks: 0, duration_ms: 1,
+    };
+    await engine.executeRaw(
+      `INSERT INTO lgdo_vault_sync_runs
+         (source_id,idempotency_key,request_hash,result_json)
+       VALUES ($1,$2,$3,$4::jsonb)`,
+      [SOURCE_ID, 'historical-recovery', 'historical-hash', JSON.stringify(oldResult)],
+    );
+
+    const result = await runLgdoVaultSync(
+      operationContext(),
+      syncInput('reconcile', [], { idempotency_key: 'current-reconcile' }),
+    );
+
+    expect(result.deleted).toEqual([{ source_id: SOURCE_ID, slug: 'historical-protected' }]);
+  });
+
   test('protects every existing mapping when an external ID is ambiguous', async () => {
     const pageId = 'page-ambiguous';
     const frontmatter = {

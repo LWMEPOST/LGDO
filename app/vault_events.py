@@ -52,7 +52,7 @@ def occurrence_payload_digest(
 def _datetime_iso(value: datetime) -> str:
     if value.tzinfo is None:
         raise ValueError("datetime must be timezone-aware")
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _parse_datetime(value: Any) -> datetime:

@@ -1284,11 +1284,52 @@ class WikiRevisionService:
             return "unique" in str(exc).lower() and "wiki_pages.path" in str(exc)
         return getattr(exc, "sqlstate", None) == "23505"
 
+    def _cancel_pending_delete_locked(
+        self,
+        conn: Any,
+        *,
+        delete_id: str | None,
+        claim_owner: str | None,
+        occurrence_id: str,
+        page_id: str,
+        old_page_path: str,
+        current_revision_id: str | None,
+    ) -> None:
+        if delete_id is None and claim_owner is None:
+            return
+        if not delete_id or not claim_owner:
+            raise ValueError(
+                "pending delete ID and claim owner must be provided together"
+            )
+        cancelled = conn.execute(
+            """
+            UPDATE pending_vault_deletes
+            SET status='cancelled',matched_occurrence_id=?,updated_at=?
+            WHERE id=? AND page_id=? AND old_page_path=? AND status='pending'
+              AND matched_occurrence_id=?
+            """,
+            (
+                occurrence_id,
+                now_iso(),
+                delete_id,
+                page_id,
+                old_page_path,
+                claim_owner,
+            ),
+        )
+        if cancelled.rowcount != 1:
+            raise RevisionConflict(
+                "pending delete claim changed during move",
+                current_revision_id=current_revision_id,
+            )
+
     def rename_page(
         self,
         event_id: str,
         old_path: str,
         new_path: str,
+        pending_delete_id: str | None = None,
+        pending_delete_owner: str | None = None,
     ) -> MutationResult:
         self._target(old_path)
         new_target = self._target(new_path)
@@ -1408,8 +1449,14 @@ class WikiRevisionService:
                             ),
                         )
                     else:
-                        if renamed_file is None:
-                            renamed_file = read_renamed_file()
+                        if self._target(old_path).exists():
+                            raise RevisionConflict(
+                                "rename source path reappeared",
+                                current_revision_id=locked.page.get(
+                                    "current_revision_id"
+                                ),
+                            )
+                        renamed_file = read_renamed_file()
                         renamed_bytes, managed_page_id = renamed_file
                         if managed_page_id != state["page_id"]:
                             raise RevisionConflict(
@@ -1448,6 +1495,17 @@ class WikiRevisionService:
                                     ),
                                 )
                             else:
+                                self._cancel_pending_delete_locked(
+                                    locked.conn,
+                                    delete_id=pending_delete_id,
+                                    claim_owner=pending_delete_owner,
+                                    occurrence_id=event_id,
+                                    page_id=locked.page["page_id"],
+                                    old_page_path=old_path,
+                                    current_revision_id=locked.page.get(
+                                        "current_revision_id"
+                                    ),
+                                )
                                 previous_epoch = int(
                                     locked.page.get("projection_epoch") or 0
                                 )
@@ -2319,18 +2377,76 @@ class WikiRevisionService:
                 self._validate_observation_content(observed)
             )
             parsed: ExternalDocumentInput | None = None
+            restore_page: dict[str, Any] | None = None
             if error_code is None and content is not None:
                 try:
+                    identity_document = parse_wiki_bytes(content)
+                    first_id = identity_document.frontmatter.get("lgdo_page_id")
+                    second_id = identity_document.frontmatter.get("id")
+                    if (
+                        first_id is not None
+                        and second_id is not None
+                        and first_id != second_id
+                    ):
+                        raise MarkdownParseError(
+                            "identity_mismatch",
+                            "id and lgdo_page_id must match",
+                        )
+                    declared_page_id = first_id or second_id
+                    if declared_page_id is not None and not isinstance(
+                        declared_page_id,
+                        str,
+                    ):
+                        raise MarkdownParseError(
+                            "invalid_page_id",
+                            "managed page ID must be a string",
+                        )
+                    if declared_page_id:
+                        restore_row = conn.execute(
+                            "SELECT * FROM wiki_pages WHERE page_id=?" + suffix,
+                            (declared_page_id,),
+                        ).fetchone()
+                        restore_page = (
+                            dict(restore_row) if restore_row is not None else None
+                        )
+                        if (
+                            restore_page is not None
+                            and restore_page.get("lifecycle_status") != "deleted"
+                        ):
+                            raise MarkdownParseError(
+                                "unproven_page_identity",
+                                "a new page path cannot claim an active managed page ID",
+                            )
                     parsed = _classify_external_document(
                         conn,
                         content,
-                        bound_page=None,
+                        bound_page=restore_page,
                     )
                     if parsed.declared_page_id is not None:
-                        raise MarkdownParseError(
-                            "unproven_page_identity",
-                            "a new page path cannot claim a managed page ID without rename evidence",
+                        active_intent = (
+                            conn.execute(
+                                """
+                                SELECT 1 FROM vault_write_intents
+                                WHERE page_id=? AND status IN (
+                                  'pending','captured','installed','recovery_required'
+                                )
+                                LIMIT 1
+                                """ + suffix,
+                                (parsed.declared_page_id,),
+                            ).fetchone()
+                            if restore_page is not None
+                            else None
                         )
+                        if (
+                            restore_page is None
+                            or restore_page.get("pending_write_intent_id") is not None
+                            or active_intent is not None
+                            or self._target(restore_page["path"]).exists()
+                        ):
+                            raise MarkdownParseError(
+                                "unproven_page_identity",
+                                "a new page path cannot claim an active managed page ID",
+                            )
                 except MarkdownParseError as exc:
                     error_code = exc.code
                     error_message = str(exc)
@@ -2373,14 +2489,27 @@ class WikiRevisionService:
                     now_iso(),
                 )
                 return result
-            prepared = self._prepare_new_external_page_locked(
-                conn,
-                event_id=event_id,
-                page_path=page_path,
-                observed=observed,
-                parsed=parsed,
-                payload_digest=payload_digest,
-            )
+            if restore_page is None:
+                prepared = self._prepare_new_external_page_locked(
+                    conn,
+                    event_id=event_id,
+                    page_path=page_path,
+                    observed=observed,
+                    parsed=parsed,
+                    payload_digest=payload_digest,
+                )
+            else:
+                prepared = self._prepare_external_revision_locked(
+                    conn,
+                    page=restore_page,
+                    event_id=event_id,
+                    observation=observed,
+                    parsed=parsed,
+                    payload_digest=payload_digest,
+                    force_new_revision=True,
+                    transition_kind="external_restore_relocated",
+                    revision_page_path=page_path,
+                )
             self._fault("new_page_before_prepare_commit")
             return prepared
 
@@ -2919,6 +3048,8 @@ class WikiRevisionService:
         new_page_path: str,
         expected_page_id: str,
         observation: FileObservationInput,
+        pending_delete_id: str | None = None,
+        pending_delete_owner: str | None = None,
     ) -> MutationResult:
         self._target(old_page_path)
         self._target(new_page_path)
@@ -3011,6 +3142,15 @@ class WikiRevisionService:
                         current_revision_id=page.get("current_revision_id"),
                         pending_intent_id=page.get("pending_write_intent_id"),
                     )
+                self._cancel_pending_delete_locked(
+                    conn,
+                    delete_id=pending_delete_id,
+                    claim_owner=pending_delete_owner,
+                    occurrence_id=event_id,
+                    page_id=expected_page_id,
+                    old_page_path=old_page_path,
+                    current_revision_id=page.get("current_revision_id"),
+                )
             else:
                 if page.get("pending_write_intent_id") is not None:
                     raise RevisionConflict(
@@ -3062,6 +3202,15 @@ class WikiRevisionService:
                         "exact-byte moves must use rename_page",
                         current_revision_id=page.get("current_revision_id"),
                     )
+                self._cancel_pending_delete_locked(
+                    conn,
+                    delete_id=pending_delete_id,
+                    claim_owner=pending_delete_owner,
+                    occurrence_id=event_id,
+                    page_id=expected_page_id,
+                    old_page_path=old_page_path,
+                    current_revision_id=page.get("current_revision_id"),
+                )
                 expected_state_json = canonical_state_json(
                     self._canonical_state_locked(conn, page)
                 )
@@ -5582,13 +5731,18 @@ class WikiRevisionService:
                 )
                 final_document = parse_wiki_bytes(rendered)
                 metadata = _plain(final_document.frontmatter)
+                parsed_content = _classify_external_document(
+                    locked.conn,
+                    rendered,
+                    bound_page=locked.page,
+                )
                 revision = self._create_revision_locked(
                     locked.conn,
                     locked.page,
                     content=rendered,
                     origin="manual",
                     base_revision_id=expected_revision_id,
-                    source_ids=_source_ids(metadata),
+                    source_ids=parsed_content.source_ids,
                     actor=actor,
                     note=note,
                     idempotency_key=transition_key,
@@ -6749,6 +6903,11 @@ class WikiRevisionService:
                     )
                     final_document = parse_wiki_bytes(rendered)
                     metadata = _plain(final_document.frontmatter)
+                    parsed_content = _classify_external_document(
+                        locked.conn,
+                        rendered,
+                        bound_page=locked.page,
+                    )
                     state_digest = hashlib.sha256(
                         review["expected_state_json"].encode("utf-8")
                     ).hexdigest()
@@ -6758,7 +6917,7 @@ class WikiRevisionService:
                         content=rendered,
                         origin="merge",
                         base_revision_id=command.expected_current_revision_id,
-                        source_ids=_source_ids(metadata),
+                        source_ids=parsed_content.source_ids,
                         actor=command.actor,
                         note=command.note,
                         idempotency_key=(
@@ -7448,9 +7607,9 @@ class WikiRevisionService:
             issue_refs: tuple[tuple[str, int], ...] = ()
             external_event_id_for_finalize: str | None = None
             observation_id_for_finalize: str | None = None
-            if revision["origin"] == "external":
+            if revision["origin"] in {"manual", "merge", "external"}:
                 try:
-                    parsed_external = _classify_external_document(
+                    parsed_content = _classify_external_document(
                         locked.conn,
                         revision_content,
                         bound_page=locked.page,
@@ -7458,29 +7617,29 @@ class WikiRevisionService:
                     )
                 except MarkdownParseError as exc:
                     raise RevisionConflict(
-                        "installed external revision is invalid",
+                        "installed revision content is invalid",
                         current_revision_id=locked.page.get(
                             "current_revision_id"
                         ),
                     ) from exc
                 if (
-                    parsed_external.declared_page_id != intent["page_id"]
+                    parsed_content.declared_page_id != intent["page_id"]
                     or content_metadata.get("lgdo_revision_id") != revision["id"]
                     or content_metadata.get("lgdo_write_token")
                     != intent["write_token"]
                 ):
                     raise RevisionConflict(
-                        "installed external revision managed identity changed",
+                        "installed revision managed identity changed",
                         current_revision_id=locked.page.get(
                             "current_revision_id"
                         ),
                     )
-                content_title = parsed_external.title
-                content_domain = parsed_external.domain
-                content_page_type = parsed_external.page_type
-                content_source_ids = parsed_external.source_ids
-                content_review_status = parsed_external.review_status
-                content_owner = parsed_external.owner
+                content_title = parsed_content.title
+                content_domain = parsed_content.domain
+                content_page_type = parsed_content.page_type
+                content_source_ids = parsed_content.source_ids
+                content_review_status = parsed_content.review_status
+                content_owner = parsed_content.owner
                 try:
                     revision_source_ids = json.loads(
                         revision["source_ids_json"] or "[]"
@@ -7503,6 +7662,14 @@ class WikiRevisionService:
                             "current_revision_id"
                         ),
                     )
+                self._revalidate_revision_sources_for_finalize_locked(
+                    locked.conn,
+                    revision_source_ids,
+                    current_revision_id=locked.page.get(
+                        "current_revision_id"
+                    ),
+                )
+            if revision["origin"] == "external":
                 issue_refs = _decode_sync_issue_refs(metadata)
                 _validate_sync_issue_ref_paths_locked(
                     locked.conn,
@@ -7559,13 +7726,6 @@ class WikiRevisionService:
                             "current_revision_id"
                         ),
                     )
-                self._revalidate_revision_sources_for_finalize_locked(
-                    locked.conn,
-                    revision_source_ids,
-                    current_revision_id=locked.page.get(
-                        "current_revision_id"
-                    ),
-                )
             observed_file_hash = (
                 metadata.get("observed_file_hash")
                 if revision["origin"] == "external"

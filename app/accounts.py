@@ -20,6 +20,9 @@ def ensure_bootstrap_admin(settings: Settings) -> None:
         existing = conn.execute("SELECT user_id FROM accounts WHERE user_id = ?", (settings.auth_dev_user_id,)).fetchone()
         if existing:
             return
+        bootstrap_password = settings.auth_bootstrap_admin_password or ""
+        if not bootstrap_password:
+            return
         timestamp = now_iso()
         conn.execute(
             """
@@ -33,7 +36,7 @@ def ensure_bootstrap_admin(settings: Settings) -> None:
                 settings.auth_dev_username,
                 "admin",
                 json_dump(["*"]),
-                hash_password(settings.auth_bootstrap_admin_password),
+                hash_password(bootstrap_password),
                 "active",
                 "local",
                 timestamp,

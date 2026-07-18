@@ -257,6 +257,7 @@ def test_exact_current_gbrain_mapping_emits_one_citation_per_lgdo_source(
         ("stale_mapping", "stale"),
         ("content_hash_mismatch", "stale"),
         ("generation_mismatch", "stale"),
+        ("missing_source_path", "stale"),
         ("source_path_mismatch", "stale"),
         ("old_revision", "stale"),
         ("old_epoch", "stale"),
@@ -289,6 +290,8 @@ def test_invalid_gbrain_mapping_never_yields_context(
             hit = replace(hit, content_hash="old-content-hash")
         elif case == "generation_mismatch":
             hit = replace(hit, page_generation=10)
+        elif case == "missing_source_path":
+            hit = replace(hit, source_path=None)
         elif case == "source_path_mismatch":
             hit = replace(hit, source_path="product/faq/other.md")
         elif case == "old_revision":

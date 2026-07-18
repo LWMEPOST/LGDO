@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +17,13 @@ from app.db import (
     json_dump,
 )
 from app.ingest import scan_sources
+from app.gbrain_projection import (
+    GBrainBatchRepository,
+    GBrainDeletedResult,
+    GBrainSyncResponse,
+)
 from app.models import CompileRequest, ScanRequest
+from app.projection_jobs import ProjectionOutbox
 from app.wiki import compile_wiki
 from app.wiki_markdown import capture_file_observation
 from app.wiki_revisions import (
@@ -359,6 +367,247 @@ def postgres_settings(tmp_path):
             _drop_test_database(admin, database_name)
 
 
+class _DeleteProjectionClient:
+    def __init__(self, slug: str):
+        self.slug = slug
+
+    async def sync(self, request):
+        return GBrainSyncResponse(
+            source_id=request.source_id,
+            mode=request.mode,
+            idempotency_key=request.idempotency_key,
+            pages=(),
+            deleted=(
+                GBrainDeletedResult(source_id=request.source_id, slug=self.slug),
+            ),
+            protected_mappings=(),
+            imported=0,
+            skipped=0,
+            errors=0,
+            chunks=0,
+            duration_ms=1.0,
+        )
+
+
+def test_postgres_restore_serializes_before_old_gbrain_delete_attribution(
+    monkeypatch,
+    postgres_settings,
+):
+    settings = postgres_settings.model_copy(
+        deep=True,
+        update={
+            "gbrain_managed_source_id": "lgdo-managed",
+            "gbrain_import_allowed_root": postgres_settings.vault_path / "wiki",
+        },
+    )
+    timestamp = "2099-01-01T12:00:00+00:00"
+    page_id = "page_pg_gbrain_restore_race"
+    revision_id = "wrev_pg_gbrain_restore_race"
+    page_path = "wiki/product/pg-gbrain-restore-race.md"
+    slug = "product/pg-gbrain-restore-race"
+    file_hash = hashlib.sha256(b"postgres restore race").hexdigest()
+    semantic_hash = hashlib.sha256(b"postgres restore semantic").hexdigest()
+    worker_id = "pg-gbrain-worker"
+
+    with connect_app_write(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_page_revisions(
+              id,page_id,page_path,revision_number,file_hash,semantic_hash,content,
+              origin,base_revision_id,source_ids_json,actor,note,metadata_json,
+              idempotency_key,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                revision_id,
+                page_id,
+                page_path,
+                1,
+                file_hash,
+                semantic_hash,
+                "# PostgreSQL restore race",
+                "manual",
+                None,
+                "[]",
+                "tester",
+                None,
+                "{}",
+                "pg:gbrain:restore:revision",
+                timestamp,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              path,page_id,domain,page_type,title,source_ids_json,review_status,
+              created_at,updated_at,current_revision_id,revision_number,file_hash,
+              semantic_hash,projection_epoch,lifecycle_status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                page_path,
+                page_id,
+                "product",
+                "faq",
+                "PostgreSQL restore race",
+                "[]",
+                "draft",
+                timestamp,
+                timestamp,
+                revision_id,
+                1,
+                file_hash,
+                semantic_hash,
+                1,
+                "deleted",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO gbrain_page_projections(
+              id,page_id,revision_id,projection_epoch,page_path,file_hash,semantic_hash,
+              gbrain_source_id,slug,source_path,gbrain_content_hash,
+              gbrain_page_generation,status,imported_at,invalidated_at,last_job_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "gproj_pg_restore_race",
+                page_id,
+                revision_id,
+                1,
+                page_path,
+                file_hash,
+                semantic_hash,
+                "lgdo-managed",
+                slug,
+                f"{slug}.md",
+                hashlib.sha256(b"gbrain content").hexdigest(),
+                1,
+                "current",
+                timestamp,
+                None,
+                "seed-job",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO gbrain_projection_protections(
+              id,gbrain_source_id,page_id,slug,source_path,reason,
+              active,created_at,resolved_at)
+            VALUES (?,?,?,?,?,?,1,?,NULL)
+            """,
+            (
+                "gprotect_pg_restore_race",
+                "lgdo-managed",
+                page_id,
+                slug,
+                f"{slug}.md",
+                "restore-race",
+                timestamp,
+            ),
+        )
+        delete_job = ProjectionOutbox(settings).enqueue(
+            conn,
+            target="gbrain",
+            operation="delete",
+            page_id=page_id,
+            revision_id=None,
+            projection_epoch=1,
+            payload={"path": page_path, "reason": "deleted"},
+        )
+
+    claimed = ProjectionOutbox(settings).claim(
+        target="gbrain",
+        worker_id=worker_id,
+        limit=10,
+        lease_seconds=180,
+        now=datetime(2099, 1, 1, 12, 0, tzinfo=timezone.utc),
+    )
+    batch = GBrainBatchRepository(settings).create_batch(
+        claimed,
+        worker_id=worker_id,
+        lease_seconds=180,
+        now=datetime(2099, 1, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+    restore_conn = connect_postgres(settings)
+    try:
+        with restore_conn.cursor() as cur:
+            cur.execute(
+                "SELECT page_id FROM wiki_pages WHERE page_id=%s FOR UPDATE",
+                (page_id,),
+            )
+            cur.execute(
+                """
+                UPDATE wiki_pages
+                SET lifecycle_status='active',projection_epoch=2,updated_at=%s
+                WHERE page_id=%s
+                """,
+                (timestamp, page_id),
+            )
+            restore_job = ProjectionOutbox(settings).enqueue(
+                PgCompatConnection(restore_conn),
+                target="gbrain",
+                operation="upsert",
+                page_id=page_id,
+                revision_id=revision_id,
+                projection_epoch=2,
+                payload={"path": page_path},
+            )
+
+            reached_page_lock = threading.Event()
+            original_execute = PgCompatConnection.execute
+
+            def signal_page_lock(self, query, params=None):
+                if "FOR UPDATE OF p" in query:
+                    reached_page_lock.set()
+                return original_execute(self, query, params)
+
+            monkeypatch.setattr(PgCompatConnection, "execute", signal_page_lock)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    lambda: asyncio.run(
+                        GBrainBatchRepository(settings).execute_batch(
+                            batch.id,
+                            worker_id=worker_id,
+                            client=_DeleteProjectionClient(slug),
+                            lease_seconds=180,
+                            now=datetime(2099, 1, 1, 12, 0, tzinfo=timezone.utc),
+                        )
+                    )
+                )
+                assert reached_page_lock.wait(timeout=10)
+                assert not future.done()
+                restore_conn.commit()
+                future.result(timeout=10)
+    finally:
+        restore_conn.close()
+
+    with connect_app(settings) as conn:
+        mapping = conn.execute(
+            "SELECT status,invalidated_at FROM gbrain_page_projections WHERE id=?",
+            ("gproj_pg_restore_race",),
+        ).fetchone()
+        protection = conn.execute(
+            "SELECT active,resolved_at FROM gbrain_projection_protections WHERE id=?",
+            ("gprotect_pg_restore_race",),
+        ).fetchone()
+        jobs = conn.execute(
+            "SELECT id,status FROM knowledge_projection_jobs WHERE id IN (?,?) ORDER BY id",
+            (delete_job, restore_job),
+        ).fetchall()
+        generation = conn.execute(
+            "SELECT value FROM projection_state WHERE key='gbrain_projection_generation'"
+        ).fetchone()["value"]
+    assert (mapping["status"], mapping["invalidated_at"]) == ("current", None)
+    assert (protection["active"], protection["resolved_at"]) == (1, None)
+    assert {row["id"]: row["status"] for row in jobs} == {
+        delete_job: "superseded",
+        restore_job: "pending",
+    }
+    assert generation == 0
+
+
 def test_postgres_revision_schema_uses_bigint_and_enforces_pending_conflict_uniqueness(
     postgres_settings,
 ):
@@ -582,6 +831,28 @@ def test_concurrent_manual_saves_with_same_revision_have_one_postgres_winner(
         encoding="utf-8",
     )
     with connect_app(settings) as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+              id,domain,title,source_type,original_path,raw_path,content_hash,
+              size_bytes,status,metadata_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "src_manual",
+                "product",
+                "Concurrent manual source",
+                "markdown",
+                "concurrent-manual.md",
+                "raw/product/concurrent-manual.md",
+                "a" * 64,
+                1,
+                "active",
+                "{}",
+                "t0",
+                "t0",
+            ),
+        )
         conn.execute(
             """
             INSERT INTO wiki_pages(

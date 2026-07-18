@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import re
 import urllib.request
@@ -37,24 +36,32 @@ class UserContext:
 
 
 def resolve_user_context(settings: Settings, request: Request) -> UserContext:
+    development_fallback_enabled = (
+        settings.app_env.strip().lower() == "development"
+        and settings.auth_dev_fallback_enabled
+    )
     authorization = request.headers.get("authorization") or ""
     bearer = _extract_bearer_token(authorization)
     if bearer:
         local_user = _session_user(settings, bearer)
         if local_user:
             return local_user
-        if not settings.oidc_enabled:
-            if not settings.auth_dev_fallback_enabled:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="OIDC 未启用且开发鉴权回退已关闭",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            return _decode_unverified_bearer(bearer)
-        return _verify_oidc_token(settings, bearer)
+        if settings.oidc_enabled:
+            return _verify_oidc_token(settings, bearer)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OIDC is disabled; Bearer token verification is unavailable",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     header_user = request.headers.get("x-lgdo-user") or request.headers.get("x-user-id")
     if header_user:
+        if not development_fallback_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Development identity fallback is disabled",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return UserContext(
             user_id=header_user.strip(),
             username=(request.headers.get("x-lgdo-user-name") or header_user).strip(),
@@ -63,7 +70,7 @@ def resolve_user_context(settings: Settings, request: Request) -> UserContext:
             auth_provider="trusted-header",
         )
 
-    if not settings.auth_dev_fallback_enabled:
+    if not development_fallback_enabled:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="缺少认证凭据",
@@ -161,11 +168,6 @@ def _extract_bearer_token(authorization: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _decode_unverified_bearer(token: str) -> UserContext:
-    claims = _decode_jwt_payload(token)
-    return _claims_to_user(claims, provider="bearer-unverified")
-
-
 def _verify_oidc_token(settings: Settings, token: str) -> UserContext:
     try:
         import jwt
@@ -241,14 +243,3 @@ def _claims_to_user(claims: dict[str, Any], settings: Settings | None = None, pr
         auth_provider=provider,
         raw_claims=claims,
     )
-
-
-def _decode_jwt_payload(token: str) -> dict[str, Any]:
-    parts = token.split(".")
-    if len(parts) < 2:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer token 不是 JWT 格式")
-    payload = parts[1] + "=" * (-len(parts[1]) % 4)
-    try:
-        return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无法解析 Bearer JWT payload") from exc

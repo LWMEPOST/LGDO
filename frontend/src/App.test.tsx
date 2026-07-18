@@ -235,6 +235,14 @@ afterEach(() => {
 });
 
 describe("App vault integration", () => {
+  it("does not advertise or prefill default administrator credentials", () => {
+    render(<App />);
+
+    expect(screen.getByRole("textbox", { name: "账户" })).toHaveValue("");
+    expect(screen.getByLabelText("密码")).toHaveValue("");
+    expect(screen.queryByText(/admin\s*\/\s*admin/i)).not.toBeInTheDocument();
+  });
+
   it("renders required workspace data before optional vault status resolves", async () => {
     const pendingVaultStatus = deferred<Response>();
     installFetch({ vaultStatusResponse: pendingVaultStatus.promise });

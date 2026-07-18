@@ -70,34 +70,43 @@ source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 cp .env.example .env
 
+# Set an explicit bootstrap password; there is no default admin/admin login.
+# AUTH_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password
+
 # Start backend
 uvicorn app.main:app --reload
 
 # Frontend, optional in development mode
 cd frontend
 npm install
-npm run dev
+npm run dev -- --port 8011
 ```
 
 Open `http://127.0.0.1:8000/docs` for API documentation, or `/console` for the admin console.
 
-The admin console uses local account login by default. The bootstrap administrator is `admin / admin`; change the password from the account ACL page after first login.
+The admin console uses local account login. A bootstrap administrator is created only when `AUTH_BOOTSTRAP_ADMIN_PASSWORD` is explicitly set; never enable `AUTH_DEV_FALLBACK_ENABLED` in production.
 
 ### Run the first cited answer in three calls
 
 ```bash
+# First obtain a token from /api/internal/auth/login.
+export TOKEN='<token returned by the login endpoint>'
+
 # 1. Scan sample materials
 curl -X POST http://127.0.0.1:8000/api/internal/sources/scan \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"root_path":"samples/product_service","domain":"product","owner":"admin","acl_tags":["internal"]}'
 
 # 2. Compile wiki pages
 curl -X POST http://127.0.0.1:8000/api/internal/wiki/compile \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"domain":"product"}'
 
 # 3. Ask a citation-required question
 curl -X POST http://127.0.0.1:8000/api/internal/ask \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"question":"灵创AI平台的核心价值主张是什么？","domain":"product","require_citations":true}'
 ```
@@ -128,7 +137,17 @@ LGDO Knowledge Core uses **LLMWiki + GBrain + DeepSeek + Obsidian** as a modular
 | **LLMWiki** | Compiles raw materials into reviewable, citable, versionable Markdown wiki pages. It is the conversion layer from source material to knowledge asset. |
 | **GBrain** | Acts as the MCP graph memory layer, covering entity relations, cross-document dependencies, and role/permission aggregation where pure vector retrieval is weak. |
 | **DeepSeek** | Optional generation model used when retrieval evidence is sufficient. Without it, the system falls back to local extractive answers. |
-| **Obsidian** | Compatible Markdown knowledge workflow for human editing, review, archiving, and long-term maintenance. |
+| **Obsidian** | Shared-vault human maintenance endpoint: LGDO writes managed Markdown, the watcher ingests external edits into revision/conflict handling; there is no native Obsidian plugin yet. |
+
+#### Obsidian integration boundary
+
+The current integration is **shared vault + filesystem watcher + API deep links**, not the Obsidian Plugin API:
+
+- Managed frontmatter writes both `id` and `lgdo_page_id`, both equal to the stable `page_id`.
+- `VaultSyncService` observes, debounces, reconciles, and records Obsidian add/modify/rename/delete/restore events as immutable revisions.
+- When generated and human content diverge, the human file is retained and a review/conflict plus recoverable backup is created.
+- `/api/internal/wiki/pages/{path}/obsidian-link` returns an `obsidian://` deep link.
+- The repository has no Obsidian plugin package, Obsidian plugin `manifest.json`, or plugin process; manifests belonging to other components are unrelated. A future plugin should wrap these APIs instead of duplicating revision logic.
 
 ### Data Layers
 
@@ -136,8 +155,8 @@ LGDO Knowledge Core uses **LLMWiki + GBrain + DeepSeek + Obsidian** as a modular
 | ----- | -------------- | ------- |
 | 🗄️ **Raw evidence** | `uploads/`, `vault/raw/`, `sources` | Stores original files, parsed text, hashes, and source tags. |
 | 📐 **Normalization** | `vault/normalized/`, `vault/jsonl/` | Stores canonical Markdown, retrieval chunks, and ingest reports. |
-| 📝 **Derived knowledge** | `vault/wiki/`, `wiki_pages`, `review_items` | Produces readable and reviewable Markdown knowledge pages. |
-| 🔍 **Retrieval** | `document_chunks`, `rag_document_chunks` | Provides pgvector indexes and cited QA retrieval. |
+| 📝 **Derived knowledge** | `vault/wiki/`, `wiki_pages`, `wiki_page_revisions`, `review_items` | Shared-Vault facts, immutable revisions, and conflict review. |
+| 🔍 **Retrieval/graph projections** | `document_chunks`, `wiki_chunks`, `gbrain_page_projections`, `gbrain_projection_protections`, `projection_state` | Rebuildable RAG/GBrain projections and generation watermarks. |
 | 🔄 **Governance** | `query_logs`, `feedback`, `knowledge_gaps`, `audit_logs` | Records questions, feedback, gaps, and audit events. |
 
 ### Component Overview
@@ -179,13 +198,13 @@ Instead of only checking whether retrieval hit the right document, LGDO evaluate
 | **T3** | Entity relations | The answer depends on graph traversal. | Which systems depend on the review engine, and what does a V2.5 -> V3.0 upgrade affect? |
 | **T4** | Negative and boundary cases | Negative retrieval, boundary conditions, and hallucination traps. | Unsupported image formats; refund eligibility after the 8th day. |
 
-> T3 separates "can retrieve text" from "understands relations". Pure vector RAG reached 12.5% accuracy on T3, while GBrain graph traversal raised it to 75%.
+> GBrain is an optional relation-retrieval source, not an assumed quality win. The latest reproducible 31-question baseline records 16/31 with GBrain OFF and 14/31 with it ON, with roughly 949 ms higher P95 when ON. Keep it disabled by default until graph coverage and per-question contribution are proven; see `docs/方案设计.md`.
 
 ---
 
 ## 📊 Evaluation
 
-LGDO Knowledge Core was tested on **31 upgraded evaluation questions** covering four difficulty layers. The benchmark used PostgreSQL + pgvector + DeepSeek + GBrain on 91 Chinese enterprise documents, 334 files, and 7.63 million characters.
+The repository contains **31 upgraded evaluation questions** across four difficulty layers. The newer traceable baseline in `docs/方案设计.md` records 16/31 with GBrain OFF and 14/31 with it ON. Historical 91-document/334-file metrics depend on an external dataset path and are not reproducible from this repository alone.
 
 ### Parsing Performance
 
@@ -200,10 +219,12 @@ LGDO Knowledge Core was tested on **31 upgraded evaluation questions** covering 
 
 | Check | Result |
 | ----- | :----: |
-| Backend tests (`pytest`) | 35 passed |
-| Frontend production build | Passed (JS 178.65 kB / CSS 17.22 kB) |
-| Basic QA set (30 questions) | 100% correct |
-| Upgraded QA set (31 questions) | 93.55% correct |
+| Full Python suite | 771 passed, 9 skipped (2026-07-18) |
+| Revision/watcher/API | 213 passed (2026-07-18) |
+| PostgreSQL | 31 passed (2026-07-18) |
+| GBrain TypeScript | 31 unit/contract + 13 PGLite E2E, typecheck passed (2026-07-18) |
+| Frontend | 32 passed, production build passed (2026-07-18) |
+| Real dynamic GBrain watcher SLA | add 1.935s, rename 1.665s, delete-expiry 5.714s |
 
 ---
 
@@ -216,7 +237,7 @@ LGDO Knowledge Core is an internal knowledge platform, not an end-customer auto-
 - **OCR is reserved but not fully integrated.** Scanned documents and image-only PDFs produce warnings until PaddleOCR or Tesseract is connected.
 - **Enterprise IM integrations are phase-two work.** WeCom, DingTalk, Lark, and customer-service writeback are not implemented yet.
 - **Cross-document entity alignment has blind spots.** For example, "department director" and "department owner" may need explicit alias mapping.
-- **Latency can be optimized further.** The current average latency is around 23s when GBrain graph traversal is included, which is not suitable for customer-facing low-latency scenarios.
+- **Latency and quality need deployment-specific gates.** Historical benchmark data is external, and the current GBrain ON baseline does not prove a quality gain. Run ON/OFF and P95 gates on the target dataset before production enablement.
 
 ---
 
@@ -305,11 +326,60 @@ If DeepSeek is not configured, the system uses local extractive answers, which i
 ```bash
 # .env
 GBRAIN_ENABLED=true
+GBRAIN_ENDPOINT=http://127.0.0.1:8787/mcp
+GBRAIN_QUERY_API_KEY=<read-only token>
+GBRAIN_PROJECTION_API_KEY=<read/write token>
+GBRAIN_MANAGED_SOURCE_ID=lgdo-managed
+GBRAIN_SOURCE_ID=lgdo-managed
+GBRAIN_IMPORT_ALLOWED_ROOT=<VAULT_PATH>/wiki
 GBRAIN_HOME=data/gbrain
 GBRAIN_REPO_PATH=gbrain
+GBRAIN_IMPORT_ON_COMPILE=false
 ```
 
-GBrain is disabled by default. When enabled, it provides entity traversal, cross-document dependency analysis, and gap reasoning.
+GBrain is disabled by default. Query and projection credentials must be separate, and the server must register canonical `<VAULT_PATH>/wiki` as an allowed root for the managed source. `GBRAIN_IMPORT_ON_COMPILE=true` only enqueues the asynchronous outbox; compile never performs a synchronous 600-second import.
+
+### Obsidian and the frontend dev server
+
+The complete local workflow uses FastAPI on `8000`, GBrain HTTP MCP on `8787`, and the frontend dev server on `8011`:
+
+```powershell
+Set-Location frontend
+npm run dev -- --port 8011
+```
+
+Open Obsidian on the actual `.env` `VAULT_PATH` (default `vault/`). `resources/obsidian-vault/` is an installation template, not the runtime Vault. `vault/wiki/` is the human-editable fact directory. Application startup installs missing `.obsidian/`, `templates/`, and `indexes/` assets but preserves drifted files and reports them through the status API. An explicit refresh backs up the managed files under `.lgdo/obsidian-backups/` before merging or replacing them:
+
+```powershell
+# Install assets that are missing.
+powershell -ExecutionPolicy Bypass -File scripts/install-obsidian-vault.ps1 -VaultPath vault
+
+# Explicitly refresh managed assets, with an automatic backup first.
+powershell -ExecutionPolicy Bypass -File scripts/install-obsidian-vault.ps1 -VaultPath vault -Refresh
+
+# Open a managed page. VaultName must match OBSIDIAN_VAULT_NAME or the Vault folder name.
+powershell -ExecutionPolicy Bypass -File scripts/open-obsidian.ps1 -VaultName vault -PagePath 'wiki/product/faq/demo.md'
+```
+
+The LGDO watcher ingests edits through the filesystem without a plugin; conflict review remains in the LGDO console/API. The local revision, watcher, RAG, and citation workflow still operates when GBrain is disabled. These operations obtain a Bearer token through local login instead of using the development identity fallback:
+
+```powershell
+$login = Invoke-RestMethod -Method Post `
+  -Uri 'http://127.0.0.1:8000/api/internal/auth/login' `
+  -ContentType 'application/json' `
+  -Body (@{ username = 'admin'; password = $env:LGDO_ADMIN_PASSWORD } | ConvertTo-Json)
+$headers = @{ Authorization = "Bearer $($login.token)" }
+
+Invoke-RestMethod -Headers $headers -Uri 'http://127.0.0.1:8000/api/internal/vault/status'
+Invoke-RestMethod -Method Post -Headers $headers -Uri 'http://127.0.0.1:8000/api/internal/vault/reconcile'
+
+# URL-encode page_path when it is embedded in the route; open the returned URL with Obsidian.
+$pagePath = [Uri]::EscapeDataString('wiki/product/faq/demo.md').Replace('%2F', '/')
+$link = Invoke-RestMethod -Headers $headers -Uri "http://127.0.0.1:8000/api/internal/wiki/pages/$pagePath/obsidian-link"
+Start-Process $link.url
+```
+
+Diagrams: [technology stack](docs/技术栈结构图.drawio) · [four-layer architecture](docs/系统四层架构图.drawio).
 
 ---
 
@@ -332,6 +402,16 @@ GBrain is disabled by default. When enabled, it provides entity traversal, cross
 | `POST` | `/api/internal/wiki/compile` | Compile Markdown wiki pages |
 | `GET` | `/api/internal/wiki/pages` | List wiki pages |
 | `PUT` | `/api/internal/wiki/pages/{path}` | Save wiki page content |
+| `GET` | `/api/internal/wiki/pages/{path}/revisions` | List page revisions |
+| `GET` | `/api/internal/wiki/pages/{path}/conflicts` | List page conflicts |
+| `POST` | `/api/internal/wiki/conflicts/{review_id}/resolve` | Resolve a content conflict |
+| `POST` | `/api/internal/wiki/write-intents/{intent_id}/release-backup` | Explicitly release a repair backup |
+| `GET` | `/api/internal/wiki/pages/{path}/obsidian-link` | Build an Obsidian deep link |
+| `GET` | `/api/internal/vault/status` | Watcher, reconcile, Obsidian asset, and projection status |
+| `POST` | `/api/internal/vault/reconcile` | Queue Vault reconciliation |
+| `GET` | `/api/internal/vault/reconcile/{job_id}` | Read reconciliation result |
+| `GET` | `/api/internal/projection-jobs` | List the RAG/GBrain projection outbox |
+| `POST` | `/api/internal/projection-jobs/{job_id}/retry` | Retry a failed projection job |
 | `GET` | `/api/internal/reviews` | List review queue |
 | `GET` | `/api/internal/gaps` | List knowledge gaps |
 | `POST` | `/api/internal/ask` | Internal cited QA |
@@ -349,9 +429,11 @@ GBrain is disabled by default. When enabled, it provides entity traversal, cross
 - [x] Human review queue and knowledge gap loop
 - [x] Four-layer evaluation framework (T1-T4)
 - [x] PostgreSQL + pgvector retrieval
-- [x] GBrain knowledge graph integration and contribution measurement
-- [x] BGE-M3 embedding + hybrid search
-- [x] **Local login and account ACL management**: bootstrap admin, session token auth, roles, ACL tags, and account management UI
+- [x] Optional GBrain query and asynchronous projection integration
+- [ ] Stable positive GBrain contribution and latency gates on the target dataset
+- [x] Configurable embedding provider + hybrid search (default `local-hash-v1`)
+- [ ] Production BGE-M3 enablement, reindexing, and high-dimensional pgvector schema
+- [x] **Local login and account ACL management**: explicit bootstrap password, session token auth, roles, ACL tags, and account management UI
 - [x] **ACL-aware internal console protection**: authenticated internal APIs, admin/editor write gates, and QA identity display from the active session
 - [x] **Entity alias alignment**: entity alias table and alias management APIs for cross-document canonical names
 - [ ] **Enterprise SSO hardening**: OIDC role/ACL mapping, token-hash storage, password policy, login throttling, and account audit filters
@@ -368,7 +450,7 @@ GBrain is disabled by default. When enabled, it provides entity traversal, cross
 - Vector retrieval based on [pgvector](https://github.com/pgvector/pgvector), the PostgreSQL vector extension
 - Knowledge graph based on [GBrain](https://github.com/garrytan/gbrain), MCP stdio adapter + PGLite
 - Admin console built with [React 18](https://react.dev/) + [Vite](https://vitejs.dev/)
-- Embedding model: [BGE-M3](https://huggingface.co/BAAI/bge-m3), BAAI multilingual embedding model
+- Optional embedding provider supports [BGE-M3](https://huggingface.co/BAAI/bge-m3); the default provider is `local-hash-v1`
 - RAG evaluation ideas inspired by [BEIR](https://github.com/beir-cellar/beir) and MTEB
 
 ---
